@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
+#include <algorithm>
 #include <cstring>
 #include <immintrin.h>
 #include <numeric>
@@ -176,21 +177,40 @@ void Buffer::ReadMapped(uint64_t offset, uint64_t size, void* destination) const
 		    vmaInvalidateAllocation(m_graphics->allocator, m_allocation, offset, size);
 		EXIT_NOT_IMPLEMENTED(static_cast<vk::Result>(result) != vk::Result::eSuccess);
 	}
-	const auto* source = m_mapped.data() + offset;
-	auto*       target = static_cast<uint8_t*>(destination);
+	const auto* map_begin = m_mapped.data();
+	const auto* map_end   = map_begin + m_mapped.size();
+	const auto* source    = map_begin + offset;
+	const auto* finish    = source + size;
+	auto*       target    = static_cast<uint8_t*>(destination);
 	// Streaming loads may be served from fill buffers that predate the GPU's write: the fence
 	// orders them after every earlier load and store, so they observe the completed write.
 	_mm_mfence();
-	const auto lead =
-	    std::min<uint64_t>(size, (16u - reinterpret_cast<uintptr_t>(source) % 16u) % 16u);
-	std::memcpy(target, source, static_cast<size_t>(lead));
-	uint64_t done = lead;
-	for (; done + 16 <= size; done += 16) {
-		const auto value =
-		    _mm_stream_load_si128(reinterpret_cast<__m128i*>(const_cast<uint8_t*>(source + done)));
-		_mm_storeu_si128(reinterpret_cast<__m128i*>(target + done), value);
+	// Every byte comes from a streaming load of its aligned 16-byte word, the bytes before the
+	// first aligned word and after the last one too: the GPU-written ranges read here are often
+	// islands shorter than a word, and a plain load of this (write-combined) memory costs a bus
+	// read of its own (~0.05 GB/s against ~1.5 GB/s). Only a word that is not wholly inside the
+	// mapping is read with plain loads.
+	while (source < finish) {
+		const auto* word = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(source) &
+		                                                    ~uintptr_t {15});
+		const auto  skip = static_cast<size_t>(source - word);
+		const auto  take = std::min<size_t>(16u - skip, static_cast<size_t>(finish - source));
+		if (word >= map_begin && word + 16 <= map_end) {
+			const auto value =
+			    _mm_stream_load_si128(reinterpret_cast<__m128i*>(const_cast<uint8_t*>(word)));
+			if (take == 16u) {
+				_mm_storeu_si128(reinterpret_cast<__m128i*>(target), value);
+			} else {
+				alignas(16) uint8_t bytes[16];
+				_mm_store_si128(reinterpret_cast<__m128i*>(bytes), value);
+				std::memcpy(target, bytes + skip, take);
+			}
+		} else {
+			std::memcpy(target, source, take);
+		}
+		source += take;
+		target += take;
 	}
-	std::memcpy(target + done, source + done, static_cast<size_t>(size - done));
 }
 
 void Buffer::Invalidate(uint64_t offset, uint64_t size) {
