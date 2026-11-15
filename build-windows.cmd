@@ -81,6 +81,22 @@ if not exist "%BUILD%\build.ninja" (
 		-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=%LTO% %KYTY_CMAKE_ARGS% || exit /b 1
 )
 
+rem A profile for profile-guided optimization, when one was trained on this PC: the build uses
+rem _Build\pgo\windows\kyty.profdata unless it is the instrumented build itself or KYTY_NO_PGO is
+rem set. To train one: build with KYTY_BUILD_DIR=_Build\pgo-gen and
+rem KYTY_CMAKE_ARGS="-DKYTY_NATIVE_OPT=ON -DKYTY_TARGET_ARCH=native -DKYTY_PGO_GENERATE=ON", play
+rem with KYTY_PGO_FILE=<file.profraw> set, then
+rem llvm-profdata merge -o _Build\pgo\windows\kyty.profdata <file.profraw>. A profile goes stale as
+rem the code changes (functions that changed are optimized without it): train again now and then.
+set "PROFILE=%ROOT%_Build\pgo\windows\kyty.profdata"
+if exist "%PROFILE%" if not defined KYTY_NO_PGO (
+	findstr /c:"KYTY_PGO_GENERATE:BOOL=ON" "%BUILD%\CMakeCache.txt" >nul 2>nul || (
+		findstr /c:"KYTY_PGO_USE:FILEPATH=%PROFILE:\=/%" "%BUILD%\CMakeCache.txt" >nul 2>nul || (
+			cmake -B "%BUILD%" "-DKYTY_PGO_USE=%PROFILE:\=/%" >nul || exit /b 1
+		)
+	)
+)
+
 set "TARGET=%~1"
 if "%TARGET%"=="" set "TARGET=kyty_emulator"
 cmake --build "%BUILD%" --target %TARGET% || exit /b 1
