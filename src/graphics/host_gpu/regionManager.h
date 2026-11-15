@@ -222,13 +222,16 @@ public:
 	// one request per cluster of them, since a request costs about as much as reaching over
 	// MaxProtectionGap pages whose protection it does not change (Windows: ~1.5 us per request,
 	// ~25 ns per page).
+	// The caller may also release the lock in between and call this later, from another thread
+	// (the upload worker): until then the taken pages are clean and still writable, a guest
+	// store into them takes no fault, and the copy that follows this call carries it.
 	void ProtectCpuClean() {
 		const StateChange change(*this);
-		const auto        mask = m_cpu_dirty ^ m_writable;
+		const auto        mask = m_writable & ~m_cpu_dirty;
 		if (mask.None()) {
 			return;
 		}
-		m_writable = m_cpu_dirty;
+		m_writable &= m_cpu_dirty;
 		RegionBits cluster;
 		size_t     cluster_end = 0;
 		bool       open        = false;
@@ -269,14 +272,30 @@ private:
 
 	template <bool track, bool is_read>
 	void UpdateProtection() {
-		const auto protection = is_read ? ~m_gpu_dirty | m_stale_readable : m_cpu_dirty;
-		auto&      previous   = is_read ? m_readable : m_writable;
-		auto       mask       = protection ^ previous;
-		if (mask.None()) {
-			return;
+		if constexpr (is_read) {
+			const auto protection = ~m_gpu_dirty | m_stale_readable;
+			auto       mask       = protection ^ m_readable;
+			if (mask.None()) {
+				return;
+			}
+			m_readable = protection;
+			m_page_manager.UpdatePageWatchersForRegion<track, true>(m_cpu_addr, mask);
+		} else {
+			// One direction at a time: pages that are clean and still writable get their write
+			// watch, or pages that are dirty and watched lose it. Pages taken for a deferred
+			// protection (clean, still writable until ProtectCpuClean) are protected by the
+			// first, which only comes early for them, and left alone by the second.
+			auto mask = track ? m_writable & ~m_cpu_dirty : m_cpu_dirty & ~m_writable;
+			if (mask.None()) {
+				return;
+			}
+			if constexpr (track) {
+				m_writable &= m_cpu_dirty;
+			} else {
+				m_writable |= mask;
+			}
+			m_page_manager.UpdatePageWatchersForRegion<track, false>(m_cpu_addr, mask);
 		}
-		previous = protection;
-		m_page_manager.UpdatePageWatchersForRegion<track, is_read>(m_cpu_addr, mask);
 	}
 
 	template <DirtySource source>

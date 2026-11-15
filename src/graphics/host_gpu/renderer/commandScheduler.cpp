@@ -399,31 +399,41 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		// recording thread. Its tick is taken now, so the scheduler's ticks keep their meaning.
 		struct Handover {
 			QueueSubmitter*   submitter;
+			SubmitGate        gate;
 			vk::CommandBuffer buffer;
 			SubmitInfo        submit;
 			uint64_t          tick;
 		};
+		// The buffer may copy from staging memory the upload worker still fills: the submission
+		// thread passes it to the queue once the uploads recorded so far are done.
+		auto&            buffers = m_context.GetBufferCache();
+		const SubmitGate gate {[](void* context, uint64_t sequence) {
+			                       static_cast<BufferCache*>(context)->WaitUploads(sequence);
+		                       },
+		                       &buffers, buffers.UploadSequence()};
 		static_assert(std::is_trivially_copyable_v<Handover>);
 		if (VulkanRecording::Recording()) {
 			tick = graphics.submitter->Reserve(submit, m_master);
-			const Handover handover {graphics.submitter, buffer, submit, tick};
+			const Handover handover {graphics.submitter, gate, buffer, submit, tick};
 			const bool     queued = VulkanRecording::EnqueueOrdered(
 			        [](const void* data) {
 				        const auto& queued_buffer = *static_cast<const Handover*>(data);
 				        queued_buffer.submitter->PushReserved(queued_buffer.buffer,
-				                                              queued_buffer.submit, queued_buffer.tick);
+				                                              queued_buffer.submit, queued_buffer.tick,
+				                                              queued_buffer.gate);
 			        },
 			        &handover, sizeof(handover), true);
 			if (!queued) {
 				VulkanRecording::Drain();
-				graphics.submitter->PushReserved(buffer, submit, tick);
+				graphics.submitter->PushReserved(buffer, submit, tick, gate);
 			}
 		} else {
 			// (Commands queued before the recording was switched off come first.)
 			VulkanRecording::Drain();
-			tick = graphics.submitter->Push(buffer, submit, m_master);
+			tick = graphics.submitter->Push(buffer, submit, m_master, gate);
 		}
 	} else {
+		m_context.GetBufferCache().WaitUploads(m_context.GetBufferCache().UploadSequence());
 		Common::LockGuard lock(graphics.queue_mutex);
 		tick = m_master.NextTick();
 		submit.AddSignal(m_master.Handle(), tick);

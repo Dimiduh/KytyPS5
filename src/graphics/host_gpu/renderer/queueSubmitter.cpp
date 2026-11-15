@@ -25,15 +25,15 @@ QueueSubmitter::~QueueSubmitter() {
 	}
 }
 
-uint64_t QueueSubmitter::Push(vk::CommandBuffer buffer, SubmitInfo submit,
-                              MasterSemaphore& master) {
+uint64_t QueueSubmitter::Push(vk::CommandBuffer buffer, SubmitInfo submit, MasterSemaphore& master,
+                              SubmitGate gate) {
 	EXIT_IF(buffer == nullptr);
 	uint64_t tick = 0;
 	{
 		std::lock_guard lock(m_mutex);
 		tick = master.NextTick();
 		submit.AddSignal(master.Handle(), tick);
-		m_queued.push_back({buffer, submit, tick});
+		m_queued.push_back({buffer, submit, tick, gate});
 		m_pushed.fetch_add(1, std::memory_order_release);
 	}
 	m_available.notify_one();
@@ -49,11 +49,11 @@ uint64_t QueueSubmitter::Reserve(SubmitInfo& submit, MasterSemaphore& master) {
 }
 
 void QueueSubmitter::PushReserved(vk::CommandBuffer buffer, const SubmitInfo& submit,
-                                  uint64_t tick) {
+                                  uint64_t tick, SubmitGate gate) {
 	EXIT_IF(buffer == nullptr);
 	{
 		std::lock_guard lock(m_mutex);
-		m_queued.push_back({buffer, submit, tick});
+		m_queued.push_back({buffer, submit, tick, gate});
 	}
 	m_available.notify_one();
 }
@@ -106,6 +106,14 @@ void QueueSubmitter::SubmitBatches(const std::vector<Batch>& batches) {
 		info.pCommandBuffers      = &batch.buffer;
 		info.signalSemaphoreCount = batch.submit.num_signal_semaphores;
 		info.pSignalSemaphores    = batch.submit.signal_semaphores.data();
+	}
+
+	// What the buffers depend on that other threads still do (sequences of one gate grow with
+	// the order of the pushes: the last one covers the batch, but gates may differ).
+	for (const auto& batch: batches) {
+		if (batch.gate.wait != nullptr) {
+			batch.gate.wait(batch.gate.context, batch.gate.sequence);
+		}
 	}
 
 	vk::Result result;

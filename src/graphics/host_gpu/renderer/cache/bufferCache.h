@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/cache/uploadWorker.h"
 
 #include <array>
 #include <atomic>
@@ -161,6 +162,10 @@ public:
 	void QueueBdaSync(uint64_t vaddr, uint64_t size, bool at_ordering_point = false);
 	// A guest submission begins a store epoch (see BdaSyncQueue). Safe from any thread.
 	[[nodiscard]] uint64_t BeginBdaStoreEpoch();
+	// The upload worker's jobs so far, and a wait for those up to a sequence: a submission is
+	// passed to the queue only once the uploads recorded before it are in staging memory.
+	[[nodiscard]] uint64_t UploadSequence() const noexcept { return m_upload_worker.Pushed(); }
+	void                   WaitUploads(uint64_t sequence) { m_upload_worker.Wait(sequence); }
 	// The newest epoch BeginBdaStoreEpoch returned (0 before the first). Safe from any thread.
 	[[nodiscard]] uint64_t CurrentBdaStoreEpoch() const noexcept {
 		return m_bda_store_epoch.load(std::memory_order_acquire);
@@ -217,6 +222,10 @@ private:
 	                                     bool is_written, bool is_texel_buffer);
 	// Records the copy of `copies` (uploaded to `source`) into `buffer`.
 	void RecordUpload(Buffer& buffer, vk::Buffer source, std::span<const vk::BufferCopy> copies);
+	// UploadCopies for the upload worker: reserves the staging memory and adds the copies to
+	// `job` instead of making them.
+	[[nodiscard]] vk::Buffer ReserveUploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
+	                                             uint64_t total_size, UploadWorker::Job& job);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
@@ -367,6 +376,8 @@ private:
 	bool                  m_bda_reports_lost = false;
 	std::vector<uint64_t> m_bda_accessed;
 	std::vector<BufferId> m_bda_watched;
+	// Last, so it ends (with its jobs done) before the tracker and the staging memory they use.
+	UploadWorker m_upload_worker;
 };
 
 } // namespace Libs::Graphics

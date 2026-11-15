@@ -45,6 +45,10 @@ Common::LiveControl::Counter g_inplace_reads("inplace_reads");
 Common::LiveControl::Counter g_inplace_waits("inplace_waits");
 Common::LiveControl::Counter g_invalidations_gpu("invalidate_gpu");
 
+// 1: a BDA synchronization leaves the write protection of the pages it takes and their copies
+// into staging memory to the upload worker (uploadWorker.h); 0: the GPU thread makes both.
+Common::LiveControl::Switch g_async_upload("async_upload", 0);
+
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
                                         vk::BufferUsageFlags usage, const auto& write) {
@@ -398,6 +402,16 @@ BufferCache::~BufferCache() {
 }
 
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size, bool guest_store) {
+	if (!guest_store) {
+		// A store of the emulated command processor, a write-back or an unmap: an upload the
+		// worker still has to copy from these pages belongs to earlier commands and must not
+		// see what comes now, so the pages (all of each: the invalidation below marks whole
+		// pages modified again) are copied for it first. (A guest store races with the work it
+		// was not ordered before.)
+		const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+		const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+		m_upload_worker.CaptureRange(begin, end - begin);
+	}
 	if (Common::LiveControl::OnGpuThread()) {
 		g_invalidations_gpu.Add();
 	}
@@ -1021,6 +1035,40 @@ void BufferCache::RecordUpload(Buffer& buffer, vk::Buffer source,
 	}
 }
 
+vk::Buffer BufferCache::ReserveUploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
+                                            uint64_t total_size, UploadWorker::Job& job) {
+	if (copies.empty()) {
+		return nullptr;
+	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, total_size);
+	Buffer*  source      = nullptr;
+	uint8_t* mapped      = nullptr;
+	uint64_t base_offset = 0;
+	if (const auto [ring, offset] = m_staging_buffer.Map(total_size, 4); ring != nullptr) {
+		m_staging_buffer.Commit();
+		source      = &m_staging_buffer;
+		mapped      = ring;
+		base_offset = offset;
+	} else {
+		// As UploadMemory: a transfer the ring cannot hold gets a buffer of its own, which
+		// lives until the submission that copies from it has completed.
+		auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
+		                                          vk::BufferUsageFlagBits::eTransferSrc, total_size);
+		source         = temporary.get();
+		mapped         = temporary->Mapped().data();
+		m_scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
+	}
+	for (auto& copy: copies) {
+		job.copies.push_back(
+		    {buffer.CpuAddress() + copy.dstOffset, copy.size, mapped + copy.srcOffset});
+		copy.srcOffset += base_offset;
+	}
+	if (!source->IsCoherent()) {
+		job.flushes.push_back({source, base_offset, total_size});
+	}
+	return source->Handle();
+}
+
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
                                      uint64_t total_size) {
 	if (copies.empty()) {
@@ -1548,26 +1596,44 @@ void BufferCache::SynchronizeBda(const RangeSet& mapped) {
 	copies.clear();
 	copy_owners.clear();
 	sources.clear();
-	m_memory_tracker.ForEachUploadRanges(
-	    ranges,
-	    [&](size_t index, uint64_t address, uint64_t bytes) noexcept {
-		    copies.emplace_back(0, m_slot_buffers[owners[index]].Offset(address), bytes);
-		    copy_owners.push_back(index);
-	    },
-	    [&]() noexcept {
-		    for (size_t first = 0; first < copies.size();) {
-			    const auto id    = owners[copy_owners[first]];
-			    size_t     last  = first;
-			    uint64_t   total = 0;
-			    for (; last < copies.size() && owners[copy_owners[last]] == id; last++) {
-				    copies[last].srcOffset = total;
-				    total += copies[last].size;
-			    }
-			    sources.push_back(UploadCopies(
-			        m_slot_buffers[id], std::span {copies}.subspan(first, last - first), total));
-			    first = last;
-		    }
-	    });
+	const auto take = [&](size_t index, uint64_t address, uint64_t bytes) noexcept {
+		copies.emplace_back(0, m_slot_buffers[owners[index]].Offset(address), bytes);
+		copy_owners.push_back(index);
+	};
+	// The copies of each buffer get one piece of staging memory: `upload` fills it, or leaves
+	// that to the upload worker.
+	const auto for_each_buffer = [&](const auto& upload) {
+		for (size_t first = 0; first < copies.size();) {
+			const auto id    = owners[copy_owners[first]];
+			size_t     last  = first;
+			uint64_t   total = 0;
+			for (; last < copies.size() && owners[copy_owners[last]] == id; last++) {
+				copies[last].srcOffset = total;
+				total += copies[last].size;
+			}
+			sources.push_back(
+			    upload(m_slot_buffers[id], std::span {copies}.subspan(first, last - first), total));
+			first = last;
+		}
+	};
+	if (g_async_upload.On()) {
+		// The GPU thread only takes the pages and records the GPU copies (below); the worker
+		// write-protects the pages again and then copies them into the staging memory.
+		UploadWorker::Job job;
+		m_memory_tracker.TakeUploadRanges(ranges, take, job.regions);
+		for_each_buffer([&](Buffer& buffer, std::span<vk::BufferCopy> part, uint64_t total) {
+			return ReserveUploadCopies(buffer, part, total, job);
+		});
+		if (!job.regions.empty() || !job.copies.empty()) {
+			m_upload_worker.Push(std::move(job));
+		}
+	} else {
+		m_memory_tracker.ForEachUploadRanges(ranges, take, [&]() noexcept {
+			for_each_buffer([&](Buffer& buffer, std::span<vk::BufferCopy> part, uint64_t total) {
+				return UploadCopies(buffer, part, total);
+			});
+		});
+	}
 	g_bda_copies.Add(copies.size());
 	size_t group = 0;
 	for (size_t first = 0; first < copies.size(); group++) {

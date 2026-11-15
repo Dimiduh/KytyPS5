@@ -169,6 +169,50 @@ public:
 		upload_func();
 	}
 
+	// ForEachUploadRanges without the write protection: the regions whose pages were taken are
+	// appended to `regions`, for ProtectTaken to protect them later, from the thread that then
+	// copies the ranges (the upload worker). Until then the taken pages are clean and still
+	// writable (RegionManager::ProtectCpuClean).
+	template <typename RangeFunc>
+	void TakeUploadRanges(std::span<const GuestRange> ranges, RangeFunc&& range_func,
+	                      std::vector<RegionManager*>& regions) {
+		static_assert(std::is_nothrow_invocable_v<RangeFunc&, size_t, uint64_t, uint64_t>);
+		RegionManager* held    = nullptr;
+		bool           taken   = false;
+		const auto     release = [&] {
+			if (held != nullptr) {
+				held->lock.unlock();
+				if (taken) {
+					regions.push_back(held);
+				}
+				held  = nullptr;
+				taken = false;
+			}
+		};
+		for (size_t index = 0; index < ranges.size(); index++) {
+			Iterate<true>(ranges[index].address, ranges[index].size,
+			              [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+				              if (manager != held) {
+					              release();
+					              manager->lock.lock();
+					              held = manager;
+				              }
+				              manager->TakeCpuModifiedRanges(offset, bytes,
+				                                             [&](uint64_t address, uint64_t size) {
+					                                             taken = true;
+					                                             range_func(index, address, size);
+				                                             });
+			              });
+		}
+		release();
+	}
+
+	// Write-protects the pages of a region that TakeUploadRanges took. Safe from any thread.
+	static void ProtectTaken(RegionManager* region) {
+		std::scoped_lock lock(region->lock);
+		region->ProtectCpuClean();
+	}
+
 private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
 

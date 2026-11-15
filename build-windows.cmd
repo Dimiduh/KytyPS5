@@ -72,10 +72,13 @@ where glslangValidator >nul 2>nul || (
 	exit /b 1
 )
 
+rem KYTY_NO_LTO=1: without ThinLTO (a build directory for the regression tests links much faster).
+set "LTO=ON"
+if defined KYTY_NO_LTO set "LTO=OFF"
 if not exist "%BUILD%\build.ninja" (
 	cmake -S "%ROOT%." -B "%BUILD%" -G Ninja -DCMAKE_BUILD_TYPE=Release ^
 		-DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DKYTY_BUILD_LAUNCHER=OFF ^
-		-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON %KYTY_CMAKE_ARGS% || exit /b 1
+		-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=%LTO% %KYTY_CMAKE_ARGS% || exit /b 1
 )
 
 set "TARGET=%~1"

@@ -26,6 +26,15 @@ class MasterSemaphore;
 //
 // A tick pushed but not yet submitted is a valid target of a host wait on its timeline
 // semaphore (timeline semaphores allow waits before the signal is submitted).
+// Work a pushed buffer depends on that another thread still does (the upload worker fills the
+// staging memory the buffer copies from): the submission thread calls `wait(context, sequence)`
+// before it passes the buffer to the queue. The threads that record and push do not wait.
+struct SubmitGate {
+	void (*wait)(void* context, uint64_t sequence) = nullptr;
+	void*    context                               = nullptr;
+	uint64_t sequence                              = 0;
+};
+
 class QueueSubmitter {
 public:
 	explicit QueueSubmitter(GraphicContext& graphics);
@@ -34,14 +43,16 @@ public:
 
 	// Allocates the next tick of `master`, adds its signal to `submit` and queues the buffer.
 	// Ticks of one semaphore reach the queue in increasing order.
-	uint64_t Push(vk::CommandBuffer buffer, SubmitInfo submit, MasterSemaphore& master);
+	uint64_t Push(vk::CommandBuffer buffer, SubmitInfo submit, MasterSemaphore& master,
+	              SubmitGate gate = {});
 	// Push in two steps, for a buffer whose commands another thread still records: Reserve
 	// allocates the tick and adds its signal to `submit` (the buffer counts as pushed from here
 	// on, so Drain waits for it), PushReserved queues the buffer once it is complete. The
 	// reserved buffers of one semaphore must be queued in the order they were reserved, and no
 	// Push of that semaphore may come between a Reserve and its PushReserved.
 	[[nodiscard]] uint64_t Reserve(SubmitInfo& submit, MasterSemaphore& master);
-	void PushReserved(vk::CommandBuffer buffer, const SubmitInfo& submit, uint64_t tick);
+	void PushReserved(vk::CommandBuffer buffer, const SubmitInfo& submit, uint64_t tick,
+	                  SubmitGate gate = {});
 	// Returns once every buffer pushed before the call has been passed to vkQueueSubmit.
 	void Drain();
 	// Buffers pushed and buffers passed to vkQueueSubmit since the start.
@@ -57,6 +68,7 @@ private:
 		vk::CommandBuffer buffer = nullptr;
 		SubmitInfo        submit;
 		uint64_t          tick = 0;
+		SubmitGate        gate;
 	};
 
 	void Run(const std::stop_token& stop);
