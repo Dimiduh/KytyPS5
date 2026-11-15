@@ -24,6 +24,15 @@ int GetThreadIdUnique();
 // Lets the calling thread yield the CPU to normal-priority threads (background work such as
 // pipeline builds). Best effort: does nothing where the platform refuses.
 void LowerCurrentThreadPriority();
+// Lets the calling thread run ahead of normal-priority threads (the thread that translates guest
+// GPU commands: the guest's own threads otherwise hold its CPUs for whole time slices while they
+// load). Best effort.
+void RaiseCurrentThreadPriority();
+// The CPUs the calling thread may run on, from a list such as "2,3,8-15" (logical CPUs 0-63 of
+// its processor group); other threads are not kept off them. "auto" names the performance cores
+// without the core of CPU 0, which serves most interrupts. False when nothing was changed (an
+// empty or unusable list, a CPU without core classes, or a platform that refuses).
+bool PinCurrentThreadToCpus(const char* list);
 
 } // namespace Thread
 

@@ -1,8 +1,11 @@
 #include "common/threads.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono> // IWYU pragma: keep
+#include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <memory>
 #include <thread>
@@ -99,6 +102,108 @@ void Thread::LowerCurrentThreadPriority() {
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	// Linux applies nice values per thread.
 	(void)setpriority(PRIO_PROCESS, static_cast<id_t>(gettid()), 5);
+#endif
+}
+
+void Thread::RaiseCurrentThreadPriority() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	(void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	// Needs CAP_SYS_NICE or a nice rlimit; refused silently otherwise.
+	(void)setpriority(PRIO_PROCESS, static_cast<id_t>(gettid()), -5);
+#endif
+}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// The logical CPUs (bit n: CPU n) of the fastest core class the process may use, without the
+// core that CPU 0 belongs to; 0 when the CPU has one class only or the classes are unknown.
+static DWORD_PTR PerformanceCpuMask() {
+	DWORD_PTR process = 0;
+	DWORD_PTR system  = 0;
+	if (GetProcessAffinityMask(GetCurrentProcess(), &process, &system) == 0) {
+		return 0;
+	}
+	ULONG length = 0;
+	(void)GetSystemCpuSetInformation(nullptr, 0, &length, GetCurrentProcess(), 0);
+	if (length == 0) {
+		return 0;
+	}
+	const auto buffer = std::make_unique<unsigned char[]>(length);
+	auto*      first  = reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.get());
+	if (GetSystemCpuSetInformation(first, length, &length, GetCurrentProcess(), 0) == 0) {
+		return 0;
+	}
+	unsigned  fastest         = 0;
+	unsigned  slowest         = 255;
+	int       interrupt_core  = -1;
+	const auto for_each = [&](const auto& visit) {
+		for (ULONG offset = 0; offset < length;) {
+			const auto* info =
+			    reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.get() + offset);
+			if (info->Type == CpuSetInformation && info->CpuSet.Group == 0 &&
+			    info->CpuSet.LogicalProcessorIndex < 64 &&
+			    ((process >> info->CpuSet.LogicalProcessorIndex) & 1u) != 0) {
+				visit(info->CpuSet);
+			}
+			offset += info->Size;
+		}
+	};
+	for_each([&](const auto& cpu) {
+		fastest = std::max<unsigned>(fastest, cpu.EfficiencyClass);
+		slowest = std::min<unsigned>(slowest, cpu.EfficiencyClass);
+		if (cpu.LogicalProcessorIndex == 0) {
+			interrupt_core = cpu.CoreIndex;
+		}
+	});
+	if (fastest == slowest) {
+		return 0;
+	}
+	DWORD_PTR mask = 0;
+	for_each([&](const auto& cpu) {
+		if (cpu.EfficiencyClass == fastest && cpu.CoreIndex != interrupt_core) {
+			mask |= DWORD_PTR {1} << cpu.LogicalProcessorIndex;
+		}
+	});
+	return mask;
+}
+#endif
+
+bool Thread::PinCurrentThreadToCpus(const char* list) {
+	if (list == nullptr || *list == '\0') {
+		return false;
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	DWORD_PTR mask = 0;
+	if (std::strcmp(list, "auto") == 0) {
+		mask = PerformanceCpuMask();
+	} else {
+		// "a,b,c-d".
+		for (const char* text = list; *text != '\0';) {
+			char*      end   = nullptr;
+			const auto first = std::strtoul(text, &end, 10);
+			if (end == text) {
+				return false;
+			}
+			auto last = first;
+			if (*end == '-') {
+				const char* range = end + 1;
+				last              = std::strtoul(range, &end, 10);
+				if (end == range) {
+					return false;
+				}
+			}
+			for (auto cpu = first; cpu <= last && cpu < 64; cpu++) {
+				mask |= DWORD_PTR {1} << cpu;
+			}
+			text = *end == ',' ? end + 1 : end;
+			if (*end != ',' && *end != '\0') {
+				return false;
+			}
+		}
+	}
+	return mask != 0 && SetThreadAffinityMask(GetCurrentThread(), mask) != 0;
+#else
+	return false;
 #endif
 }
 

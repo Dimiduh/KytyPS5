@@ -28,6 +28,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -457,6 +458,18 @@ void GuestGpu::ThreadRun(void* data) {
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	Common::LiveControl::RegisterThread("gpu");
+	// This thread's time is the frame's: it runs above the guest's threads, which otherwise hold
+	// its CPUs for whole time slices while they stream a level in (KYTY_RENDER_PRIORITY=0: normal
+	// priority). KYTY_RENDER_CPUS names the CPUs it may run on ("auto": the performance cores
+	// without CPU 0's, which serves most interrupts); unset, the scheduler places it.
+	if (const char* priority = std::getenv("KYTY_RENDER_PRIORITY");
+	    priority == nullptr || std::strcmp(priority, "0") != 0) {
+		Common::Thread::RaiseCurrentThreadPriority();
+	}
+	if (const char* cpus = std::getenv("KYTY_RENDER_CPUS"); cpus != nullptr && *cpus != '\0') {
+		const bool pinned = Common::Thread::PinCurrentThreadToCpus(cpus);
+		LOGF("GPU thread: KYTY_RENDER_CPUS=%s %s\n", cpus, pinned ? "applied" : "not applied");
+	}
 	g_gpu_state = gpu;
 
 	for (;;) {
