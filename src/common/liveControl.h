@@ -45,6 +45,27 @@ private:
 	Switch*               m_next;
 };
 
+// A named event counter that `measure` reports per frame beside its own numbers. Define counters
+// at namespace scope, like switches. Adding is one relaxed increment, taken only while the
+// channel is active.
+class Counter {
+public:
+	explicit Counter(const char* name) noexcept;
+	Counter(const Counter&)            = delete;
+	Counter& operator=(const Counter&) = delete;
+
+	void Add(uint64_t value = 1) noexcept;
+
+	[[nodiscard]] uint64_t Get() const noexcept { return m_value.load(std::memory_order_relaxed); }
+	[[nodiscard]] const char*    Name() const noexcept { return m_name; }
+	[[nodiscard]] const Counter* Next() const noexcept { return m_next; }
+
+private:
+	const char*           m_name;
+	std::atomic<uint64_t> m_value {0};
+	Counter*              m_next;
+};
+
 // The host actions the commands need, set by the emulator before Start.
 struct HostHooks {
 	void (*pad_button)(uint32_t button, bool down)             = nullptr;
@@ -65,10 +86,22 @@ inline constexpr size_t      FLIP_TIMES = 8192;
 inline std::atomic<bool>     g_active {false};
 inline std::atomic<uint64_t> g_flips {0};
 inline std::atomic<int64_t>  g_flip_times_ns[FLIP_TIMES] {};
+inline thread_local bool     t_gpu_thread = false;
 } // namespace Detail
+
+// The calling thread registered itself as "gpu" (for counters kept apart for that thread).
+[[nodiscard]] inline bool OnGpuThread() noexcept {
+	return Detail::t_gpu_thread;
+}
 
 [[nodiscard]] inline bool Active() noexcept {
 	return Detail::g_active.load(std::memory_order_relaxed);
+}
+
+inline void Counter::Add(uint64_t value) noexcept {
+	if (Active()) {
+		m_value.fetch_add(value, std::memory_order_relaxed);
+	}
 }
 
 // A guest flip on the main bus (one caller thread).

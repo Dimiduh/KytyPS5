@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/pageManager.h"
 
 #include "common/alignment.h"
+#include "common/liveControl.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "kernel/memory.h"
@@ -36,6 +37,12 @@ constexpr uint64_t ADDRESS_SIZE = TRACKER_ADDRESS_SIZE;
 constexpr uint64_t REGION_COUNT = ADDRESS_SIZE / REGION_SIZE;
 
 constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
+
+// Protection requests to the host, their pages, and those the GPU thread made.
+Common::LiveControl::Counter g_protect_requests("protect_req");
+Common::LiveControl::Counter g_protect_pages("protect_pages");
+Common::LiveControl::Counter g_protect_requests_gpu("protect_req_gpu");
+Common::LiveControl::Counter g_protect_pages_gpu("protect_pages_gpu");
 
 [[noreturn]] void Fatal(const char* format, ...) {
 	std::fputs("PageManager fatal: ", stderr);
@@ -186,6 +193,12 @@ struct PageManager::Impl {
 	}
 
 	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
+		g_protect_requests.Add();
+		g_protect_pages.Add(size / PAGE_SIZE);
+		if (Common::LiveControl::OnGpuThread()) {
+			g_protect_requests_gpu.Add();
+			g_protect_pages_gpu.Add(size / PAGE_SIZE);
+		}
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode)) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", mode=0x%08" PRIx32, vaddr,
 			      static_cast<uint32_t>(mode));

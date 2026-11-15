@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/gpuTiming.h"
+#include "common/liveControl.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -33,6 +34,16 @@ constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
 // GPU-modified ranges come as many small scattered islands, so a readback widens to a window.
 constexpr uint64_t DownloadWindowSize = 512 * 1024;
+
+// For `measure` of the live channel: BDA synchronizations that had ranges to take, those ranges
+// and their copies; in-place readbacks and those that waited for the GPU; invalidations made by
+// the GPU thread (stores of the emulated command processor).
+Common::LiveControl::Counter g_bda_syncs("bda_syncs");
+Common::LiveControl::Counter g_bda_ranges("bda_ranges");
+Common::LiveControl::Counter g_bda_copies("bda_copies");
+Common::LiveControl::Counter g_inplace_reads("inplace_reads");
+Common::LiveControl::Counter g_inplace_waits("inplace_waits");
+Common::LiveControl::Counter g_invalidations_gpu("invalidate_gpu");
 
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
@@ -304,7 +315,9 @@ bool BufferCache::ReadBackInPlace(Buffer& buffer, uint64_t vaddr, uint64_t size)
 	if (dirty == 0 || dirty > MaxInPlaceReadback) {
 		return false;
 	}
+	g_inplace_reads.Add();
 	if (!m_scheduler.IsFree(write_tick)) {
+		g_inplace_waits.Add();
 		m_scheduler.Wait(write_tick);
 	}
 	// Publications of earlier downloads of these bytes land first, so none overwrites them.
@@ -385,6 +398,9 @@ BufferCache::~BufferCache() {
 }
 
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size, bool guest_store) {
+	if (Common::LiveControl::OnGpuThread()) {
+		g_invalidations_gpu.Add();
+	}
 	const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::CpuWrite);
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
@@ -1521,6 +1537,8 @@ void BufferCache::SynchronizeBda(const RangeSet& mapped) {
 	if (ranges.empty()) {
 		return;
 	}
+	g_bda_syncs.Add();
+	g_bda_ranges.Add(ranges.size());
 	// One protection change per tracking region for all the written pages (they are typically
 	// many small ranges: the guest's writes since the last synchronization), then one upload
 	// per buffer.
@@ -1550,6 +1568,7 @@ void BufferCache::SynchronizeBda(const RangeSet& mapped) {
 			    first = last;
 		    }
 	    });
+	g_bda_copies.Add(copies.size());
 	size_t group = 0;
 	for (size_t first = 0; first < copies.size(); group++) {
 		const auto id   = owners[copy_owners[first]];

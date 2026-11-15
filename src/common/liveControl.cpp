@@ -35,8 +35,9 @@ namespace Common::LiveControl {
 
 namespace {
 
-// Head of the list the switches' constructors build (before main, one thread).
-Switch* g_switches = nullptr;
+// Heads of the lists the switches' and counters' constructors build (before main, one thread).
+Switch*  g_switches = nullptr;
+Counter* g_counters = nullptr;
 
 HostHooks g_hooks;
 
@@ -128,17 +129,17 @@ double ProcessCpuSeconds() noexcept {
 // ---------------------------------------------------------------------------------------------
 // measure
 
-using Counter = DebugCounters::Counter;
+using DebugCounter = DebugCounters::Counter;
 
 constexpr std::array MEASURED_COUNTERS {
-    std::pair {Counter::Draws, "draws"},
-    std::pair {Counter::IndirectDraws, "indirect_draws"},
-    std::pair {Counter::Dispatches, "dispatches"},
-    std::pair {Counter::QueueSubmits, "submits"},
-    std::pair {Counter::GpuWaits, "gpu_waits"},
-    std::pair {Counter::GpuFaults, "write_faults"},
-    std::pair {Counter::ShadersCompiled, "shaders"},
-    std::pair {Counter::PipelinesCreated, "pipelines"},
+    std::pair {DebugCounter::Draws, "draws"},
+    std::pair {DebugCounter::IndirectDraws, "indirect_draws"},
+    std::pair {DebugCounter::Dispatches, "dispatches"},
+    std::pair {DebugCounter::QueueSubmits, "submits"},
+    std::pair {DebugCounter::GpuWaits, "gpu_waits"},
+    std::pair {DebugCounter::GpuFaults, "write_faults"},
+    std::pair {DebugCounter::ShadersCompiled, "shaders"},
+    std::pair {DebugCounter::PipelinesCreated, "pipelines"},
 };
 
 struct Snapshot {
@@ -154,6 +155,7 @@ struct Snapshot {
 	GpuTiming::Totals                                gpu;
 	double                                           process_cpu = 0.0;
 	std::vector<std::pair<std::string, double>>      thread_cpu;
+	std::vector<uint64_t>                            named; // The Counters, in list order.
 };
 
 Snapshot Take() {
@@ -163,14 +165,17 @@ Snapshot Take() {
 	for (size_t i = 0; i < MEASURED_COUNTERS.size(); i++) {
 		snapshot.counters[i] = DebugCounters::Get(MEASURED_COUNTERS[i].first);
 	}
-	snapshot.gpu_thread_busy_ns = DebugCounters::Get(Counter::GpuThreadBusyNs);
-	snapshot.gpu_wait_ns        = DebugCounters::Get(Counter::GpuWaitNs);
-	snapshot.buffer_upload      = DebugCounters::Get(Counter::BufferUploadBytes);
-	snapshot.texture_upload     = DebugCounters::Get(Counter::TextureUploadBytes);
-	snapshot.buffer_download    = DebugCounters::Get(Counter::BufferDownloadBytes);
+	snapshot.gpu_thread_busy_ns = DebugCounters::Get(DebugCounter::GpuThreadBusyNs);
+	snapshot.gpu_wait_ns        = DebugCounters::Get(DebugCounter::GpuWaitNs);
+	snapshot.buffer_upload      = DebugCounters::Get(DebugCounter::BufferUploadBytes);
+	snapshot.texture_upload     = DebugCounters::Get(DebugCounter::TextureUploadBytes);
+	snapshot.buffer_download    = DebugCounters::Get(DebugCounter::BufferDownloadBytes);
 	snapshot.sync               = GpuTiming::Sync().Snapshot();
 	snapshot.gpu                = GpuTiming::RunningTotals();
 	snapshot.process_cpu        = ProcessCpuSeconds();
+	for (const auto* counter = g_counters; counter != nullptr; counter = counter->Next()) {
+		snapshot.named.push_back(counter->Get());
+	}
 	for (const auto& thread: Threads()) {
 		const double seconds = ThreadCpuSeconds(thread);
 		const auto   known   = std::find_if(snapshot.thread_cpu.begin(), snapshot.thread_cpu.end(),
@@ -269,6 +274,15 @@ void Measure(uint64_t id, double seconds, const std::string& label) {
 	               per_frame(end.buffer_upload, begin.buffer_upload) / 1024.0,
 	               per_frame(end.texture_upload, begin.texture_upload) / 1024.0,
 	               per_frame(end.buffer_download, begin.buffer_download) / 1024.0);
+	if (g_counters != nullptr) {
+		line += " | counters";
+		size_t index = 0;
+		for (const auto* counter = g_counters; counter != nullptr; counter = counter->Next()) {
+			line += Format(" %s=%.1f", counter->Name(),
+			               per_frame(end.named[index], begin.named[index]));
+			index++;
+		}
+	}
 	line += " | waits_ms";
 	for (size_t reason = 0; reason < GpuTiming::SYNC_REASON_COUNT; reason++) {
 		if (sync.waits[reason] != 0) {
@@ -645,13 +659,18 @@ Switch::Switch(const char* name, uint32_t default_value) noexcept
 	}
 }
 
+Counter::Counter(const char* name) noexcept: m_name(name), m_next(g_counters) {
+	g_counters = this;
+}
+
 void SetHostHooks(const HostHooks& hooks) noexcept {
 	g_hooks = hooks;
 }
 
 void RegisterThread(const char* name) noexcept {
 	NamedThread thread;
-	thread.name = name;
+	thread.name          = name;
+	Detail::t_gpu_thread = thread.name == "gpu";
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	HANDLE handle = nullptr;
 	if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &handle, 0,
