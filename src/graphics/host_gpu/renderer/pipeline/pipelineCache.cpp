@@ -1460,6 +1460,12 @@ PrecompileOutcome PrecompileComputeProgram(GraphicContext& graphics, vk::Pipelin
 		                                        record.push_data_cursor);
 	};
 	std::optional<ShaderRecompiler::CompileResult> result;
+	// A created shader no dispatch has used may never be used: its module stays out of the
+	// simplification store, which every session reads whole.
+	std::optional<ShaderRecompiler::Spirv::SimplifiedStoreBypass> unstored;
+	if (code_only) {
+		unstored.emplace();
+	}
 	// No dispatch has used a created shader, and a recorded program may meet a recompiler that
 	// no longer handles its code: either is skipped instead of ending the process.
 	try {
@@ -1696,6 +1702,74 @@ void PipelineCache::ReleasePrecompiledStages() {
 	}
 	m_stage_memo.clear();
 }
+
+// The code-only builds of created compute shaders that have ended (their pipelines are in the
+// driver cache, or their shaders cannot be translated) with this emulator build and this driver
+// cache: later sessions do not queue them again. Without it every session would translate
+// every created shader no dispatch has used just to find its pipeline in the driver cache,
+// which is all the game's compute shaders once --import-shaders has brought them in (Saros:
+// 11,600). A text file: the signature line, then a key per line, appended as builds end. A file
+// of another signature, or a driver cache that starts empty, starts it over. Thread-safe.
+class PipelineCache::FinishedBuilds {
+public:
+	FinishedBuilds(std::filesystem::path path, std::string signature, bool keep)
+	    : m_path(std::move(path)), m_line("KytyFinishedBuilds1 " + std::move(signature)) {
+		if (keep) {
+			std::ifstream in(m_path);
+			std::string   text;
+			if (std::getline(in, text) && text == m_line) {
+				while (std::getline(in, text)) {
+					char*      end = nullptr;
+					const auto key = std::strtoull(text.c_str(), &end, 16);
+					if (end != text.c_str()) {
+						m_keys.insert(key);
+					}
+				}
+			}
+		}
+		Rewrite();
+	}
+	KYTY_CLASS_NO_COPY(FinishedBuilds);
+
+	[[nodiscard]] bool Contains(uint64_t key) const {
+		std::lock_guard lock(m_mutex);
+		return m_keys.contains(key);
+	}
+	[[nodiscard]] size_t Size() const {
+		std::lock_guard lock(m_mutex);
+		return m_keys.size();
+	}
+	void Add(uint64_t key) {
+		std::lock_guard lock(m_mutex);
+		if (m_keys.insert(key).second && m_file.is_open()) {
+			m_file << fmt::format("{:016x}\n", key);
+			m_file.flush();
+		}
+	}
+	// The driver cache starts over: so does this.
+	void Clear() {
+		std::lock_guard lock(m_mutex);
+		m_keys.clear();
+		Rewrite();
+	}
+
+private:
+	void Rewrite() {
+		m_file.close();
+		m_file.open(m_path, std::ios::trunc);
+		m_file << m_line << '\n';
+		for (const auto key: m_keys) {
+			m_file << fmt::format("{:016x}\n", key);
+		}
+		m_file.flush();
+	}
+
+	std::filesystem::path        m_path;
+	std::string                  m_line;
+	mutable std::mutex           m_mutex;
+	std::unordered_set<uint64_t> m_keys;
+	std::ofstream                m_file;
+};
 
 PipelineCache::PipelineCache(GraphicContext&                         graphics,
                              ShaderRecompiler::IR::ImageHeapSource* image_heap,
@@ -2011,6 +2085,9 @@ void PipelineCache::InitializeDriverCache() {
 	m_precompile_attempts = std::make_unique<PrecompileAttempts>(
 	    PrecompileAttempts::PathFor(directory, title_id),
 	    PrecompileAttempts::PreviousPathFor(directory, title_id));
+	m_finished_created = std::make_unique<FinishedBuilds>(
+	    directory / (title_id + ".v1.finished"), signature + ":" + KYTY_GIT_VERSION,
+	    !initial_data.empty());
 	m_title_id = title_id;
 	SetPipelineManifest(
 	    std::make_unique<PipelineManifest>(PipelineManifest::PathFor(directory, title_id),
@@ -2213,6 +2290,11 @@ void PipelineCache::EnqueuePrecompileJob(uint64_t key, std::string label, Precom
 		}
 		if (kept.pipeline != nullptr) {
 			m_warm_pipelines.Keep(kept);
+		}
+		// A created shader's code-only build that ended is not queued by later sessions.
+		if (order >= PrecompileCreatedOrder && outcome != PrecompileOutcome::TimedOut &&
+		    m_finished_created != nullptr) {
+			m_finished_created->Add(key);
 		}
 		if (attempts != nullptr) {
 			attempts->End(key);
@@ -2510,24 +2592,33 @@ void PipelineCache::QueuePrecompile(uint32_t thread_count) {
 	const auto recorded = progress.Get().queued;
 	ImportPipelineList();
 	const auto listed = progress.Get().queued - recorded;
+	uint64_t   finished_before = 0;
 	// A created shader no session has dispatched gets the module of its code-only
 	// specialization, which the first dispatches of most such shaders use.
 	if (m_created != nullptr) {
 		const auto created = m_created->Records();
 		for (size_t i = 0; i < created.size(); i++) {
-			if (!m_manifest->HasShader(created[i]->shader_hash)) {
-				EnqueuePrecompile(created[i], true, FirstSeenPosition(i, created.size()));
+			if (m_manifest->HasShader(created[i]->shader_hash)) {
+				continue;
 			}
+			// Built by an earlier session of this emulator build into this driver cache.
+			if (m_finished_created != nullptr && m_finished_created->Contains(created[i]->Key())) {
+				finished_before++;
+				continue;
+			}
+			EnqueuePrecompile(created[i], true, FirstSeenPosition(i, created.size()));
 		}
 	}
 	const auto queued = progress.Get().queued;
 	PipelineCacheLog(
 	    "Precompile: {} recorded compute programs, {} recorded graphics pipelines, {} from the "
 	    "pipeline list and {} created compute shaders queued on {} threads ({} quarantined "
-	    "builds skipped or rebuilt unoptimized, {} retried once)",
+	    "builds skipped or rebuilt unoptimized, {} retried once; {} created compute shaders "
+	    "were built by earlier sessions)",
 	    recorded_compute, recorded - recorded_compute, listed, queued - recorded - listed,
 	    thread_count, m_precompile_attempts != nullptr ? m_precompile_attempts->FailedCount() : 0,
-	    m_precompile_attempts != nullptr ? m_precompile_attempts->RetriedCount() : 0);
+	    m_precompile_attempts != nullptr ? m_precompile_attempts->RetriedCount() : 0,
+	    finished_before);
 	// Entries of the list whose shaders the guest has not created stay queueable while it runs.
 	m_list_open = !m_precompile_only && m_list_resolver != nullptr && m_list_resolver->Pending();
 	if (!m_list_open && progress.EndQueueing() && !m_precompile_only) {
@@ -2729,6 +2820,9 @@ bool PipelineCache::StartEmptyDriverCache() {
 	m_driver_cache_rebuild = true;
 	m_driver_cache_dirty.store(false);
 	m_driver_history->Clear();
+	if (m_finished_created != nullptr) {
+		m_finished_created->Clear();
+	}
 	m_precompile_progress.Reset();
 	PipelineCacheLog(
 	    "Vulkan pipeline cache: rebuilding {} from the pipelines this precompile builds",

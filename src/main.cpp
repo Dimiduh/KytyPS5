@@ -193,6 +193,11 @@ static void PrintUsage() {
 	    "  --import-pipeline-list <file>        Precompile the pipelines of a shared list whose\n"
 	    "                                       shaders this game has (with --precompile-only, or\n"
 	    "                                       beside the game unless --no-precompile-pipelines).\n");
+	::printf(
+	    "  --import-shaders <file>              With --precompile-only: also build the compute\n"
+	    "                                       shaders of this file, which holds shader binaries\n"
+	    "                                       taken from the game's files (so before the game\n"
+	    "                                       has created them).\n");
 	::printf("  --serialize-dispatches               Order every guest compute dispatch after the\n"
 	         "                                       previous one, also where the guest sends no\n"
 	         "                                       flush between them.\n");
@@ -561,6 +566,8 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			options.config.export_pipeline_list = Common::PathFromUtf8(value);
 		} else if (arg == "--import-pipeline-list") {
 			options.config.import_pipeline_list = Common::PathFromUtf8(value);
+		} else if (arg == "--import-shaders") {
+			options.config.import_shaders = Common::PathFromUtf8(value);
 		} else if (arg == "--command-buffer-dump-folder") {
 			options.config.command_buffer_dump_folder = Common::PathFromUtf8(value);
 		} else if (arg == "--printf-direction") {

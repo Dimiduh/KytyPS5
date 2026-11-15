@@ -28,6 +28,20 @@ void SetSimplifiedStore(SimplifiedStore* store);
 // SimplifyForDriver through the store: a module simplified before (in this or an earlier session)
 // takes the stored words, a new one is simplified and stored.
 bool SimplifyForDriverStored(std::vector<uint32_t>& words);
+// While one lives, the calling thread's translations neither read nor fill the store: for modules
+// no session is known to need again (a precompile of shaders the game has not used). The store
+// is read into memory by every session, so what goes in must earn its place (the modules of all
+// of Saros' compute shaders are 1.4 GB).
+class SimplifiedStoreBypass {
+public:
+	SimplifiedStoreBypass();
+	~SimplifiedStoreBypass();
+	SimplifiedStoreBypass(const SimplifiedStoreBypass&)            = delete;
+	SimplifiedStoreBypass& operator=(const SimplifiedStoreBypass&) = delete;
+
+private:
+	bool m_previous;
+};
 
 uint32_t DriverSimplifyMinWords();
 void     SetDriverSimplifyMinWords(uint32_t words);

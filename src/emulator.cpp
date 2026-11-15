@@ -14,6 +14,7 @@
 #include "common/threads.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window.h"
+#include "graphics/shader/shader.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
@@ -29,6 +30,8 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <fmt/format.h>
+#include <string>
 #include <thread>
 
 namespace Emulator {
@@ -158,6 +161,17 @@ static void Execute(const std::filesystem::path& game_patch) {
 		std::quick_exit(Libs::Graphics::WindowExportPipelineList(list) ? 0 : 1);
 	}
 	if (Config::PrecompileOnlyEnabled()) {
+		// Shaders from the game's files join the ones the game created in earlier sessions,
+		// before the precompile lists what to build.
+		if (const auto seeds = Config::ImportShadersPath(); !seeds.empty()) {
+			const auto imported = Libs::Graphics::ShaderImportSeeds(seeds);
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Shader import: {} shaders ({} compute programs) from {}{}{}\n", imported.shaders,
+			    imported.compute, Common::PathToString(seeds),
+			    imported.rejected != 0 ? fmt::format(", {} not shader binaries", imported.rejected)
+			                           : std::string {},
+			    imported.read ? "" : "; the file could not be read to its end"));
+		}
 		// The renderer is up; the guest never starts. The driver cache is written when this
 		// returns; builds abandoned past their time budget may still run, so the process ends
 		// without joining them.

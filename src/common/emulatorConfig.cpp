@@ -269,6 +269,10 @@ std::filesystem::path ImportPipelineListPath() {
 	return g_config->import_pipeline_list;
 }
 
+std::filesystem::path ImportShadersPath() {
+	return g_config->import_shaders;
+}
+
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }

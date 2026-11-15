@@ -1574,9 +1574,19 @@ void SetSimplifiedStore(SimplifiedStore* store) {
 	g_store.store(store, std::memory_order_release);
 }
 
+static thread_local bool t_store_bypass = false;
+
+SimplifiedStoreBypass::SimplifiedStoreBypass(): m_previous(t_store_bypass) {
+	t_store_bypass = true;
+}
+
+SimplifiedStoreBypass::~SimplifiedStoreBypass() {
+	t_store_bypass = m_previous;
+}
+
 bool SimplifyForDriverStored(std::vector<uint32_t>& words) {
 	auto* store = g_store.load(std::memory_order_acquire);
-	if (store == nullptr) {
+	if (store == nullptr || t_store_bypass) {
 		return SimplifyForDriver(words);
 	}
 	// The simplifier's switches change its output for the same module.

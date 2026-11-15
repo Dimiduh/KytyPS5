@@ -94,6 +94,93 @@ uint64_t ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	return hash;
 }
 
+// A field of a shader header that holds an offset from its own position (sceAgcCreateShader turns
+// those into pointers): the address it names when the `bytes` after it lie inside the header.
+template <typename T>
+static const T* SeedPointer(const uint8_t* header, size_t header_size, const void* field,
+                            size_t bytes) {
+	uint64_t offset = 0;
+	std::memcpy(&offset, field, sizeof(offset));
+	const auto at = static_cast<uint64_t>(static_cast<const uint8_t*>(field) - header);
+	if (offset == 0 || offset > header_size || at + offset > header_size ||
+	    bytes > header_size - (at + offset) || (at + offset) % alignof(T) != 0) {
+		return nullptr;
+	}
+	return reinterpret_cast<const T*>(header + at + offset);
+}
+
+ShaderSeedImport ShaderImportSeeds(const std::filesystem::path& path) {
+	ShaderSeedImport result;
+	FILE*            file = nullptr;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	file = _wfopen(path.c_str(), L"rb");
+#else
+	file = std::fopen(path.c_str(), "rb");
+#endif
+	if (file == nullptr) {
+		return result;
+	}
+	char     magic[16] {};
+	uint32_t count = 0;
+	if (std::fread(magic, 1, sizeof(magic), file) == sizeof(magic) &&
+	    std::memcmp(magic, "KytyShaderSeeds1", sizeof(magic)) == 0 &&
+	    std::fread(&count, sizeof(count), 1, file) == 1) {
+		result.read = true;
+	}
+	// Aligned as the guest's own: the header holds 8-byte fields, the code is read as dwords.
+	std::vector<uint64_t> header;
+	std::vector<uint32_t> code;
+	for (uint32_t i = 0; result.read && i < count; i++) {
+		uint32_t sizes[2] {};
+		constexpr uint32_t MaxHeader = 1u << 20u;
+		constexpr uint32_t MaxCode   = 1u << 26u;
+		if (std::fread(sizes, sizeof(uint32_t), 2, file) != 2 || sizes[0] > MaxHeader ||
+		    sizes[1] > MaxCode) {
+			result.read = false;
+			break;
+		}
+		header.assign((sizes[0] + 7u) / 8u, 0);
+		code.assign((sizes[1] + 3u) / 4u, 0);
+		if (std::fread(header.data(), 1, sizes[0], file) != sizes[0] ||
+		    std::fread(code.data(), 1, sizes[1], file) != sizes[1]) {
+			result.read = false;
+			break;
+		}
+		const auto* bytes = reinterpret_cast<const uint8_t*>(header.data());
+		const auto* h     = reinterpret_cast<const Shader*>(header.data());
+		if (sizes[0] < sizeof(Shader) || h->file_header != 0x34333231 || h->version != 0x00000018 ||
+		    h->shader_size != sizes[1] || sizes[1] == 0 || sizes[1] % sizeof(uint32_t) != 0) {
+			result.rejected++;
+			continue;
+		}
+		// As sceAgcCreateShader notes a shader the guest creates (src/libs/agc.cpp).
+		const auto hash = XXH3_64bits(code.data(), ShaderProgramSize(code.data(), sizes[1]));
+		ShaderNoteCreatedCode({.binary_type = h->type, .hash = hash, .code = std::span(code)});
+		result.shaders++;
+		if (static_cast<Prospero::ShaderBinaryType>(h->type) != Prospero::ShaderBinaryType::kCs) {
+			continue;
+		}
+		const auto* registers = SeedPointer<ShaderRegister>(
+		    bytes, sizes[0], &h->sh_registers, h->num_sh_registers * sizeof(ShaderRegister));
+		const auto* specials =
+		    SeedPointer<ShaderSpecialRegs>(bytes, sizes[0], &h->specials, sizeof(ShaderSpecialRegs));
+		if (registers == nullptr || specials == nullptr) {
+			continue;
+		}
+		ShaderCreatedCompute created;
+		created.hash = hash;
+		created.code = std::span(code);
+		if (ShaderGetCreatedComputeInput(std::span(registers, h->num_sh_registers),
+		                                 specials->dispatch_modifier, h->scratch_size_dw_per_thread,
+		                                 created.input, created.user_data_count)) {
+			ShaderNoteCreatedCompute(created);
+			result.compute++;
+		}
+	}
+	std::fclose(file);
+	return result;
+}
+
 static std::function<void(const ShaderCreatedCompute&)> g_created_compute_sink;
 static std::mutex                                       g_created_compute_mutex;
 

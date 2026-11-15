@@ -8,6 +8,7 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <array>
+#include <filesystem>
 #include <functional>
 #include <span>
 #include <string>
@@ -380,6 +381,22 @@ struct ShaderCreatedCode {
 // Receives every created shader on the creating guest thread, like the compute sink.
 void     ShaderSetCreatedCodeSink(std::function<void(const ShaderCreatedCode&)> sink);
 void     ShaderNoteCreatedCode(const ShaderCreatedCode& shader);
+
+// --import-shaders: shader binaries taken from the game's files, each noted as
+// sceAgcCreateShader notes a shader the guest creates (the code sink, and the compute sink for a
+// compute shader), so that the precompile builds them before the game has created them. The
+// file: "KytyShaderSeeds1", a count (u32), then per shader the header size and the code size
+// (u32 each), the AGC shader header as the game stores it (its pointer fields still offsets
+// from themselves) and the code.
+struct ShaderSeedImport {
+	// The file was read to its end.
+	bool     read     = false;
+	uint64_t shaders  = 0;
+	uint64_t compute  = 0;
+	// Not a version 0x18 shader header, or sizes that disagree with it.
+	uint64_t rejected = 0;
+};
+ShaderSeedImport ShaderImportSeeds(const std::filesystem::path& path);
 uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);

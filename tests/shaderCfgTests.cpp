@@ -33,6 +33,9 @@
 #include "xxhash.h"
 #include "SrtWalkerTestMemory.h"
 
+#include <cstddef>
+#include <filesystem>
+#include <fstream>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -3861,6 +3864,110 @@ void TestCreatedComputeShaderInput() {
   Check(!ShaderGetCreatedComputeInput(std::span(registers).first(4), 0x1u, 0u,
                                       info, user_data_count),
         "registers without RSRC2 must not give a compute input");
+}
+
+// --import-shaders: every shader binary of a seed file reaches the created-code
+// sink, a compute shader also the created-compute sink with the input its
+// header's registers describe; a record that is no shader header is counted and
+// passed over, and offsets that leave the header give no compute input.
+void TestShaderSeedImport() {
+  const ShaderRegister registers[] = {
+      {Pm4::COMPUTE_PGM_LO, 0x1000u},
+      {Pm4::COMPUTE_PGM_HI, 0u},
+      {Pm4::COMPUTE_PGM_RSRC1, 0xc0u << 12u},
+      {Pm4::COMPUTE_PGM_RSRC2, (2u << 1u) | (4u << 15u)},
+      {Pm4::COMPUTE_NUM_THREAD_X, 8u},
+      {Pm4::COMPUTE_NUM_THREAD_Y, 8u},
+      {Pm4::COMPUTE_NUM_THREAD_Z, 1u},
+  };
+  struct Binary {
+    Shader header{};
+    ShaderRegister registers[7]{};
+    ShaderSpecialRegs specials{};
+  };
+  const std::vector<uint32_t> code = {0x7e000280u, 0xbf810000u, 0u, 0u};
+  const auto make = [&](uint8_t type, bool in_bounds) {
+    Binary binary;
+    binary.header.file_header = 0x34333231u;
+    binary.header.version = 0x18u;
+    binary.header.header_size = sizeof(Binary);
+    binary.header.shader_size =
+        static_cast<uint32_t>(code.size() * sizeof(uint32_t));
+    binary.header.type = type;
+    binary.header.num_sh_registers = 7;
+    binary.header.scratch_size_dw_per_thread = 12;
+    std::copy(std::begin(registers), std::end(registers), binary.registers);
+    binary.specials.dispatch_modifier = 0x8001u;
+    // Offsets from the fields themselves, as the game stores them.
+    const auto offset = [&](size_t field, size_t target) {
+      return static_cast<uint64_t>(in_bounds ? target - field : 0x100000u);
+    };
+    const auto registers_offset = offset(offsetof(Binary, header.sh_registers),
+                                         offsetof(Binary, registers));
+    const auto specials_offset =
+        offset(offsetof(Binary, header.specials), offsetof(Binary, specials));
+    std::memcpy(&binary.header.sh_registers, &registers_offset,
+                sizeof(registers_offset));
+    std::memcpy(&binary.header.specials, &specials_offset,
+                sizeof(specials_offset));
+    return binary;
+  };
+  const auto path = std::filesystem::temp_directory_path() /
+                    "kyty_shader_seed_import_test.seeds";
+  {
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    const auto write = [&](const void *data, size_t size) {
+      file.write(static_cast<const char *>(data),
+                 static_cast<std::streamsize>(size));
+    };
+    const uint32_t count = 4;
+    const uint32_t sizes[2] = {
+        sizeof(Binary), static_cast<uint32_t>(code.size() * sizeof(uint32_t))};
+    write("KytyShaderSeeds1", 16);
+    write(&count, sizeof(count));
+    const auto compute = make(0, true);
+    const auto pixel = make(1, true);
+    auto broken = make(0, true);
+    broken.header.file_header = 0;
+    const auto outside = make(0, false);
+    for (const Binary *binary :
+         {&compute, &pixel, static_cast<const Binary *>(&broken), &outside}) {
+      write(sizes, sizeof(sizes));
+      write(binary, sizeof(Binary));
+      write(code.data(), sizes[1]);
+    }
+  }
+  std::vector<std::pair<uint8_t, size_t>> noted;
+  std::vector<ShaderComputeInputInfo> computes;
+  uint32_t compute_user_data = 0;
+  ShaderSetCreatedCodeSink([&](const ShaderCreatedCode &shader) {
+    noted.emplace_back(shader.binary_type, shader.code.size());
+  });
+  ShaderSetCreatedComputeSink([&](const ShaderCreatedCompute &shader) {
+    computes.push_back(shader.input);
+    compute_user_data = shader.user_data_count;
+  });
+  const auto imported = ShaderImportSeeds(path);
+  ShaderSetCreatedCodeSink({});
+  ShaderSetCreatedComputeSink({});
+  std::error_code ignored;
+  std::filesystem::remove(path, ignored);
+  Check(imported.read && imported.shaders == 3 && imported.compute == 1 &&
+            imported.rejected == 1,
+        "a seed file's shaders were not counted as imported, compute and "
+        "rejected");
+  Check(noted.size() == 3 && noted[0] == std::pair<uint8_t, size_t>{0, 4} &&
+            noted[1] == std::pair<uint8_t, size_t>{1, 4} &&
+            noted[2] == std::pair<uint8_t, size_t>{0, 4},
+        "the imported shaders did not reach the created-code sink with "
+        "their type and code");
+  Check(computes.size() == 1 && computes[0].threads_num[0] == 8u &&
+            computes[0].wave_size == 32u &&
+            computes[0].scratch_size_dwords == 12u && compute_user_data == 2u,
+        "the imported compute shader did not reach the created-compute sink "
+        "with the input of its header");
+  Check(!ShaderImportSeeds(path).read,
+        "a missing seed file must not count as read");
 }
 
 void SetImageTestType(std::array<uint32_t, 64> *data, uint32_t srsrc,
@@ -14669,6 +14776,9 @@ int main() {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  // The wave64 cases assert on the two-lanes-per-invocation shape; a program proven lane-local
+  // (the default for compute on 32-lane subgroups, LaneLocalTests) is translated one lane wide.
+  ShaderRecompiler::Frontend::SetLaneLocalTranslation(false);
   TestVop3FloatConversionDecode();
   // These cases assert on the shape the structurizer emits, so they read the
   // module before the driver simplification; CheckSpirvBinaryValidates still
@@ -14720,6 +14830,7 @@ int main() {
   TestNewShaderRecompilerScalarMemoryBindingDomains();
   TestRecoverableFatalScope();
   TestCreatedComputeShaderInput();
+  TestShaderSeedImport();
   TestCodeOnlySpecializationMatchesPlainDescriptors();
   // Opcode semantics and optimized SPIR-V are exercised by
   // ShaderRecompilerComputeTests; keep the distinct decoder contract checks
