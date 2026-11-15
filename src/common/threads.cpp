@@ -63,8 +63,42 @@ static wait_poll_func_t g_cond_wait_poll_callback = nullptr;
 
 static std::thread::id g_main_thread;
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// Windows runs the threads of a process whose window is not in the foreground at reduced speed
+// where it can: on a CPU with performance and efficiency cores it places them on the efficiency
+// cores, and it may coarsen their timers. The emulator's work is the same whether or not its
+// window has the focus (a second monitor, a capture, an overlay in front): with the window in
+// the background Saros ran at 24.7 flips/s on an i9-13900K and at 37.6 once its threads were
+// kept on the performance cores. Opting out of both leaves the scheduler free to use every core
+// as for a foreground process. KYTY_POWER_THROTTLING=1 keeps the system's default.
+static void OptOutOfPowerThrottling() {
+	if (const char* keep = std::getenv("KYTY_POWER_THROTTLING");
+	    keep != nullptr && std::strcmp(keep, "1") == 0) {
+		return;
+	}
+#ifndef PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+#define PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION 0x4
+#endif
+	PROCESS_POWER_THROTTLING_STATE state {};
+	state.Version     = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+	state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED |
+	                    PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+	state.StateMask   = 0;
+	if (SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state, sizeof(state)) ==
+	    0) {
+		// Before Windows 11 the timer resolution control is unknown: the execution speed alone.
+		state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+		(void)SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state,
+		                            sizeof(state));
+	}
+}
+#endif
+
 void InitializeThreads() {
 	g_main_thread = std::this_thread::get_id();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	OptOutOfPowerThrottling();
+#endif
 }
 
 void Thread::SleepMicro(uint32_t micros) {
