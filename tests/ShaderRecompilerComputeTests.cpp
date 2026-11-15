@@ -7436,7 +7436,7 @@ public:
     };
     BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, never, never);
     collect(4);
-    const auto id = cache.FindBuffer(base, 2 * page);
+    const auto id = cache.FindBuffer(base, 2 * page, true);
     const auto device_address = cache.GetBuffer(id).BufferDeviceAddress();
     context.PrepareBda();
     // Older than the aggressive collection needs, younger than the BDA age.
@@ -7571,7 +7571,7 @@ public:
       }
     };
     BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, never, never);
-    const auto id = cache.FindBuffer(base, 2 * page);
+    const auto id = cache.FindBuffer(base, 2 * page, true);
     Require(name, "resident", static_cast<bool>(id), "no buffer was created");
     collect(200);
     Require(name, "kept without BDA", cache.IsRegionRegistered(base, 2 * page),
@@ -7623,7 +7623,7 @@ public:
 
     // With BDA accesses in use a buffer is watched once it went unused for the
     // BDA collection age, not the (longer) age of the plain collection.
-    const auto again = cache.FindBuffer(base, 2 * page);
+    const auto again = cache.FindBuffer(base, 2 * page, true);
     const auto again_address = cache.GetBuffer(again).BufferDeviceAddress();
     context.PrepareBda();
     collect(static_cast<uint32_t>(BufferCache::BdaCollectionAge));
@@ -7635,6 +7635,149 @@ public:
     Require(name, "aged with BDA",
             read_entry() == (again_address | BufferCache::BdaWatchBit),
             "a buffer past the BDA collection age was not watched");
+
+    context.UnmapMemory(base, 2 * page);
+    scheduler.Finish();
+    DestroyBuffer(&entries);
+    Require(
+        name, "release",
+        LibKernel::Memory::KernelMunmap(base, 2 * page) == 0 &&
+            LibKernel::Memory::KernelReleaseDirectMemory(direct, 2 * page) == 0,
+        "guest allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // A buffer only bindings use is left to them: a BDA synchronization passes
+  // over the guest's stores into it (they stay modified pages until a binding
+  // covers them) and its page table entries are watched. A reported access
+  // through them makes it a buffer shaders read, synchronized at ordering
+  // points from then on, until a probation passes without a report.
+  void CheckBdaUnreadBuffer() {
+    constexpr const char *name = "BdaUnreadBuffer";
+    constexpr auto page = BufferCache::CACHING_PAGESIZE;
+    EnsureRuntimeContext();
+    int64_t direct = -1;
+    void *mapped = nullptr;
+    Require(name, "allocation",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), 2 * page,
+                page, 0, &direct) == 0 &&
+                LibKernel::Memory::KernelMapDirectMemory(&mapped, 2 * page, 0x3,
+                                                         0, direct, page) == 0,
+            "guest allocation failed");
+    const auto base = reinterpret_cast<uint64_t>(mapped);
+    std::fill_n(static_cast<u32 *>(mapped), 2 * page / sizeof(u32),
+                0x0b1ec0deu);
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    auto &cache = context.GetBufferCache();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    context.MapMemory(base, 2 * page);
+    constexpr auto never = std::numeric_limits<uint64_t>::max();
+    BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, never, never);
+    const auto id = cache.FindBuffer(base, 2 * page);
+    const auto device_address = cache.GetBuffer(id).BufferDeviceAddress();
+
+    auto entries = CreateHostBuffer(name, sizeof(vk::DeviceAddress),
+                                    vk::BufferUsageFlagBits::eTransferDst, {});
+    const auto watched = [&] {
+      auto command = scheduler.Current().Handle();
+      const vk::MemoryBarrier before{
+          .srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
+          .dstAccessMask = vk::AccessFlagBits::eTransferRead};
+      command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                              vk::PipelineStageFlagBits::eTransfer, {}, 1,
+                              &before, 0, nullptr, 0, nullptr);
+      const vk::BufferCopy copy{BufferCache::PageIndex(base) *
+                                    sizeof(vk::DeviceAddress),
+                                0, entries.size};
+      command.copyBuffer(cache.GetBdaPageTableBuffer()->Handle(),
+                         entries.buffer, 1, &copy);
+      const vk::MemoryBarrier after{
+          .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+          .dstAccessMask = vk::AccessFlagBits::eHostRead};
+      command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                              vk::PipelineStageFlagBits::eHost, {}, 1, &after,
+                              0, nullptr, 0, nullptr);
+      scheduler.Finish();
+      const auto words = ReadBuffer(name, entries, 2);
+      const auto entry = words[0] | (uint64_t{words[1]} << 32u);
+      Require(name, "entry",
+              (entry & ~uint64_t{BufferCache::BdaWatchBit}) == device_address,
+              "the page table does not map the buffer");
+      return (entry & BufferCache::BdaWatchBit) != 0;
+    };
+    // A guest store into the first tracker page, and whether the next
+    // synchronization uploaded it.
+    const auto store_is_synchronized = [&] {
+      cache.InvalidateMemory(base + 8, 1);
+      context.PrepareBda();
+      return !cache.IsRegionCpuModified(base, TRACKER_PAGE_SIZE);
+    };
+    const auto report_access = [&] {
+      const auto reported_page = BufferCache::PageIndex(base + page);
+      cache.GetFaultBuffer()->Fill((reported_page >> 5u) * sizeof(u32),
+                                   sizeof(u32), 1u << (reported_page & 31u));
+      cache.ProcessFaultBuffer();
+      scheduler.Finish();
+    };
+    // Collections with the buffer in use by a binding, which keeps it cached.
+    const auto collect = [&](uint64_t times) {
+      for (uint64_t i = 0; i < times; i++) {
+        (void)cache.ObtainBuffer(base, page + 4, false, false);
+        cache.RunGarbageCollector();
+      }
+    };
+
+    // A new buffer takes the guest memory it was created over once.
+    context.PrepareBda();
+    Require(name, "new buffer",
+            !cache.IsRegionCpuModified(base, 2 * page) && watched(),
+            "a new buffer did not take its guest memory, or is not watched");
+    // Guest stores into it stay modified pages at ordering points, and a
+    // binding uploads those it covers.
+    const auto far_store = base + page + TRACKER_PAGE_SIZE;
+    cache.InvalidateMemory(base + 8, 1);
+    cache.InvalidateMemory(far_store + 8, 1);
+    context.PrepareBda();
+    Require(name, "stores left to bindings",
+            cache.IsRegionCpuModified(base, TRACKER_PAGE_SIZE) &&
+                cache.IsRegionCpuModified(far_store, TRACKER_PAGE_SIZE),
+            "a guest store into a buffer no shader reads through the page table "
+            "was uploaded at an ordering point");
+    (void)cache.ObtainBuffer(base, page + 4, false, false);
+    Require(name, "binding upload",
+            !cache.IsRegionCpuModified(base, page) &&
+                cache.IsRegionCpuModified(far_store, TRACKER_PAGE_SIZE),
+            "a binding did not upload exactly the modified pages it covers");
+
+    report_access();
+    context.PrepareBda();
+    Require(name, "reported access",
+            !cache.IsRegionCpuModified(base, 2 * page) && !watched(),
+            "a reported access did not synchronize the buffer and end its watch");
+    Require(name, "read buffer", store_is_synchronized(),
+            "a guest store into a buffer shaders read was not uploaded");
+
+    collect(BufferCache::BdaProbeInterval + BufferCache::BdaProbeStride);
+    Require(name, "probed", watched() && store_is_synchronized(),
+            "a buffer read for the probe interval is not watched, or lost its "
+            "synchronization during the probation");
+    report_access();
+    Require(name, "probation report", !watched() && store_is_synchronized(),
+            "a report during the probation did not end the watch");
+
+    collect(BufferCache::BdaProbeInterval + BufferCache::BdaProbeStride);
+    Require(name, "probed again", watched() && store_is_synchronized(),
+            "the buffer was not probed again");
+    collect(BufferCache::BdaProbationTicks + BufferCache::BdaProbeStride);
+    Require(name, "unread again", watched() && !store_is_synchronized(),
+            "a probation without a report did not leave the buffer to its "
+            "bindings");
 
     context.UnmapMemory(base, 2 * page);
     scheduler.Finish();
@@ -7842,7 +7985,7 @@ public:
     context.InitializeGpu(nullptr);
     context.MapMemory(base, page);
     context.MapMemory(base + 2 * page, page);
-    const auto id = cache.FindBuffer(base, 3 * page);
+    const auto id = cache.FindBuffer(base, 3 * page, true);
     auto &buffer = cache.GetBuffer(id);
     auto readback = CreateHostBuffer(name, 11 * sizeof(u32),
                                      vk::BufferUsageFlagBits::eTransferDst, {});
@@ -8003,8 +8146,8 @@ public:
     }
     Require(name, "clean eviction", !cache.IsRegionRegistered(base, 3 * page),
             "garbage collection kept the clean buffer");
-    const auto low = cache.FindBuffer(base, page);
-    const auto high = cache.FindBuffer(base + page, 2 * page);
+    const auto low = cache.FindBuffer(base, page, true);
+    const auto high = cache.FindBuffer(base + page, 2 * page, true);
     context.PrepareBda();
     Require(name, "replacement upload", !cache.IsRegionCpuModified(base, 3 * page),
             "buffers replacing an evicted one did not upload their untracked pages");
@@ -8085,7 +8228,7 @@ public:
     // Guest writes invalidate the pages first, as the write-fault handler
     // would.
     context.MapMemory(base, 2 * page);
-    const auto id = cache.FindBuffer(base, 2 * page);
+    const auto id = cache.FindBuffer(base, 2 * page, true);
     auto &buffer = cache.GetBuffer(id);
     auto readback = CreateHostBuffer(name, 4 * sizeof(u32),
                                      vk::BufferUsageFlagBits::eTransferDst, {});
@@ -8461,7 +8604,7 @@ public:
       // a preceding read. Registration must preserve both ordering requirements.
       table.Fill(table_offset, pages * sizeof(vk::DeviceAddress), 0xa5a5a5a5u);
       const auto previous_tick = scheduler.CurrentTick();
-      const auto id = cache.FindBuffer(base, pages * page);
+      const auto id = cache.FindBuffer(base, pages * page, true);
       const auto &buffer = cache.GetBuffer(id);
       const auto destination_offset = expected.size() * sizeof(vk::DeviceAddress);
       for (uint64_t index = 0; index < pages; ++index) {
@@ -64297,6 +64440,7 @@ int main(int argc, char **argv) {
     vulkan.CheckFaultRecordsOverflow();
     vulkan.CheckBdaWatchedEviction();
     vulkan.CheckBdaAgeCollection();
+    vulkan.CheckBdaUnreadBuffer();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--batched-uploads-only") == 0) {
@@ -64315,6 +64459,7 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     vulkan.CheckBdaWatchedEviction();
     vulkan.CheckBdaAgeCollection();
+    vulkan.CheckBdaUnreadBuffer();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sampler-border-only") == 0) {
@@ -64580,6 +64725,7 @@ int main(int argc, char **argv) {
   vulkan.CheckFaultRecordsOverflow();
   vulkan.CheckBdaWatchedEviction();
   vulkan.CheckBdaAgeCollection();
+  vulkan.CheckBdaUnreadBuffer();
   vulkan.CheckBatchedUploads();
   vulkan.CheckScatteredUploads();
   vulkan.CheckLargeSparseImageUpload();

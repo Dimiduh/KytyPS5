@@ -53,14 +53,23 @@ public:
 	// more than a fault report takes to reach the cache (ProcessFaultBuffer).
 	static constexpr uint64_t BdaWatchTicks = 16;
 	// Collections a clean buffer stays untouched before the collector watches it while BDA
-	// accesses are in use (instead of the plain age of 160). Every cached buffer then costs its
-	// share of each BDA synchronization (write protection, copies of guest stores) whether or
-	// not anything reads it, while a buffer still read through the page table is kept by the
+	// accesses are in use (instead of the plain age of 160). A cached buffer then costs its
+	// share of each BDA synchronization (write protection, copies of guest stores) while it
+	// counts as read through the page table (BdaUse), and its watched page table entries
+	// otherwise, while a buffer still read through the page table is kept by the
 	// watch and one read through bindings is touched by every use; an evicted buffer that is
 	// used again costs only its re-creation and upload. Shorter ages re-create buffers still in
 	// periodic use (their uploads come back as waits); the collection passes past the watch
 	// window bound how long an idle buffer is kept.
 	static constexpr uint64_t BdaCollectionAge = 20;
+	// Garbage-collector ticks a buffer shaders read through the page table (BdaUse::Read) stays
+	// so before it is probed, and ticks a probed buffer waits for a reported access before it
+	// counts as unread. Reports take a few ticks to reach the cache (ProcessFaultBuffer); the
+	// probation is much longer, so a buffer read only now and then is not taken for an unread
+	// one. The states change at every BdaProbeStride-th tick.
+	static constexpr uint64_t BdaProbeInterval  = 600;
+	static constexpr uint64_t BdaProbationTicks = 64;
+	static constexpr uint64_t BdaProbeStride    = 16;
 
 	static constexpr uint64_t PageIndex(uint64_t address) {
 		return (address < LOWER_ADDRESS_SIZE
@@ -87,7 +96,11 @@ public:
 	// bytes past vaddr, or just the byte at vaddr when no GPU-modified range contains it.
 	void                                       ReadMemoryAround(uint64_t vaddr, uint64_t window);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
-	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
+	// The buffer that holds the range, created when there is none. `by_address`: shaders read
+	// the range through the page table (a fault report, an address base), so the buffer takes
+	// the guest's stores at ordering points (BdaUse::Read); a buffer found for a binding takes
+	// them when the binding is obtained.
+	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size, bool by_address = false);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
@@ -151,8 +164,9 @@ public:
 	// since the last boundary take the current tick as the tick of their latest write.
 	void               NoteCommandBoundary();
 	void               ProcessFaultBuffer();
-	// A fault report of a resident page whose buffer is watched (BdaWatchBit): records the
-	// access for the next collection and returns true; false when the page needs a buffer.
+	// A fault report of a resident page (its buffer is watched, or was when the shader ran):
+	// shaders read the buffer through the page table, and the collector keeps it; returns true.
+	// False when the page needs a buffer.
 	[[nodiscard]] bool NoteBdaAccess(uint64_t address);
 	// Fault reports were dropped (the report area was full): every watched buffer counts as
 	// accessed at the next collection.
@@ -202,13 +216,24 @@ private:
 	template <typename Func>
 	void ForEachBufferPart(uint64_t start, uint64_t finish, Func&& func);
 	void TouchBuffer(Buffer& buffer);
-	// Writes the page table entries of a registered buffer, with BdaWatchBit when `watched`.
-	void WriteBdaEntries(const Buffer& buffer, bool watched);
+	// Whether the page table entries of the buffer carry BdaWatchBit: the collector considers
+	// it, or no shader is known to read it through the page table (BdaUse).
+	[[nodiscard]] bool IsBdaWatched(const Buffer& buffer) const noexcept {
+		return buffer.bda_watch_tick != 0 || (m_bda_lazy && buffer.bda_use != BdaUse::Read);
+	}
+	// Writes the page table entries of a registered buffer (see IsBdaWatched).
+	void WriteBdaEntries(const Buffer& buffer);
+	// Shaders read the buffer through the page table: it is synchronized at ordering points
+	// from now on, starting with the guest's stores it has not taken.
+	void MarkBdaRead(Buffer& buffer);
+	// Every BdaProbeStride-th collection: probes the buffers read through the page table for
+	// BdaProbeInterval, and takes those probed for BdaProbationTicks without a report as unread.
+	void ProbeBdaReaders();
 	// Keeps the watched buffers shaders reported (NoteBdaAccess, NoteLostBdaReports).
 	void                        KeepAccessedBdaBuffers();
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
-	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size, bool by_address);
 	void                   Register(BufferId id);
 	void Unregister(BufferId id);
 	template <bool insert>
@@ -308,6 +333,7 @@ private:
 	BdaSyncDue                  m_bda_due;
 	std::vector<GuestRange>     m_bda_ranges;
 	std::vector<BufferId>       m_bda_owners;
+	std::vector<BufferId>       m_bda_created;
 	std::vector<vk::BufferCopy> m_bda_copies;
 	std::vector<size_t>         m_bda_copy_owners;
 	std::vector<vk::Buffer>     m_bda_sources;
@@ -373,6 +399,8 @@ private:
 	// Shaders read the page table (SynchronizeBda ran), so collection watches buffers first.
 	bool                  m_bda_in_use       = false;
 	bool                  m_bda_reports_lost = false;
+	// The bda_lazy switch as applied to the page table entries (ProbeBdaReaders).
+	bool                  m_bda_lazy         = true;
 	std::vector<uint64_t> m_bda_accessed;
 	std::vector<BufferId> m_bda_watched;
 	// Last, so it ends (with its jobs done) before the tracker and the staging memory they use.

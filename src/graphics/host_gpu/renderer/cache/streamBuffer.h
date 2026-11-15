@@ -38,6 +38,14 @@ inline constexpr vk::BufferUsageFlags ReadFlags =
 inline constexpr vk::BufferUsageFlags AllFlags =
     ReadFlags | vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eStorageBuffer;
 
+// How shaders use a cached guest buffer through the BDA page table (addresses, GPU-selected V#s,
+// BVH nodes), as far as the buffer cache knows:
+//   Unread  no such access is known. The buffer's pages are watched (BufferCache::BdaWatchBit),
+//           and the guest's stores reach it only when a range of it is bound.
+//   Read    shaders read it: the guest's stores reach it at every command ordering point.
+//   Probed  Read and watched again for a while, to find out whether shaders still read it.
+enum class BdaUse : uint8_t { Unread, Read, Probed };
+
 class Buffer {
 public:
 	// A host-readable device buffer is placed in device-local memory the host can map (resizable
@@ -89,6 +97,13 @@ public:
 	// The garbage-collector tick (plus one) since which shaders report their accesses to the
 	// buffer's pages (BufferCache::BdaWatchBit), or 0.
 	uint64_t bda_watch_tick = 0;
+	// Whether shaders read the buffer through the page table (BufferCache::MarkBdaRead), and the
+	// garbage-collector tick of the latest evidence, or of the probation's start.
+	BdaUse   bda_use      = BdaUse::Unread;
+	uint64_t bda_use_tick = 0;
+	// The buffer has not taken the guest memory it was created over yet: its first
+	// synchronization uploads it whatever bda_use says (BufferCache::SynchronizeBda).
+	bool     bda_new      = true;
 	// The scheduler tick that holds the latest GPU write of the buffer, valid while no write is
 	// open (marked by a command still being prepared; BufferCache::NoteCommandBoundary).
 	uint64_t gpu_write_tick = 0;

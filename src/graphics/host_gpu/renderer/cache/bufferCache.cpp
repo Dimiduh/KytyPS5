@@ -65,6 +65,18 @@ Common::LiveControl::Switch g_readback_narrow("readback_narrow", 1);
 // GPU thread for 2 ms.
 Common::LiveControl::Switch g_inplace_max_kb("inplace_max_kb", 64);
 
+// 1: a BDA synchronization uploads the guest's stores only into buffers shaders read through
+// the page table (BdaUse); a buffer only bindings use takes them when a binding is obtained, and
+// its stored pages stay unprotected until then. 0: every cached buffer is synchronized. In Saros
+// about 3,700 pages a frame were stored into cached buffers, in thousands of scattered pieces
+// (the engine's heap shares its pages with what the GPU reads); shaders read one of them through
+// the page table and bindings covered about 700, and the rest was protected and uploaded again
+// every frame for nothing: 40.4 -> 47.9 fps in one process, write faults 3,770 -> 840 a frame,
+// uploads 16.8 -> 4.3 MiB, protection requests of the GPU thread 1,930 -> 590.
+Common::LiveControl::Switch g_bda_lazy("bda_lazy", 1);
+// The buffer parts a BDA synchronization left to their bindings.
+Common::LiveControl::Counter g_bda_unread("bda_unread");
+
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
                                         vk::BufferUsageFlags usage, const auto& write) {
@@ -156,7 +168,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		m_total_used_memory += buffer.Size();
 		buffer.lru_id         = m_lru_cache.Insert(id, m_gc_tick);
 		buffer.bda_watch_tick = 0;
-		WriteBdaEntries(buffer, false);
+		WriteBdaEntries(buffer);
 		QueueBdaSync(buffer.CpuAddress(), buffer.Size());
 	} else {
 		m_buffers.erase(m_buffers.find(buffer.CpuAddress()));
@@ -172,14 +184,16 @@ void BufferCache::TouchBuffer(Buffer& buffer) {
 	m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
 	if (buffer.bda_watch_tick != 0) {
 		buffer.bda_watch_tick = 0;
-		WriteBdaEntries(buffer, false);
+		if (!IsBdaWatched(buffer)) {
+			WriteBdaEntries(buffer);
+		}
 	}
 }
 
-void BufferCache::WriteBdaEntries(const Buffer& buffer, bool watched) {
+void BufferCache::WriteBdaEntries(const Buffer& buffer) {
 	PageTable::PageRange pages {};
 	EXIT_IF(!PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
-	const auto                     flags = watched ? BdaWatchBit : vk::DeviceAddress {0};
+	const auto flags = IsBdaWatched(buffer) ? BdaWatchBit : vk::DeviceAddress {0};
 	std::vector<vk::DeviceAddress> addresses;
 	addresses.reserve(pages.last_exclusive - pages.first);
 	for (uint64_t i = 0; i < pages.last_exclusive - pages.first; ++i) {
@@ -194,11 +208,70 @@ void BufferCache::WriteBdaEntries(const Buffer& buffer, bool watched) {
 
 bool BufferCache::NoteBdaAccess(uint64_t address) {
 	const auto* owner = m_page_table.Find(address >> PageTable::kPageBits);
-	if (owner == nullptr || !*owner || m_slot_buffers[*owner].bda_watch_tick == 0) {
+	if (owner == nullptr || !*owner) {
 		return false;
 	}
-	m_bda_accessed.push_back(address);
+	// The page is resident, so the access was made. Its watch may have ended since the shader
+	// ran: the report still shows the use, and the page needs no other buffer.
+	auto& buffer = m_slot_buffers[*owner];
+	MarkBdaRead(buffer);
+	if (buffer.bda_watch_tick != 0) {
+		m_bda_accessed.push_back(address);
+	}
 	return true;
+}
+
+void BufferCache::MarkBdaRead(Buffer& buffer) {
+	const auto previous = std::exchange(buffer.bda_use, BdaUse::Read);
+	buffer.bda_use_tick = m_gc_tick;
+	if (previous == BdaUse::Read) {
+		return;
+	}
+	if (previous == BdaUse::Unread) {
+		// The stores it did not take: synchronizations passed them over (SynchronizeBda).
+		QueueBdaSync(buffer.CpuAddress(), buffer.Size());
+	}
+	if (!IsBdaWatched(buffer)) {
+		WriteBdaEntries(buffer);
+	}
+}
+
+void BufferCache::ProbeBdaReaders() {
+	const bool lazy = g_bda_lazy.On();
+	if (lazy != m_bda_lazy) {
+		// The switch changed: the entries of the unread buffers gain or lose their watch, and
+		// with every buffer synchronized again they take the stores passed over so far.
+		m_bda_lazy = lazy;
+		for (const auto& [vaddr, id]: m_buffers) {
+			(void)vaddr;
+			const auto& buffer = m_slot_buffers[id];
+			if (buffer.bda_use != BdaUse::Read && buffer.bda_watch_tick == 0) {
+				WriteBdaEntries(buffer);
+			}
+			if (!lazy && buffer.bda_use == BdaUse::Unread) {
+				QueueBdaSync(buffer.CpuAddress(), buffer.Size());
+			}
+		}
+	}
+	if (!lazy || m_gc_tick % BdaProbeStride != 0) {
+		return;
+	}
+	for (const auto& [vaddr, id]: m_buffers) {
+		(void)vaddr;
+		auto&      buffer = m_slot_buffers[id];
+		const auto age    = m_gc_tick - buffer.bda_use_tick;
+		if (buffer.bda_use == BdaUse::Read && age >= BdaProbeInterval) {
+			const bool watched  = IsBdaWatched(buffer);
+			buffer.bda_use      = BdaUse::Probed;
+			buffer.bda_use_tick = m_gc_tick;
+			if (!watched) {
+				WriteBdaEntries(buffer);
+			}
+		} else if (buffer.bda_use == BdaUse::Probed && age >= BdaProbationTicks) {
+			// Its entries stay watched: the next access through them is reported.
+			buffer.bda_use = BdaUse::Unread;
+		}
+	}
 }
 
 void BufferCache::KeepAccessedBdaBuffers() {
@@ -381,6 +454,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
+	m_bda_lazy = g_bda_lazy.On();
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
@@ -923,7 +997,7 @@ void BufferCache::RecordAsyncDownloads() {
 	    GuestWrites {written_begin, written_end - written_begin});
 }
 
-BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
+BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size, bool by_address) {
 	if (vaddr == 0) {
 		return NULL_BUFFER_ID;
 	}
@@ -934,10 +1008,13 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	if (owner != nullptr && *owner) {
 		auto& buffer = m_slot_buffers[*owner];
 		if (buffer.IsInBounds(vaddr, size)) {
+			if (by_address) {
+				MarkBdaRead(buffer);
+			}
 			return *owner;
 		}
 	}
-	return CreateBuffer(vaddr, size);
+	return CreateBuffer(vaddr, size, by_address);
 }
 
 BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t size) {
@@ -1004,7 +1081,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	DeleteBuffer(overlap_id);
 }
 
-BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
+BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size, bool by_address) {
 	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	size               = end - vaddr;
@@ -1018,10 +1095,15 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
 	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", overlap.begin,
 	                     overlap.end - overlap.begin);
+	// Shaders read the new buffer through the page table when they read a buffer it replaces.
+	bool read = by_address;
 	for (auto it = overlap.first; it != overlap.last;) {
 		const auto old_id = (it++)->second;
+		read              = read || m_slot_buffers[old_id].bda_use != BdaUse::Unread;
 		JoinOverlap(id, old_id, !overlap.has_stream_leap);
 	}
+	buffer.bda_use      = read ? BdaUse::Read : BdaUse::Unread;
+	buffer.bda_use_tick = m_gc_tick;
 	if (overlap.first != overlap.last) {
 		// The joined contents arrive by GPU copies recorded now.
 		NoteOpenWrite(buffer, id);
@@ -1438,6 +1520,7 @@ bool BufferCache::ConsumeCpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::RunGarbageCollector() {
+	ProbeBdaReaders();
 	KeepAccessedBdaBuffers();
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
@@ -1472,8 +1555,11 @@ void BufferCache::RunGarbageCollector() {
 			// Shaders may still use the buffer through the page table: they report it while it
 			// is watched, and only a buffer nobody reported is evicted.
 			if (buffer.bda_watch_tick == 0) {
+				const bool watched    = IsBdaWatched(buffer);
 				buffer.bda_watch_tick = tick + 1;
-				WriteBdaEntries(buffer, true);
+				if (!watched) {
+					WriteBdaEntries(buffer);
+				}
 				m_bda_watched.push_back(id);
 				return ++retire_count == limit;
 			}
@@ -1607,16 +1693,35 @@ void BufferCache::SynchronizeBda(const RangeSet& mapped) {
 	auto& owners = m_bda_owners;
 	ranges.clear();
 	owners.clear();
+	// The new buffers among the owners (Buffer::bda_new).
+	auto& created = m_bda_created;
+	created.clear();
 	// The due ranges come in address order, so a mapping usually holds several in a row.
 	RangeSet::Cursor mapping;
 	due.ForEach([&](uint64_t begin, uint64_t end) {
 		mapped.ForEachInRange(begin, end - begin, mapping, [&](uint64_t start, uint64_t finish) {
 			ForEachBufferPart(start, finish, [&](BufferId id, uint64_t first, uint64_t last) {
+				// A buffer no shader reads through the page table keeps the stores as modified
+				// pages: its bindings upload what they cover, and MarkBdaRead queues the rest.
+				// A new buffer takes its guest memory first (Register queued all of it), so an
+				// access through the page table that nothing announced reads the guest's bytes
+				// of that time at worst, never memory the buffer was allocated with.
+				auto& buffer = m_slot_buffers[id];
+				if (m_bda_lazy && buffer.bda_use == BdaUse::Unread && !buffer.bda_new) {
+					g_bda_unread.Add();
+					return;
+				}
+				if (buffer.bda_new) {
+					created.push_back(id);
+				}
 				ranges.push_back({first, last - first});
 				owners.push_back(id);
 			});
 		});
 	});
+	for (const auto id: created) {
+		m_slot_buffers[id].bda_new = false;
+	}
 	due.Clear();
 	if (ranges.empty()) {
 		return;

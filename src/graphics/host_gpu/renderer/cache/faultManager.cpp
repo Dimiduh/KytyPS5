@@ -136,7 +136,8 @@ void FaultManager::ProcessFaultBuffer() {
 		for (uint32_t index = 1; index <= count; ++index) {
 			const auto address = BufferCache::GuestAddress(faults[index]);
 			if (m_buffer_cache.NoteBdaAccess(address)) {
-				// A watched resident page (BufferCache::BdaWatchBit): the access was made.
+				// A resident page, watched (BufferCache::BdaWatchBit) when the shader ran: the
+				// access was made.
 				continue;
 			}
 			// The access that faulted is lost for its dispatch; streaming then touches the
@@ -152,7 +153,7 @@ void FaultManager::ProcessFaultBuffer() {
 		}
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
-			(void)m_buffer_cache.FindBuffer(start, end - start);
+			(void)m_buffer_cache.FindBuffer(start, end - start, true);
 		});
 		m_fault_areas[area] = 0;
 	});
