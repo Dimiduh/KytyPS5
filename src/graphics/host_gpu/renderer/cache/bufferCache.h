@@ -241,9 +241,8 @@ private:
 	// mapping into guest memory, after waiting only for the submission that holds the buffer's
 	// latest GPU write (not for the work queued behind it). Returns false, doing nothing, when
 	// the buffer is not host-readable, the write may still be recorded into an open command
-	// buffer, or the dirty bytes exceed MaxInPlaceReadback.
+	// buffer, or the dirty bytes exceed the in-place limit (the inplace_max_kb switch).
 	[[nodiscard]] bool        ReadBackInPlace(Buffer& buffer, uint64_t vaddr, uint64_t size);
-	static constexpr uint64_t MaxInPlaceReadback = uint64_t {512} << 10u;
 	std::vector<uint8_t>      m_in_place_scratch;
 	// A GPU write of the buffer is being prepared; NoteCommandBoundary assigns it its tick.
 	void                  NoteOpenWrite(Buffer& buffer, BufferId id);

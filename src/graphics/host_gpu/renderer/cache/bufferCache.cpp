@@ -17,6 +17,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <cstring>
 #include <functional>
@@ -43,6 +44,8 @@ Common::LiveControl::Counter g_bda_ranges("bda_ranges");
 Common::LiveControl::Counter g_bda_copies("bda_copies");
 Common::LiveControl::Counter g_inplace_reads("inplace_reads");
 Common::LiveControl::Counter g_inplace_waits("inplace_waits");
+Common::LiveControl::Counter g_inplace_bytes("inplace_bytes");
+Common::LiveControl::Counter g_inplace_us("inplace_us");
 Common::LiveControl::Counter g_invalidations_gpu("invalidate_gpu");
 
 // 1: a BDA synchronization leaves the write protection of the pages it takes and their copies
@@ -53,6 +56,14 @@ Common::LiveControl::Switch g_async_upload("async_upload", 0);
 // resource walk take the tracking pages of the request only; 0: the download window around it,
 // as a guest read fault does.
 Common::LiveControl::Switch g_readback_narrow("readback_narrow", 1);
+
+// The most GPU-written bytes (in KiB) a readback copies out of a buffer's own mapping. The
+// mapping is device memory: a streaming load of it is a bus read per 64-byte line (RTX 4090:
+// 8 us a KiB, 0.12 GB/s; the inplace_us and inplace_bytes counters measure it). Past some size
+// the copy the GPU makes into the download buffer is the shorter way, its submission and wait
+// (about 0.5 ms) included: at 512 KiB, the 256 KiB a guest read fault takes in Saros held the
+// GPU thread for 2 ms.
+Common::LiveControl::Switch g_inplace_max_kb("inplace_max_kb", 64);
 
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
@@ -321,10 +332,11 @@ bool BufferCache::ReadBackInPlace(Buffer& buffer, uint64_t vaddr, uint64_t size)
 	uint64_t dirty = 0;
 	m_gpu_modified_ranges.ForEachInRange(
 	    vaddr, size, [&](uint64_t begin, uint64_t end) { dirty += end - begin; });
-	if (dirty == 0 || dirty > MaxInPlaceReadback) {
+	if (dirty == 0 || dirty > (uint64_t {g_inplace_max_kb.Get()} << 10u)) {
 		return false;
 	}
 	g_inplace_reads.Add();
+	g_inplace_bytes.Add(dirty);
 	if (!m_scheduler.IsFree(write_tick)) {
 		g_inplace_waits.Add();
 		m_scheduler.Wait(write_tick);
@@ -333,6 +345,7 @@ bool BufferCache::ReadBackInPlace(Buffer& buffer, uint64_t vaddr, uint64_t size)
 	m_scheduler.WaitPriorityOperations(write_tick);
 	const auto buffer_address = buffer.CpuAddress();
 	bool       copied         = false;
+	const auto copy_begin     = std::chrono::steady_clock::now();
 	m_memory_tracker.ForEachDownloadRange<false>(
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges.Ranges(), address, bytes,
@@ -347,6 +360,9 @@ bool BufferCache::ReadBackInPlace(Buffer& buffer, uint64_t vaddr, uint64_t size)
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 		    ForgetColorMetadataChecks(address, bytes);
 	    });
+	g_inplace_us.Add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+	                                           std::chrono::steady_clock::now() - copy_begin)
+	                                           .count()));
 	if (copied) {
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, dirty);
 	}
