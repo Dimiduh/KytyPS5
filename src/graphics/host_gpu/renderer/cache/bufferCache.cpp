@@ -49,6 +49,11 @@ Common::LiveControl::Counter g_invalidations_gpu("invalidate_gpu");
 // into staging memory to the upload worker (uploadWorker.h); 0: the GPU thread makes both.
 Common::LiveControl::Switch g_async_upload("async_upload", 0);
 
+// 1: a readback for a store (a label of the command processor, a guest write) and one for a
+// resource walk take the tracking pages of the request only; 0: the download window around it,
+// as a guest read fault does.
+Common::LiveControl::Switch g_readback_narrow("readback_narrow", 1);
+
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
                                         vk::BufferUsageFlags usage, const auto& write) {
@@ -517,10 +522,23 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 			const auto wanted_end = request.kind == GuestReadback::Kind::Around
 			                            ? request.vaddr + 1u
 			                            : request.vaddr + request.size;
-			const auto start = std::max(Common::AlignDown(request.vaddr, DownloadWindowSize),
-			                            buffer.CpuAddress());
-			const auto end        = std::min(std::max(start + DownloadWindowSize, wanted_end),
-			                                 buffer.CpuAddress() + buffer.Size());
+			auto start = std::max(Common::AlignDown(request.vaddr, DownloadWindowSize),
+			                      buffer.CpuAddress());
+			auto end   = std::min(std::max(start + DownloadWindowSize, wanted_end),
+			                      buffer.CpuAddress() + buffer.Size());
+			// The window pays for a guest that reads on through the pages after its fault. A
+			// store needs the pages it writes and no more, and a walk asks for every range it
+			// reads in one batch: the window around such a request only moves bytes nothing
+			// asked for (Saros stores a 4-byte label into a 512 KiB range the GPU writes each
+			// frame, and the window read all of it back for that), and hands their pages to the
+			// CPU until the GPU's next write takes them again.
+			if (g_readback_narrow.On() &&
+			    (request.kind == GuestReadback::Kind::Write ||
+			     (request.kind == GuestReadback::Kind::Read &&
+			      request.reason == Common::GpuTiming::SyncReason::WalkRead))) {
+				start = std::max(Common::AlignDown(request.vaddr, TRACKER_PAGE_SIZE), start);
+				end   = std::min(Common::AlignUp(wanted_end, TRACKER_PAGE_SIZE), end);
+			}
 			result.base = start;
 			result.size = end - start;
 		}
