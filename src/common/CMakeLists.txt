@@ -46,6 +46,8 @@ target_link_libraries(common
 if(WIN32)
 	# hostStats.cpp reads per-process GPU engine utilization from the performance counters.
 	target_link_libraries(common PRIVATE pdh)
+	# liveControl.cpp names the functions of its thread samples.
+	target_link_libraries(common PRIVATE dbghelp psapi)
 endif()
 if(APPLE)
 	# hostStats.cpp reads GPU utilization from the IOAccelerator registry entries.

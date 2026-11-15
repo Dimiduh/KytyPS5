@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/liveControl.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/singleton.h"
@@ -112,6 +113,25 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 	subsystems.Initialize<Libs::Controller::Lifecycle>();
 	subsystems.Initialize<Libs::Audio::Lifecycle>();
 	subsystems.Initialize<Libs::Graphics::Lifecycle>();
+
+	// The measurement channel (KYTY_LIVE_FILE): scripted pad input and a window close.
+	Common::LiveControl::SetHostHooks({
+	    .pad_button =
+	        [](uint32_t button, bool down) {
+		        Libs::Controller::SetButton(Libs::Controller::HOST_INPUT_CONTROLLER_ID, button, down);
+	        },
+	    .pad_sticks =
+	        [](int left_x, int left_y, int right_x, int right_y) {
+		        using Libs::Controller::Axis;
+		        const int id = Libs::Controller::HOST_INPUT_CONTROLLER_ID;
+		        Libs::Controller::SetAxis(id, Axis::LeftX, left_x);
+		        Libs::Controller::SetAxis(id, Axis::LeftY, left_y);
+		        Libs::Controller::SetAxis(id, Axis::RightX, right_x);
+		        Libs::Controller::SetAxis(id, Axis::RightY, right_y);
+	        },
+	    .quit = [] { Libs::Graphics::WindowRequestClose(); },
+	});
+	Common::LiveControl::Start();
 }
 
 static void LoadElf(const std::filesystem::path& elf, bool dbg_print_reloc = false,

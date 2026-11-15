@@ -307,6 +307,15 @@ private:
 // "GpuTiming: busy 412 ms/s, 980 submits/s (...), end->complete p50/p95 ..." (no newline).
 [[nodiscard]] std::string FormatSummary(const Summary& summary);
 
+// GPU execution time and window time of every published summary so far, for measurements over
+// longer spans than one window.
+struct Totals {
+	uint64_t busy_ns   = 0;
+	uint64_t window_ns = 0;
+	uint64_t submits   = 0;
+};
+[[nodiscard]] Totals RunningTotals() noexcept;
+
 // Latest one-second summary, for the performance overlay.
 void                                 Publish(const Summary& summary);
 [[nodiscard]] std::optional<Summary> Latest();

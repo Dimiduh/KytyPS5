@@ -461,9 +461,23 @@ std::string FormatSummary(const Summary& summary) {
 	return line + SyncSuffix(summary);
 }
 
+static std::atomic<uint64_t> g_total_busy_ns {0};
+static std::atomic<uint64_t> g_total_window_ns {0};
+static std::atomic<uint64_t> g_total_submits {0};
+
 void Publish(const Summary& summary) {
+	g_total_busy_ns.fetch_add(summary.busy_ns, std::memory_order_relaxed);
+	g_total_window_ns.fetch_add(static_cast<uint64_t>(summary.seconds * 1e9),
+	                            std::memory_order_relaxed);
+	g_total_submits.fetch_add(summary.submits, std::memory_order_relaxed);
 	std::scoped_lock lock(g_latest_mutex);
 	g_latest = summary;
+}
+
+Totals RunningTotals() noexcept {
+	return {g_total_busy_ns.load(std::memory_order_relaxed),
+	        g_total_window_ns.load(std::memory_order_relaxed),
+	        g_total_submits.load(std::memory_order_relaxed)};
 }
 
 std::optional<Summary> Latest() {

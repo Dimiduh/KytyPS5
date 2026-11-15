@@ -18,6 +18,8 @@ void                     WindowRun();
 // --export-pipeline-list: whether the list was written.
 [[nodiscard]] bool       WindowExportPipelineList(const std::filesystem::path& path);
 void                     WindowShutdown();
+// Asks the window loop to close, as the user closing the window does (any thread).
+void                     WindowRequestClose();
 
 // Nits of the display showing the game window; the defaults apply when the host reports none.
 struct DisplayLuminance {

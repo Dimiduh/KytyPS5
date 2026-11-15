@@ -878,6 +878,12 @@ void WindowRun() {
 	pipelines.Save();
 }
 
+void WindowRequestClose() {
+	SDL_Event event {};
+	event.type = SDL_EVENT_QUIT;
+	(void)SDL_PushEvent(&event);
+}
+
 int WindowPrecompilePipelines() {
 	EXIT_IF(g_window == nullptr);
 	// About half the host threads: nothing else runs, and each driver compile is mostly serial.
