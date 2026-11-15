@@ -531,9 +531,11 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 			// reads in one batch: the window around such a request only moves bytes nothing
 			// asked for (Saros stores a 4-byte label into a 512 KiB range the GPU writes each
 			// frame, and the window read all of it back for that), and hands their pages to the
-			// CPU until the GPU's next write takes them again.
+			// CPU until the GPU's next write takes them again. Other invalidations keep the
+			// window: an unmap of part of a buffer publishes the GPU-written pages beside it.
 			if (g_readback_narrow.On() &&
-			    (request.kind == GuestReadback::Kind::Write ||
+			    ((request.kind == GuestReadback::Kind::Write &&
+			      request.reason == Common::GpuTiming::SyncReason::CpuWrite) ||
 			     (request.kind == GuestReadback::Kind::Read &&
 			      request.reason == Common::GpuTiming::SyncReason::WalkRead))) {
 				start = std::max(Common::AlignDown(request.vaddr, TRACKER_PAGE_SIZE), start);
