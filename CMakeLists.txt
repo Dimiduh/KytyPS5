@@ -256,6 +256,36 @@ if(KYTY_TARGET_ARCH)
 	endif()
 	message(STATUS "Code generation for ${KYTY_TARGET_ARCH}")
 endif()
+# KYTY_NATIVE_OPT (clang): -O3 instead of the Release default (-O2). Together with ThinLTO
+# (CMAKE_INTERPROCEDURAL_OPTIMIZATION) and KYTY_TARGET_ARCH this is the build the measurements use.
+option(KYTY_NATIVE_OPT "Release: -O3 for Kyty's own targets (clang)" OFF)
+if(KYTY_NATIVE_OPT)
+	if(NOT CLANG)
+		message(FATAL_ERROR "KYTY_NATIVE_OPT needs clang or clang-cl")
+	endif()
+	if(KYTY_CLANG_CL)
+		add_compile_options("$<$<CONFIG:Release>:/clang:-O3>")
+	else()
+		add_compile_options("$<$<CONFIG:Release>:-O3>")
+	endif()
+endif()
+# KYTY_PROFILING_SYMBOLS (clang): function names and line tables in the debug information and frame
+# pointers, for the thread sampler of the measurement channel (src/common/liveControl.h, `prof`)
+# and for symbolized crash reports. The generated code otherwise stays the Release code.
+option(KYTY_PROFILING_SYMBOLS "Function names and frame pointers for the thread sampler (clang)" OFF)
+if(KYTY_PROFILING_SYMBOLS)
+	if(NOT CLANG)
+		message(FATAL_ERROR "KYTY_PROFILING_SYMBOLS needs clang or clang-cl")
+	endif()
+	if(KYTY_CLANG_CL)
+		add_compile_options(-gline-tables-only "/clang:-fno-omit-frame-pointer")
+		# /DEBUG alone turns /OPT:REF and /OPT:ICF off; keep the Release link.
+		add_link_options(/DEBUG /OPT:REF /OPT:ICF)
+	else()
+		add_compile_options(-gline-tables-only -fno-omit-frame-pointer)
+	endif()
+	message(STATUS "Profiling symbols: on")
+endif()
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
 
 file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
