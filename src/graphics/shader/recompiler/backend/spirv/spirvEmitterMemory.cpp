@@ -93,8 +93,18 @@ BufferAddress CalculateBufferAddress(EmitterState& state, uint32_t index, uint32
 }
 
 uint32_t BufferLane(EmitterState& state) {
-	return Binary(state, spv::OpBitwiseAnd, TypeU32(state), EmitSubgroupLocalInvocationId(state),
-	              ConstantU32(state, 63));
+	// ADD_TID: the GCN lane. The subgroup of a lane-local wave64 program on 32-wide subgroups is
+	// half a wave: the lane is the invocation's index in the group.
+	const auto* workgroup  = ShaderWorkgroupInput(state.program.stage, state.input_info);
+	const bool  half_waves = state.program.lane_local && workgroup != nullptr &&
+	                         workgroup->host_subgroup_size == 32u;
+	if (half_waves &&
+	    InputVariableForKind(state, IR::StageInputKind::LocalInvocationIndex) == 0) {
+		EXIT("LocalInvocationIndex was not declared for a lane-local program's ADD_TID\n");
+	}
+	const auto id = half_waves ? EmitLocalInvocationIndex(state)
+	                           : EmitSubgroupLocalInvocationId(state);
+	return Binary(state, spv::OpBitwiseAnd, TypeU32(state), id, ConstantU32(state, 63));
 }
 
 uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,

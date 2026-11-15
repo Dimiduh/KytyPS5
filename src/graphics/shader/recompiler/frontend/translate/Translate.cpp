@@ -4,11 +4,32 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
+
+static std::atomic<bool>& LaneLocalSwitch() {
+	static std::atomic<bool> enabled {[] {
+		const char* value = std::getenv("KYTY_LANE_LOCAL");
+		return value == nullptr || std::string_view(value) != "0";
+	}()};
+	return enabled;
+}
+
+void SetLaneLocalTranslation(bool enabled) {
+	LaneLocalSwitch().store(enabled, std::memory_order_relaxed);
+}
+
+bool LaneLocalTranslation() {
+	return LaneLocalSwitch().load(std::memory_order_relaxed);
+}
 
 static IR::DppMoveFlags DppFlags(const Decoder::Operand& operand) {
 	return {
@@ -1009,6 +1030,19 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	IR::Program result;
 	result.stage               = options.stage;
 	result.wave_size           = options.wave_size;
+	if (options.stage == ShaderType::Compute && options.wave_size == 64u) {
+		// Off (KYTY_LANE_LOCAL=0): every wave64 program two lanes per invocation on 32-wide
+		// subgroups, as before. KYTY_LANE_LOCAL_LOG=1 prints each program's verdict.
+		const bool        enabled = LaneLocalTranslation();
+		static const bool log     = std::getenv("KYTY_LANE_LOCAL_LOG") != nullptr;
+		std::string       reason;
+		result.lane_local = enabled && IsWaveLaneLocal(decoded, log ? &reason : nullptr);
+		if (log) {
+			std::fprintf(stderr, "LaneLocal CS %016llx: %s\n",
+			             static_cast<unsigned long long>(options.shader_hash),
+			             result.lane_local ? "yes" : enabled ? reason.c_str() : "off");
+		}
+	}
 	result.shader_hash         = options.shader_hash;
 	result.user_data_base      = options.user_data_base;
 	result.user_data_count     = options.user_data_count;
@@ -1161,8 +1195,10 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			total_threads = std::max(workgroup->threads_num[0], 1u) *
 			                std::max(workgroup->threads_num[1], 1u) *
 			                std::max(workgroup->threads_num[2], 1u);
+			// (Two lanes per invocation: the lanes past the group's threads. A lane-local program
+			// has an invocation per thread.)
 			if (options.wave_size == 64u && workgroup->host_subgroup_size == 32u &&
-			    total_threads % 64u != 0u) {
+			    !result.lane_local && total_threads % 64u != 0u) {
 				initial_exec = entry_ir.ULessThan(builtin(IR::StageInputKind::LocalInvocationIndex),
 				                                  IR::U32(IR::Value(total_threads)));
 			}

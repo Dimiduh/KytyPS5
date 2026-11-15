@@ -544,6 +544,12 @@ void DefineInputs(EmitterState& state) {
 		    })) {
 			add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
 		}
+	} else if (const auto* workgroup = ShaderWorkgroupInput(state.program.stage, state.input_info);
+	           state.program.lane_local && workgroup != nullptr &&
+	           workgroup->host_subgroup_size == 32u &&
+	           state.program.info.subgroup_local_invocation_id) {
+		// A lane-local wave64 program's GCN lane where its subgroup is half a wave (BufferLane).
+		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
 	}
 	for (auto& input: state.inputs) {
 		if (state.program.stage == ShaderType::Pixel &&

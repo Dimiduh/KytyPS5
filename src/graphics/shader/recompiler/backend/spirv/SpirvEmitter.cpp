@@ -42,10 +42,11 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 		state.builder.EnableNames();
 	}
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
-	state.lane_count =
-	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
-	        ? 2u
-	        : 1u;
+	// A lane-local wave64 program: one GCN lane per invocation, each 32-wide subgroup a half wave.
+	state.lane_count = workgroup != nullptr && program.wave_size == 64u &&
+	                           workgroup->host_subgroup_size == 32u && !program.lane_local
+	                       ? 2u
+	                       : 1u;
 	DefineModule(state);
 	EmitProgram(state);
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,

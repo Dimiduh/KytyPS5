@@ -62,6 +62,7 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvDriverSimplify.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+#include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
@@ -1910,6 +1911,10 @@ size_t SpirvCodeWords(const std::vector<u32> &spirv) {
   return words;
 }
 
+// The texts cases require of (or forbid in) their SPIR-V describe the two-lane translation of
+// a wave64 program; the lane-local run (--lane-local-only) compares results only.
+bool g_check_spirv_text = true;
+
 void CheckSpirvEmission(const TestCase &test, const std::vector<u32> &spirv) {
   std::vector<u32> result_types(spirv[3]);
   for (size_t offset = 5; offset < spirv.size();) {
@@ -1925,7 +1930,8 @@ void CheckSpirvEmission(const TestCase &test, const std::vector<u32> &spirv) {
     }
     offset += words.size();
   }
-  if (test.required_spirv.empty() && test.forbidden_spirv.empty()) {
+  if (!g_check_spirv_text ||
+      (test.required_spirv.empty() && test.forbidden_spirv.empty())) {
     return;
   }
 
@@ -42983,7 +42989,8 @@ void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
                 profile.uses != 0u && profile.definitions == 1u &&
                     profile.calls ==
                         profile.uses *
-                            (wave == 64u && vulkan.SubgroupSize() == 32u
+                            (wave == 64u && vulkan.SubgroupSize() == 32u &&
+                                     !compiled.program.lane_local
                                  ? 2u
                                  : 1u) &&
                     profile.reads == std::min(profile.components, 2u),
@@ -49452,7 +49459,9 @@ void CheckDynamicSampleOffsets(VulkanHarness &vulkan, u32 wave_size) {
   auto compiled = CompileCase(test, vulkan.SubgroupSize());
   spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
   std::string text;
-  const auto halves = wave_size > vulkan.SubgroupSize() ? 2u : 1u;
+  // (Two lanes an invocation unless the program is lane-local.)
+  const auto halves =
+      wave_size > vulkan.SubgroupSize() && !compiled.program.lane_local ? 2u : 1u;
   Require(test.name, "direct dynamic offset", tools.Disassemble(compiled.spirv, &text) &&
               CountText(text, "OpImageSampleExplicitLod") == halves &&
               CountText(text, "OpBitFieldSExtract %int") == 2u * halves,
@@ -50260,7 +50269,7 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
             "format geometry duplicated, branched or acquired memory accesses");
         Require(test.name, "one shared indirect store per virtual half",
                 std::ranges::count_if(stores, [&](u32 pointer) { return nonuniform.contains(pointer); }) ==
-                    (wave > vulkan.SubgroupSize() ? 2 : 1),
+                    (wave > vulkan.SubgroupSize() && !compiled.program.lane_local ? 2 : 1),
                 "formatted identity lowering duplicated the store per descriptor");
         Require(test.name, "shared formatted payload read", bda_reads <= 12u,
                 "formatted source load duplicated BDA reads per format or "
@@ -51026,7 +51035,8 @@ void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
             offset += words.size();
           }
           Require(test.name, "one shared store after the null candidate",
-                  shared_stores == (wave > vulkan.SubgroupSize() ? 2u : 1u),
+                  shared_stores ==
+                      (wave > vulkan.SubgroupSize() && !compiled.program.lane_local ? 2u : 1u),
                   "homogeneous children duplicated the native store per "
                   "descriptor");
         }
@@ -52739,7 +52749,8 @@ void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
     if (large_samplers) {
       spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
       std::string text;
-      const auto halves = wave > vulkan.SubgroupSize() ? 2u : 1u;
+      const auto halves =
+          wave > vulkan.SubgroupSize() && !compiled.program.lane_local ? 2u : 1u;
       Require(test.name, "expanded sampler bindings and emitted size",
               compiled.resources.samplers.size() == rows + 1u &&
                   compiled.program.info.samplers.size() == rows + 1u &&
@@ -63038,8 +63049,22 @@ int main(int argc, char **argv) {
   // Every test shader goes through the driver simplification, however small, so
   // the GPU results below cover it.
   ShaderRecompiler::Spirv::SetDriverSimplifyMinWords(0);
+  // The cases check the shape of the two-lane translation of wave64 programs (the texts and
+  // counts they require); --lane-local-only runs their results through the lane-local one.
+  ShaderRecompiler::Frontend::SetLaneLocalTranslation(false);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 2 && std::strcmp(argv[1], "--lane-local-only") == 0) {
+    // Wave64 programs the lane-local proof admits run one GCN lane per invocation, each
+    // 32-wide subgroup a half wave: every case's results must come out as in the two-lane run.
+    ShaderRecompiler::Frontend::SetLaneLocalTranslation(true);
+    g_check_spirv_text = false;
+    VulkanHarness vulkan;
+    for (const auto &test : MakeCases()) {
+      RunCase(&vulkan, test);
+    }
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--mul-hi24-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorMulHi24(32));

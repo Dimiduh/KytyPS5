@@ -796,6 +796,20 @@ add_executable(guest_fault_report_tests EXCLUDE_FROM_ALL
 target_include_directories(guest_fault_report_tests PRIVATE ${inc_headers})
 target_link_libraries(guest_fault_report_tests fmt::fmt)
 
+add_executable(lane_local_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LaneLocalTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/cfg/ShaderCFG.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/ExportOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/ImageOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/MemoryOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/ScalarAluOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/ShaderDecoder.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/VectorAluOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/translate/LaneLocal.cpp"
+)
+target_link_libraries(lane_local_tests fmt::fmt)
+target_include_directories(lane_local_tests PRIVATE ${inc_headers})
+
 add_executable(scalar_read_cache_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarReadCacheTests.cpp"
 )
@@ -1012,6 +1026,7 @@ if(BUILD_TESTING)
 	add_test(NAME filtered_range_set COMMAND $<TARGET_FILE:filtered_range_set_tests>)
 	add_test(NAME pending_labels COMMAND $<TARGET_FILE:pending_labels_tests>)
 	add_test(NAME scalar_read_cache COMMAND $<TARGET_FILE:scalar_read_cache_tests>)
+	add_test(NAME lane_local COMMAND $<TARGET_FILE:lane_local_tests>)
 	add_test(NAME layout_change_log COMMAND $<TARGET_FILE:layout_change_log_tests>)
 	add_test(NAME guest_fault_report COMMAND $<TARGET_FILE:guest_fault_report_tests>)
 	add_test(NAME dcc_constant COMMAND $<TARGET_FILE:dcc_constant_tests>)
@@ -1155,6 +1170,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --htile-clear-only)
 	add_test(NAME bindless_slot_image_reuse
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bindless-slot-reuse-only)
+	add_test(NAME shader_recompiler_lane_local
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --lane-local-only)
 	add_test(NAME buffer_cache_ranges
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
 
@@ -1167,6 +1184,7 @@ if(BUILD_TESTING)
 		filtered_range_set_tests
 		pending_labels_tests
 		scalar_read_cache_tests
+		lane_local_tests
 		layout_change_log_tests
 		guest_fault_report_tests
 		dcc_constant_tests
