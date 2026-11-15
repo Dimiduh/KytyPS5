@@ -1,0 +1,15 @@
+{
+  "environment": {},
+  "command": [
+    "--",
+    "kyty_emulator.exe",
+    "--screen-width",
+    "1920",
+    "--screen-height",
+    "1080",
+    "--console-language",
+    "1",
+    "--present-mode",
+    "Mailbox"
+  ]
+}

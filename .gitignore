@@ -7,3 +7,11 @@ _Build/
 cmake-build-debug/
 _PipelineCache/
 CMakeUserPresets.json
+# Launcher state and the emulator data of a run from this folder
+launcher-settings.json
+game-path.txt
+_SaveData/
+_DownloadData/
+_TempData/
+_Trophies/
+logs/
