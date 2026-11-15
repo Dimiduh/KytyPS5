@@ -40,6 +40,24 @@ uint64_t QueueSubmitter::Push(vk::CommandBuffer buffer, SubmitInfo submit,
 	return tick;
 }
 
+uint64_t QueueSubmitter::Reserve(SubmitInfo& submit, MasterSemaphore& master) {
+	std::lock_guard lock(m_mutex);
+	const auto      tick = master.NextTick();
+	submit.AddSignal(master.Handle(), tick);
+	m_pushed.fetch_add(1, std::memory_order_release);
+	return tick;
+}
+
+void QueueSubmitter::PushReserved(vk::CommandBuffer buffer, const SubmitInfo& submit,
+                                  uint64_t tick) {
+	EXIT_IF(buffer == nullptr);
+	{
+		std::lock_guard lock(m_mutex);
+		m_queued.push_back({buffer, submit, tick});
+	}
+	m_available.notify_one();
+}
+
 void QueueSubmitter::Drain() {
 	EXIT_IF(std::this_thread::get_id() == m_thread.get_id());
 	const auto target = m_pushed.load(std::memory_order_acquire);

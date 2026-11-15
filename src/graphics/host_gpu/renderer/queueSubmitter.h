@@ -35,6 +35,13 @@ public:
 	// Allocates the next tick of `master`, adds its signal to `submit` and queues the buffer.
 	// Ticks of one semaphore reach the queue in increasing order.
 	uint64_t Push(vk::CommandBuffer buffer, SubmitInfo submit, MasterSemaphore& master);
+	// Push in two steps, for a buffer whose commands another thread still records: Reserve
+	// allocates the tick and adds its signal to `submit` (the buffer counts as pushed from here
+	// on, so Drain waits for it), PushReserved queues the buffer once it is complete. The
+	// reserved buffers of one semaphore must be queued in the order they were reserved, and no
+	// Push of that semaphore may come between a Reserve and its PushReserved.
+	[[nodiscard]] uint64_t Reserve(SubmitInfo& submit, MasterSemaphore& master);
+	void PushReserved(vk::CommandBuffer buffer, const SubmitInfo& submit, uint64_t tick);
 	// Returns once every buffer pushed before the call has been passed to vkQueueSubmit.
 	void Drain();
 	// Buffers pushed and buffers passed to vkQueueSubmit since the start.

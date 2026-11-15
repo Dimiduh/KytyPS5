@@ -6,10 +6,12 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/queueSubmitter.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/vulkanRecording.h"
 
 #include <algorithm>
 #include <chrono>
 #include <optional>
+#include <type_traits>
 
 namespace Libs::Graphics {
 
@@ -392,7 +394,35 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
 		                std::chrono::steady_clock::now().time_since_epoch())
 		                .count();
-		tick      = graphics.submitter->Push(buffer, submit, m_master);
+		// With a recording thread the buffer's commands, and its end, are still on their way to
+		// the driver: the buffer is handed to the submission thread behind them, by the
+		// recording thread. Its tick is taken now, so the scheduler's ticks keep their meaning.
+		struct Handover {
+			QueueSubmitter*   submitter;
+			vk::CommandBuffer buffer;
+			SubmitInfo        submit;
+			uint64_t          tick;
+		};
+		static_assert(std::is_trivially_copyable_v<Handover>);
+		if (VulkanRecording::Recording()) {
+			tick = graphics.submitter->Reserve(submit, m_master);
+			const Handover handover {graphics.submitter, buffer, submit, tick};
+			const bool     queued = VulkanRecording::EnqueueOrdered(
+			        [](const void* data) {
+				        const auto& queued_buffer = *static_cast<const Handover*>(data);
+				        queued_buffer.submitter->PushReserved(queued_buffer.buffer,
+				                                              queued_buffer.submit, queued_buffer.tick);
+			        },
+			        &handover, sizeof(handover), true);
+			if (!queued) {
+				VulkanRecording::Drain();
+				graphics.submitter->PushReserved(buffer, submit, tick);
+			}
+		} else {
+			// (Commands queued before the recording was switched off come first.)
+			VulkanRecording::Drain();
+			tick = graphics.submitter->Push(buffer, submit, m_master);
+		}
 	} else {
 		Common::LockGuard lock(graphics.queue_mutex);
 		tick = m_master.NextTick();

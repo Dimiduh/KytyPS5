@@ -446,6 +446,27 @@ add_gpu_blit_shader(gpu_buffer_scatter gpu_buffer_scatter.comp)
 add_gpu_blit_shader(gpu_mesh_indirect gpu_mesh_indirect.task --target-env spirv1.5)
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 
+# The Vulkan thunks of the recording thread (graphics/host_gpu/vulkanRecording.cpp), one per entry
+# of this checkout's Vulkan-Hpp dispatcher.
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+set(vulkan_recording_generated_dir "${PROJECT_BINARY_DIR}/vulkan_recording")
+set(vulkan_recording_thunks "${vulkan_recording_generated_dir}/vulkanRecordingThunks.inc")
+set(vulkan_recording_generator "${KYTY_SOURCE_DIR}/graphics/host_gpu/generateVulkanRecording.py")
+add_custom_command(
+	OUTPUT "${vulkan_recording_thunks}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${vulkan_recording_generated_dir}"
+	COMMAND "${Python3_EXECUTABLE}" "${vulkan_recording_generator}"
+	        "${KYTY_THIRD_PARTY_DIR}/Vulkan-Headers/registry/vk.xml"
+	        "${KYTY_THIRD_PARTY_DIR}/Vulkan-Headers/include/vulkan/vulkan.hpp"
+	        "${vulkan_recording_thunks}"
+	DEPENDS "${vulkan_recording_generator}"
+	        "${KYTY_THIRD_PARTY_DIR}/Vulkan-Headers/registry/vk.xml"
+	        "${KYTY_THIRD_PARTY_DIR}/Vulkan-Headers/include/vulkan/vulkan.hpp"
+	COMMENT "Generate the Vulkan recording thunks"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${vulkan_recording_thunks}")
+
 list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/emulator.h"
 	"${KYTY_SOURCE_DIR}/emulator.cpp"
@@ -475,6 +496,7 @@ set(inc_headers
 	${KYTY_THIRD_PARTY_DIR}/renderdoc
 	${KYTY_THIRD_PARTY_DIR}/stb
 	${KYTY_THIRD_PARTY_DIR}/ffx-api
+	${vulkan_recording_generated_dir}
 )
 
 if (KYTY_CLANG_CL)

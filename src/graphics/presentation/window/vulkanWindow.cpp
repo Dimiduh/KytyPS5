@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/upscaler/fsr.h"
 #include "graphics/host_gpu/subgroupPlan.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/host_gpu/vulkanRecording.h"
 #include "graphics/presentation/openxrHeadset.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
@@ -1113,6 +1114,10 @@ void WindowContext::CreateVulkan() {
 
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, std::move(device_extensions));
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+	// From here on the dispatcher's entries are the recording thunks: a thread with a
+	// VulkanRecording::ProducerScope (the GPU thread) queues its commands, every other thread
+	// calls the driver as before.
+	VulkanRecording::Install();
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
 	Dlss::Init(graphic_ctx, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,

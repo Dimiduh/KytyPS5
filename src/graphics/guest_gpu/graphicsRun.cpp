@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
+#include "graphics/host_gpu/vulkanRecording.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/shader/shader.h"
@@ -458,6 +459,9 @@ void GuestGpu::ThreadRun(void* data) {
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	Common::LiveControl::RegisterThread("gpu");
+	// This thread's Vulkan commands are replayed by a recording thread (vulkanRecording.h); the
+	// scope ends, with everything replayed, when the thread does.
+	const VulkanRecording::ProducerScope recording;
 	// This thread's time is the frame's: it runs above the guest's threads, which otherwise hold
 	// its CPUs for whole time slices while they stream a level in (KYTY_RENDER_PRIORITY=0: normal
 	// priority). KYTY_RENDER_CPUS names the CPUs it may run on ("auto": the performance cores
