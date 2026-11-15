@@ -813,6 +813,10 @@ struct PipelineCacheTestAccess {
     cache.m_driver_cache = driver_cache;
   }
 
+  static WarmPipelines &Warm(PipelineCache &cache) {
+    return cache.m_warm_pipelines;
+  }
+
   static uint64_t ComputeFromDriverCache(const PipelineCache &cache) {
     return cache.m_compute_from_cache;
   }
@@ -56642,6 +56646,35 @@ void CheckComputePrecompile(VulkanHarness &vulkan) {
             "differently");
   }
 
+  // A pipeline the precompile kept is taken by the first use of its program:
+  // the live pipeline is that very one, and it has left the store.
+  {
+    auto warm_cache = new_driver_cache();
+    KeptPipeline kept;
+    Require(name, "kept precompile",
+            PrecompileComputeProgram(graphics, warm_cache, *record, nullptr,
+                                     false, PipelineBuildMode::Precompile,
+                                     nullptr, {},
+                                     &kept) != PrecompileOutcome::Skipped &&
+                kept.pipeline != nullptr && kept.fingerprint != 0,
+            "the precompile did not hand its pipeline on");
+    PipelineCache cache(graphics, nullptr);
+    PipelineCacheTestAccess::AttachPersistence(
+        cache, std::make_unique<ProgramManifest>(), warm_cache);
+    auto &warm = PipelineCacheTestAccess::Warm(cache);
+    warm.Keep(kept);
+    ShaderComputeInputInfo input{};
+    (void)cache.GetComputeProgram(regs, input);
+    const auto &live = cache.GetComputePipeline(input);
+    Require(name, "kept pipeline taken",
+            live.pipeline == kept.pipeline &&
+                live.fingerprint == kept.fingerprint &&
+                warm.GetCounts().kept == 1 && warm.GetCounts().taken == 1 &&
+                warm.Take(kept.fingerprint) == vk::Pipeline{},
+            "the first use of a program did not take the pipeline the "
+            "precompile kept");
+  }
+
   // A specialization the shader no longer has is skipped, not applied.
   auto stale = *record;
   stale.specialization.buffers.clear();
@@ -56688,7 +56721,8 @@ void CheckComputePrecompile(VulkanHarness &vulkan) {
             "precompiling every record did not account for each record once");
   }
 
-  // A queued precompile is expedited by the first use of its program.
+  // The first use of a program whose precompile is still queued builds the
+  // pipeline itself, without waiting; the queued build then ends at once.
   {
     PipelineCache cache(graphics, nullptr);
     auto manifest = std::make_unique<ProgramManifest>();
@@ -56706,26 +56740,31 @@ void CheckComputePrecompile(VulkanHarness &vulkan) {
     });
     ShaderComputeInputInfo input{};
     const auto program = cache.GetComputeProgram(regs, input);
-    Require(name, "expedited key", program.record_key == record->Key(),
+    Require(name, "queued key", program.record_key == record->Key(),
             "the live program and the record disagree on the key");
-    Require(name, "expedited pipeline",
-            cache.GetComputePipeline(input).pipeline != nullptr,
-            "no pipeline after expediting its precompile");
-    Require(
-        name, "expedited precompile",
-        PipelineCacheTestAccess::PrecompilesFinished(cache) == 1,
-        "the pipeline lookup did not run the queued precompile of its program");
-    if (probes) {
-      Require(
-          name, "expedited hit",
-          PipelineCacheTestAccess::ComputeFromDriverCache(cache) == 1,
-          "the pipeline lookup compiled a pipeline its precompile had built");
-    }
+    Require(name, "pipeline beside a queued precompile",
+            cache.GetComputePipeline(input).pipeline != nullptr &&
+                PipelineCacheTestAccess::PrecompilesFinished(cache) == 0,
+            "the pipeline lookup waited for the queued precompile of its "
+            "program, or built no pipeline");
     {
       std::lock_guard lock(gate_mutex);
       gate_open = true;
     }
     gate_cv.notify_all();
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (PipelineCacheTestAccess::PrecompilesFinished(cache) == 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    const auto counts = PipelineCacheTestAccess::PrecompileCounts(cache);
+    Require(name, "superseded precompile",
+            counts.finished == 1 && counts.skipped == 1 &&
+                counts.cached + counts.compiled == 0 &&
+                PipelineCacheTestAccess::Warm(cache).GetCounts().kept == 0,
+            "the precompile of a program the renderer had built itself was "
+            "not skipped");
   }
 
   // A recorded program is translated ahead of its first use, which takes that

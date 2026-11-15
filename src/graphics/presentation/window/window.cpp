@@ -884,6 +884,13 @@ void WindowRequestClose() {
 	(void)SDL_PushEvent(&event);
 }
 
+uint64_t WindowPendingBackgroundBuilds() {
+	if (g_window == nullptr || g_window->render_context == nullptr) {
+		return 0;
+	}
+	return g_window->render_context->GetPipelineCache().PendingBackgroundBuilds();
+}
+
 int WindowPrecompilePipelines() {
 	EXIT_IF(g_window == nullptr);
 	// About half the host threads: nothing else runs, and each driver compile is mostly serial.

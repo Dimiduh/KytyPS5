@@ -5,6 +5,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/gpuTiming.h"
+#include "common/liveControl.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
@@ -57,6 +58,11 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr auto DriverCacheSaveInterval = std::chrono::minutes {5};
+
+// 1: the precompile of a running session keeps the pipelines it builds for recorded programs
+// and pipelines, and their first use takes them (WarmPipelines); 0: it destroys them, and the
+// first use creates each from the driver cache on the GPU thread.
+Common::LiveControl::Switch g_warm_pipelines("warm_pipelines", 1);
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -1410,7 +1416,8 @@ PrecompileOutcome PrecompileComputeProgram(GraphicContext& graphics, vk::Pipelin
                                            const ComputeProgramRecord& record, uint64_t* spirv_hash,
                                            bool code_only, PipelineBuildMode mode,
                                            const std::atomic<bool>*            cancel,
-                                           std::shared_ptr<DriverCacheHistory> history) {
+                                           std::shared_ptr<DriverCacheHistory> history,
+                                           KeptPipeline*                       keep) {
 	const auto cancelled = [cancel] { return cancel != nullptr && cancel->load(); };
 	EXIT_IF(mode != PipelineBuildMode::Precompile && mode != PipelineBuildMode::Unoptimized);
 	EXIT_IF(record.code == nullptr || record.code->empty());
@@ -1489,7 +1496,11 @@ PrecompileOutcome PrecompileComputeProgram(GraphicContext& graphics, vk::Pipelin
 	(void)CreatePipelineInternal(graphics, pipeline, input, module, driver_cache, mode,
 	                             &from_driver_cache, cancel, std::move(history));
 	const bool built = pipeline.pipeline != nullptr;
-	graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+	if (built && keep != nullptr) {
+		*keep = {.pipeline = pipeline.pipeline, .fingerprint = pipeline.fingerprint};
+	} else {
+		graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+	}
 	graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
 	graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
 	graphics.device.destroyShaderModule(module, nullptr);
@@ -1598,7 +1609,7 @@ bool PipelineCache::TranslateRecordedStage(GraphicContext&            graphics,
 PrecompileOutcome PipelineCache::PrecompileGraphicsPipeline(
     const GraphicsPipelineRecord&                               record,
     std::span<const std::shared_ptr<const GraphicsStageRecord>> stages, PipelineBuildMode mode,
-    const std::atomic<bool>* cancel) {
+    const std::atomic<bool>* cancel, KeptPipeline* keep) {
 	EXIT_IF(stages.size() != record.vertex_stage_count + (record.pixel_stage != 0 ? 1u : 0u));
 	const auto cancelled = [cancel] { return cancel != nullptr && cancel->load(); };
 	// Each stage once, however many pipelines use it.
@@ -1659,7 +1670,11 @@ PrecompileOutcome PipelineCache::PrecompileGraphicsPipeline(
 		return PrecompileOutcome::Skipped;
 	}
 	const bool built = pipeline.pipeline != nullptr;
-	device.destroyPipeline(pipeline.pipeline, nullptr);
+	if (built && keep != nullptr) {
+		*keep = {.pipeline = pipeline.pipeline, .fingerprint = pipeline.fingerprint};
+	} else {
+		device.destroyPipeline(pipeline.pipeline, nullptr);
+	}
 	device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
 	device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
 	if (!built) {
@@ -1690,7 +1705,8 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
       m_program_cache(std::make_unique<ProgramCache>(
           graphics, image_heap,
           scheduler != nullptr ? std::min(Config::LookaheadThreads(), 8u) : 0u)),
-      m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
+      m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval),
+      m_warm_pipelines(graphics.device) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	ShaderRecompiler::Spirv::SetMaximalReconvergence(graphics.maximal_reconvergence_enabled);
 	InitializeDriverCache();
@@ -1802,6 +1818,14 @@ void PipelineCache::DeferOptimization(Pipeline& pipeline, PipelineCompileQueue::
 // a command buffer is being recorded: command buffers recorded so far may have bound the old
 // handle, so it is destroyed once the current command buffer has completed.
 void PipelineCache::InstallOptimizedPipelines() {
+	// What a finished precompile run compiled is written now, not at the next save interval:
+	// a session that ends before it would compile it all again.
+	if (m_precompile_save_due.load(std::memory_order_relaxed) &&
+	    m_precompile_save_due.exchange(false, std::memory_order_relaxed) &&
+	    m_driver_cache_dirty.load(std::memory_order_relaxed)) {
+		m_next_driver_cache_save = std::chrono::steady_clock::now();
+		m_precompile_dirty.store(true, std::memory_order_relaxed);
+	}
 	if (m_precompile_dirty.load(std::memory_order_relaxed) &&
 	    m_precompile_dirty.exchange(false, std::memory_order_relaxed)) {
 		CheckpointDriverCache();
@@ -2048,9 +2072,6 @@ namespace {
 // A precompile build that has not finished after this long is abandoned: the driver may never
 // finish it (seen for optimized builds of some large compute modules on NVIDIA).
 constexpr auto PrecompileBuildBudget = std::chrono::seconds {300};
-// The renderer waits this long at most for a running precompile build of a program it needs,
-// then builds the pipeline itself.
-constexpr auto PrecompileExpediteWait = std::chrono::seconds {30};
 // Precompile order: recorded and listed programs and pipelines by their FirstSeenPosition (below
 // 2^32), then the created shaders without a record by theirs.
 constexpr uint64_t PrecompileCreatedOrder = uint64_t {1} << 32u;
@@ -2133,7 +2154,25 @@ void PipelineCache::EnqueuePrecompileJob(uint64_t key, std::string label, Precom
 	auto& progress = m_precompile_progress;
 	// Counted before the job can run; a key the queue rejects is uncounted again below.
 	progress.Queued();
-	auto job = [this, runs = m_precompile_runs, key, label, build, mode, order] {
+	auto job = [this, runs = m_precompile_runs, key, label, build, mode, order,
+	            device = m_graphics.device] {
+		bool superseded = false;
+		{
+			std::lock_guard lock(runs->mutex);
+			superseded = runs->superseded.erase(key) != 0;
+		}
+		if (superseded) {
+			// The renderer needed the pipeline first and built it itself.
+			if (m_precompile_progress.Finish(PrecompileOutcome::Skipped, 0) && !m_precompile_only) {
+				LogPrecompileStats("done");
+				m_precompile_save_due.store(true, std::memory_order_relaxed);
+			}
+			return;
+		}
+		// The optimized pipeline of a recorded or listed build is kept for its first use.
+		const bool   keep = mode == PipelineBuildMode::Precompile && !m_precompile_only &&
+		                    order < PrecompileCreatedOrder && g_warm_pipelines.On();
+		KeptPipeline kept;
 		// A build that ends the process or never finishes leaves an unfinished attempt, so
 		// that later runs skip it (PrecompileAttempts).
 		auto*      attempts = m_precompile_attempts.get();
@@ -2153,7 +2192,7 @@ void PipelineCache::EnqueuePrecompileJob(uint64_t key, std::string label, Precom
 			                      .mode    = mode,
 			                      .order   = order};
 		}
-		const auto outcome = build(mode, *cancel);
+		const auto outcome = build(mode, *cancel, keep ? &kept : nullptr);
 		const auto ms      = std::chrono::duration_cast<std::chrono::milliseconds>(
 		                         std::chrono::steady_clock::now() - start)
 		                         .count();
@@ -2167,7 +2206,13 @@ void PipelineCache::EnqueuePrecompileJob(uint64_t key, std::string label, Precom
 			runs->abandoned.fetch_sub(1, std::memory_order_relaxed);
 			PipelineCacheLog("Precompile: {} finished after {} s, past the time budget", label,
 			                 ms / 1000);
+			if (kept.pipeline != nullptr) {
+				device.destroyPipeline(kept.pipeline, nullptr);
+			}
 			return;
+		}
+		if (kept.pipeline != nullptr) {
+			m_warm_pipelines.Keep(kept);
 		}
 		if (attempts != nullptr) {
 			attempts->End(key);
@@ -2181,6 +2226,7 @@ void PipelineCache::EnqueuePrecompileJob(uint64_t key, std::string label, Precom
 		if (m_precompile_progress.Finish(outcome, static_cast<uint64_t>(ms)) &&
 		    !m_precompile_only) {
 			LogPrecompileStats("done");
+			m_precompile_save_due.store(true, std::memory_order_relaxed);
 		}
 	};
 	const bool queued = m_precompile_queue->Enqueue(key, std::move(job), order);
@@ -2285,9 +2331,9 @@ void PipelineCache::EnqueuePrecompile(std::shared_ptr<const ComputeProgramRecord
 	    key, std::move(label),
 	    [graphics = &m_graphics, driver_cache = m_driver_cache, history = m_driver_history,
 	     record = std::move(record),
-	     code_only](PipelineBuildMode mode, const std::atomic<bool>& cancel) {
+	     code_only](PipelineBuildMode mode, const std::atomic<bool>& cancel, KeptPipeline* keep) {
 		    return PrecompileComputeProgram(*graphics, driver_cache, *record, nullptr, code_only,
-		                                    mode, &cancel, history);
+		                                    mode, &cancel, history, keep);
 	    },
 	    code_only ? PrecompileCreatedOrder + position : position);
 }
@@ -2302,8 +2348,9 @@ void PipelineCache::EnqueuePrecompile(
 	(void)EnqueuePrecompileJob(
 	    key, std::move(label),
 	    [this, record = std::move(record),
-	     stages = std::move(stages)](PipelineBuildMode mode, const std::atomic<bool>& cancel) {
-		    return PrecompileGraphicsPipeline(*record, stages, mode, &cancel);
+	     stages = std::move(stages)](PipelineBuildMode mode, const std::atomic<bool>& cancel,
+	                                 KeptPipeline* keep) {
+		    return PrecompileGraphicsPipeline(*record, stages, mode, &cancel, keep);
 	    },
 	    position);
 }
@@ -2485,6 +2532,7 @@ void PipelineCache::QueuePrecompile(uint32_t thread_count) {
 	m_list_open = !m_precompile_only && m_list_resolver != nullptr && m_list_resolver->Pending();
 	if (!m_list_open && progress.EndQueueing() && !m_precompile_only) {
 		LogPrecompileStats("done");
+		m_precompile_save_due.store(true, std::memory_order_relaxed);
 	}
 }
 
@@ -2623,6 +2671,11 @@ void PipelineCache::LogCoverage() {
 		                 "{} of {} recorded were predicted (by earlier sessions or the list)",
 		                 m_graphics_from_cache, m_graphics_compiled, m_graphics_predicted,
 		                 m_graphics_recorded);
+	}
+	if (const auto warm = m_warm_pipelines.GetCounts(); warm.kept != 0) {
+		PipelineCacheLog("Pipelines the precompile kept ready: {} taken at their first use of {} "
+		                 "kept",
+		                 warm.taken, warm.kept);
 	}
 	if (programs.preparation != nullptr) {
 		const auto counts = GetProgramPreparationCounts();
@@ -3146,18 +3199,18 @@ PipelineCache::Pipeline* PipelineCache::ResolvePendingBuild(Pipeline&          p
 	return &pipeline;
 }
 
-void PipelineCache::RecordGraphicsPipeline(const GraphicsPipelineKey& key,
-                                           const DrawRenderState&     state) {
+uint64_t PipelineCache::RecordGraphicsPipeline(const GraphicsPipelineKey& key,
+                                               const DrawRenderState&     state) {
 	GraphicsPipelineRecord record;
 	const auto             vertex_stages = state.VertexStages();
 	record.vertex_stage_count            = static_cast<uint32_t>(vertex_stages.size());
 	for (uint32_t i = 0; i < vertex_stages.size(); i++) {
 		record.vertex_stages[i] = vertex_stages[i].stage.handle->record_key;
-		if (record.vertex_stages[i] == 0) return;
+		if (record.vertex_stages[i] == 0) return 0;
 	}
 	if (state.ps_active) {
 		record.pixel_stage = state.ps_input_info.stage.handle->record_key;
-		if (record.pixel_stage == 0) return;
+		if (record.pixel_stage == 0) return 0;
 	}
 	record.rendering      = key.rendering;
 	record.vertex_input   = key.vertex_input;
@@ -3172,6 +3225,32 @@ void PipelineCache::RecordGraphicsPipeline(const GraphicsPipelineKey& key,
 	if (predicted) {
 		m_graphics_predicted++;
 	}
+	return record_key;
+}
+
+void PipelineCache::SupersedePrecompile(uint64_t key) {
+	if (m_precompile_queue == nullptr || key == 0) {
+		return;
+	}
+	std::lock_guard lock(m_precompile_runs->mutex);
+	// A build that runs is past the check; only queued ones read the set.
+	if (!m_precompile_runs->running.contains(key)) {
+		m_precompile_runs->superseded.insert(key);
+	}
+}
+
+uint64_t PipelineCache::PendingBackgroundBuilds() {
+	uint64_t pending = 0;
+	if (m_program_cache->preparation != nullptr) {
+		std::lock_guard lock(m_program_cache->preparation->mutex);
+		const auto&     counts = m_program_cache->preparation->counts;
+		// A program its first use translated itself (missed) left the queue too.
+		const auto done = counts.prepared + counts.failed + counts.missed;
+		pending += counts.queued > done ? counts.queued - done : 0;
+	}
+	const auto precompile = m_precompile_progress.Get();
+	pending += precompile.queued > precompile.finished ? precompile.queued - precompile.finished : 0;
+	return pending;
 }
 
 PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
@@ -3345,9 +3424,7 @@ PipelineCache::Pipeline* PipelineCache::FindGraphicsPipeline(const CommandBuffer
 		auto& found = *iter->second;
 		return found.pipeline != nullptr ? &found : ResolvePendingBuild(found, blocker);
 	}
-	if (m_pipeline_manifest != nullptr) {
-		RecordGraphicsPipeline(key, state);
-	}
+	const auto record_key = m_pipeline_manifest != nullptr ? RecordGraphicsPipeline(key, state) : 0;
 
 	if (graphics_debug_dump_enabled()) {
 		ShaderDbgDumpInputInfo(vs_input_info);
@@ -3373,9 +3450,10 @@ PipelineCache::Pipeline* PipelineCache::FindGraphicsPipeline(const CommandBuffer
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
 		return CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, state,
 		                              static_params, m_driver_cache, build_mode, &from_driver_cache,
-		                              nullptr, m_driver_history);
+		                              nullptr, m_driver_history, &m_warm_pipelines);
 	}();
 	(from_driver_cache ? m_graphics_from_cache : m_graphics_compiled)++;
+	SupersedePrecompile(record_key);
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr && !job);
@@ -3424,15 +3502,10 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 		ShaderDbgDumpInputInfo(input_info);
 	}
 
-	// A recorded program whose precompile has not finished: build it here, or wait for the
-	// worker building it, rather than compiling it twice; the build below then hits the driver
-	// cache.
-	if (m_precompile_queue != nullptr && compute_program.record_key != 0 &&
-	    !m_precompile_queue->Expedite(compute_program.record_key, PrecompileExpediteWait)) {
-		PipelineCacheLog("PipelineCache: the precompile of CS program {:016x} still runs after "
-		                 "{} s; building it here",
-		                 compute_program.record_key, PrecompileExpediteWait.count());
-	}
+	// A recorded program whose precompile has finished is taken ready-made below
+	// (m_warm_pipelines). One whose precompile has not started is built here like any other
+	// pipeline (from the driver cache, or unoptimized first) and its precompile is skipped; one
+	// being built is built here too: waiting for an optimized build would stop the frame.
 	// A program whose optimized build ran past the precompile budget is never built optimized:
 	// the driver may not finish that build at all.
 	const bool optimized_hangs   = compute_program.record_key != 0 &&
@@ -3449,9 +3522,11 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 		                              optimized_hangs        ? PipelineBuildMode::Unoptimized
 		                              : m_defer_optimization ? PipelineBuildMode::UnoptimizedFirst
 		                                                     : PipelineBuildMode::Optimized,
-		                              &from_driver_cache, nullptr, m_driver_history);
+		                              &from_driver_cache, nullptr, m_driver_history,
+		                              &m_warm_pipelines);
 	}();
 	(from_driver_cache ? m_compute_from_cache : m_compute_compiled)++;
+	SupersedePrecompile(compute_program.record_key);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);

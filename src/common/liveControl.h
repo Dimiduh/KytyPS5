@@ -16,6 +16,9 @@
 //   pad <button> [ms]              press and release a controller button (cross, circle, up, ...)
 //   stick <lx> <ly> <rx> <ry> <ms> hold the sticks (0..255, 128 centred), then centre them
 //   sleep <ms>                     wait before the next command
+//   wait [seconds]                 wait (at most that long, default 300) until the emulator has no
+//                                  shader translation or pipeline build left that it runs ahead of
+//                                  first uses, so that a measurement does not see them
 //   threads                        the registered threads and their CPU time
 //   quit                           close the emulator window
 // Answers go to the log and, one line each, to <command file>.out. Without KYTY_LIVE_FILE nothing
@@ -71,6 +74,9 @@ struct HostHooks {
 	void (*pad_button)(uint32_t button, bool down)             = nullptr;
 	void (*pad_sticks)(int left_x, int left_y, int right_x, int right_y) = nullptr;
 	void (*quit)()                                              = nullptr;
+	// Shader translations and pipeline builds the emulator runs ahead of their first use and
+	// has not finished (for `wait`).
+	uint64_t (*pending_builds)()                                = nullptr;
 };
 void SetHostHooks(const HostHooks& hooks) noexcept;
 

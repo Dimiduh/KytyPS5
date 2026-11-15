@@ -129,7 +129,8 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 		        Libs::Controller::SetAxis(id, Axis::RightX, right_x);
 		        Libs::Controller::SetAxis(id, Axis::RightY, right_y);
 	        },
-	    .quit = [] { Libs::Graphics::WindowRequestClose(); },
+	    .quit           = [] { Libs::Graphics::WindowRequestClose(); },
+	    .pending_builds = [] { return Libs::Graphics::WindowPendingBackgroundBuilds(); },
 	});
 	Common::LiveControl::Start();
 }

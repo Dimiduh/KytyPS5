@@ -102,7 +102,7 @@ struct ConfigOptions {
 	bool                   async_pipelines_enabled     = true;
 	bool                   skip_pending_draws              = false;
 	bool                   serialize_dispatches            = false;
-	bool                   precompile_pipelines            = false;
+	bool                   precompile_pipelines            = true;
 	bool                   precompile_only                 = false;
 	bool                   rebuild_pipeline_cache          = false;
 	// --export-pipeline-list / --import-pipeline-list (empty = off).

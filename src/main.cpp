@@ -163,10 +163,12 @@ static void PrintUsage() {
 	    "                                       their pipelines build in the background (at most\n"
 	    "                                       2 s per pipeline).\n");
 	::printf(
-	    "  --precompile-pipelines               Build the compute and graphics pipelines recorded\n"
-	    "                                       in earlier sessions, and those of compute shaders\n"
-	    "                                       the game created but never dispatched, into the\n"
-	    "                                       driver cache in the background while it runs.\n");
+	    "  --no-precompile-pipelines            Do not build the compute and graphics pipelines\n"
+	    "                                       recorded in earlier sessions, and those of compute\n"
+	    "                                       shaders the game created but never dispatched, in\n"
+	    "                                       the background while it runs. (The builds go into\n"
+	    "                                       the driver cache, and the recorded ones are kept\n"
+	    "                                       ready for their first use.)\n");
 	::printf(
 	    "  --lookahead-threads <n>              Threads that evaluate the resources of upcoming\n"
 	    "                                       draws and dispatches ahead of the GPU thread\n"
@@ -189,8 +191,8 @@ static void PrintUsage() {
 	    "                                       shareable list without shader code, and exit.\n");
 	::printf(
 	    "  --import-pipeline-list <file>        Precompile the pipelines of a shared list whose\n"
-	    "                                       shaders this game has (with --precompile-only or\n"
-	    "                                       --precompile-pipelines).\n");
+	    "                                       shaders this game has (with --precompile-only, or\n"
+	    "                                       beside the game unless --no-precompile-pipelines).\n");
 	::printf("  --serialize-dispatches               Order every guest compute dispatch after the\n"
 	         "                                       previous one, also where the guest sends no\n"
 	         "                                       flush between them.\n");
@@ -326,6 +328,7 @@ static constexpr Flag FLAGS[] = {
     {"--no-async-pipelines", &ConfigOptions::async_pipelines_enabled, false},
     {"--skip-pending-draws", &ConfigOptions::skip_pending_draws},
     {"--precompile-pipelines", &ConfigOptions::precompile_pipelines},
+    {"--no-precompile-pipelines", &ConfigOptions::precompile_pipelines, false},
     {"--precompile-only", &ConfigOptions::precompile_only},
     {"--rebuild-pipeline-cache", &ConfigOptions::rebuild_pipeline_cache},
     {"--serialize-dispatches", &ConfigOptions::serialize_dispatches},

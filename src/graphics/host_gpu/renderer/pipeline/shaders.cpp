@@ -368,10 +368,11 @@ CreatePipelineHandle(GraphicContext& graphics, PipelineCache::Pipeline& pipeline
                      std::unique_ptr<Inputs> inputs, vk::PipelineCache driver_cache,
                      PipelineBuildMode mode, bool* from_driver_cache,
                      const std::atomic<bool>* cancel, std::shared_ptr<DriverCacheHistory> history,
-                     uint64_t fingerprint) {
+                     uint64_t fingerprint, WarmPipelines* warm) {
 	EXIT_IF(pipeline.pipeline != nullptr);
 	const auto device = graphics.device;
 	vk::Result result = vk::Result::eSuccess;
+	pipeline.fingerprint = fingerprint;
 	if (from_driver_cache != nullptr) {
 		*from_driver_cache = false;
 	}
@@ -384,6 +385,18 @@ CreatePipelineHandle(GraphicContext& graphics, PipelineCache::Pipeline& pipeline
 	}
 	if (driver_cache == nullptr) {
 		history = nullptr;
+	}
+	// The session's precompile built this very pipeline already (the same create info, which
+	// the fingerprint identifies; its layout was another object, identically defined): it is
+	// the optimized build, and nothing is left to do.
+	if (warm != nullptr && mode != PipelineBuildMode::Precompile) {
+		if (const auto kept = warm->Take(fingerprint); kept != nullptr) {
+			pipeline.pipeline = kept;
+			if (from_driver_cache != nullptr) {
+				*from_driver_cache = true;
+			}
+			return {};
+		}
 	}
 	// Probed in every other mode: a hit is the whole build, and the outcome is reported.
 	if (driver_cache != nullptr && graphics.pipeline_creation_cache_control_enabled) {
@@ -548,7 +561,8 @@ PipelineCompileQueue::Job CreatePipelineInternal(
     const PipelineRenderingState& rendering, const PipelineVertexInputState& vertex_input,
     const DrawRenderState& state, const PipelineStaticParameters& static_params,
     vk::PipelineCache driver_cache, PipelineBuildMode mode, bool* from_driver_cache,
-    const std::atomic<bool>* cancel, std::shared_ptr<DriverCacheHistory> history) {
+    const std::atomic<bool>* cancel, std::shared_ptr<DriverCacheHistory> history,
+    WarmPipelines* warm) {
 	const auto  vertex_info    = state.VertexStages();
 	const auto& vs_input_info  = vertex_info.front();
 	const auto* ps_input_info  = state.ps_active ? &state.ps_input_info : nullptr;
@@ -898,7 +912,7 @@ PipelineCompileQueue::Job CreatePipelineInternal(
 	    GraphicsFingerprint(*inputs, rendering, vertex_input, state, static_params, rect_list_spirv,
 	                        layout_fingerprint);
 	return CreatePipelineHandle(graphics, pipeline, std::move(inputs), driver_cache, mode,
-	                            from_driver_cache, cancel, std::move(history), fingerprint);
+	                            from_driver_cache, cancel, std::move(history), fingerprint, warm);
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -907,7 +921,7 @@ CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeli
                        const ShaderComputeInputInfo& input_info, vk::ShaderModule compute_module,
                        vk::PipelineCache driver_cache, PipelineBuildMode mode,
                        bool* from_driver_cache, const std::atomic<bool>* cancel,
-                       std::shared_ptr<DriverCacheHistory> history) {
+                       std::shared_ptr<DriverCacheHistory> history, WarmPipelines* warm) {
 	EXIT_IF(compute_module == nullptr);
 
 	auto  inputs                  = std::make_unique<ComputePipelineInputs>();
@@ -983,7 +997,7 @@ CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeli
 	    *inputs, input_info.stage.handle != nullptr ? input_info.stage.handle->spirv_hash : 0,
 	    layout_fingerprint);
 	return CreatePipelineHandle(graphics, pipeline, std::move(inputs), driver_cache, mode,
-	                            from_driver_cache, cancel, std::move(history), fingerprint);
+	                            from_driver_cache, cancel, std::move(history), fingerprint, warm);
 }
 
 } // namespace Libs::Graphics

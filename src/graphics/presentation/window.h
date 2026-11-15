@@ -20,6 +20,9 @@ void                     WindowRun();
 void                     WindowShutdown();
 // Asks the window loop to close, as the user closing the window does (any thread).
 void                     WindowRequestClose();
+// The renderer's background builds that have not finished (PipelineCache::
+// PendingBackgroundBuilds); zero without a renderer. Any thread, while the window lives.
+[[nodiscard]] uint64_t   WindowPendingBackgroundBuilds();
 
 // Nits of the display showing the game window; the defaults apply when the host reports none.
 struct DisplayLuminance {

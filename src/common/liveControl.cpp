@@ -596,6 +596,28 @@ void Execute(uint64_t id, const std::string& line) {
 	} else if (command == "sleep" && words.size() == 2) {
 		std::this_thread::sleep_for(
 		    std::chrono::milliseconds(std::clamp(static_cast<int>(number(1, 0.0)), 0, 600000)));
+	} else if (command == "wait" && g_hooks.pending_builds != nullptr) {
+		const auto start    = std::chrono::steady_clock::now();
+		const auto limit    = std::chrono::duration<double>(std::clamp(number(1, 300.0), 0.0, 3600.0));
+		uint64_t   pending  = g_hooks.pending_builds();
+		uint64_t   at_start = pending;
+		// Idle for a second: builds queue as the guest creates its shaders.
+		auto idle_since = start;
+		for (;;) {
+			const auto now = std::chrono::steady_clock::now();
+			if (pending != 0) {
+				idle_since = now;
+			}
+			if (now - idle_since >= std::chrono::seconds {1} || now - start >= limit) {
+				break;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(50));
+			pending = g_hooks.pending_builds();
+		}
+		Answer(Format("LIVE wait id=%" PRIu64 " pending=%" PRIu64 " (was %" PRIu64 ") waited=%.1fs",
+		              id, pending, at_start,
+		              std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+		                  .count()));
 	} else if (command == "threads") {
 		std::string list = Format("LIVE threads id=%" PRIu64, id);
 		for (const auto& thread: Threads()) {

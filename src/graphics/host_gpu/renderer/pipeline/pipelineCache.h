@@ -101,6 +101,77 @@ struct DrawRenderState {
 	}
 };
 
+// A pipeline a precompile build hands on instead of destroying it, with the fingerprint of its
+// create info (PipelineCache::Pipeline::fingerprint).
+struct KeptPipeline {
+	vk::Pipeline pipeline    = nullptr;
+	uint64_t     fingerprint = 0;
+};
+
+// The pipelines the precompile of a running session built for what earlier sessions recorded,
+// kept until their first use takes them: that use then needs no driver call on the GPU thread.
+// Keyed by the fingerprint of the create info, which is what makes two pipelines
+// interchangeable (the taker binds its own, identically defined, layout). Thread-safe.
+class WarmPipelines {
+public:
+	explicit WarmPipelines(vk::Device device): m_device(device) {}
+	~WarmPipelines() { Clear(); }
+	KYTY_CLASS_NO_COPY(WarmPipelines);
+
+	// Keeps the pipeline; destroys it when one of its fingerprint is kept already, the
+	// fingerprint is unknown (zero), or the store is full.
+	void Keep(const KeptPipeline& kept) {
+		{
+			std::lock_guard lock(m_mutex);
+			if (kept.fingerprint != 0 && m_pipelines.size() < MaxKept &&
+			    m_pipelines.try_emplace(kept.fingerprint, kept.pipeline).second) {
+				m_kept++;
+				return;
+			}
+		}
+		m_device.destroyPipeline(kept.pipeline, nullptr);
+	}
+	// The kept pipeline of the fingerprint, which leaves the store; null without one.
+	[[nodiscard]] vk::Pipeline Take(uint64_t fingerprint) {
+		std::lock_guard lock(m_mutex);
+		const auto      entry = m_pipelines.find(fingerprint);
+		if (entry == m_pipelines.end()) {
+			return nullptr;
+		}
+		const auto pipeline = entry->second;
+		m_pipelines.erase(entry);
+		m_taken++;
+		return pipeline;
+	}
+	// Destroys the pipelines nobody took.
+	void Clear() {
+		std::lock_guard lock(m_mutex);
+		for (const auto& [fingerprint, pipeline]: m_pipelines) {
+			(void)fingerprint;
+			m_device.destroyPipeline(pipeline, nullptr);
+		}
+		m_pipelines.clear();
+	}
+	struct Counts {
+		uint64_t kept  = 0;
+		uint64_t taken = 0;
+	};
+	[[nodiscard]] Counts GetCounts() const {
+		std::lock_guard lock(m_mutex);
+		return {m_kept, m_taken};
+	}
+
+private:
+	// More than a session's precompile keeps for the titles seen so far (Saros: about 1,400).
+	static constexpr size_t MaxKept = 8192;
+
+	vk::Device                                 m_device;
+	mutable std::mutex                         m_mutex;
+	std::unordered_map<uint64_t, vk::Pipeline> m_pipelines;
+	uint64_t                                   m_kept  = 0;
+	uint64_t                                   m_taken = 0;
+};
+
 // The owning renderer serializes access, including saves while the GPU is running.
 class PipelineCache {
 public:
@@ -170,7 +241,15 @@ public:
 		vk::ShaderStageFlags    push_stages;
 		bool                    uses_push_descriptors = false;
 		bool                    uses_image_heap       = false;
+		// Identifies the create info the pipeline was built from (zero when a stage's SPIR-V
+		// is unknown); see CreatePipelineInternal.
+		uint64_t                fingerprint           = 0;
 	};
+
+	// Background work that fills in for first uses and has not finished: recorded programs
+	// still to translate (StartProgramPreparation) and precompile builds (StartPrecompile).
+	// Safe from any thread; a measurement waits for zero.
+	[[nodiscard]] uint64_t PendingBackgroundBuilds();
 
 	// Reads the shaders and registers bound in `command` into the state's shader stages.
 	void GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state);
@@ -320,9 +399,9 @@ private:
 	// A precompile build that runs: when it started, and whether it has finished or timed out
 	// (whichever comes first settles it). A build stops before its next driver call once
 	// `cancel` is set (it timed out, or the cache stops); a driver call itself cannot be
-	// interrupted.
-	using PrecompileBuild =
-	    std::function<PrecompileOutcome(PipelineBuildMode, const std::atomic<bool>& cancel)>;
+	// interrupted. With `keep`, the build hands its pipeline on instead of destroying it.
+	using PrecompileBuild = std::function<PrecompileOutcome(
+	    PipelineBuildMode, const std::atomic<bool>& cancel, KeptPipeline* keep)>;
 	struct RunningPrecompile {
 		std::chrono::steady_clock::time_point start;
 		std::shared_ptr<std::atomic<bool>>    settled;
@@ -338,6 +417,9 @@ private:
 		std::unordered_map<uint64_t, RunningPrecompile> running;
 		// Abandoned builds still in their driver call.
 		std::atomic<uint64_t> abandoned {0};
+		// Keys whose pipeline the renderer built at its first use before the precompile got
+		// to it: their builds end at once when their turn comes.
+		std::unordered_set<uint64_t> superseded;
 	};
 	std::shared_ptr<PrecompileRuns>       m_precompile_runs = std::make_shared<PrecompileRuns>();
 	std::chrono::steady_clock::time_point m_next_timeout_check {};
@@ -355,6 +437,12 @@ private:
 	std::chrono::steady_clock::time_point           m_next_coverage_report {};
 	// --precompile-only logs its outcome itself.
 	bool m_precompile_only = false;
+	// What the precompile of this session built for recorded programs and pipelines, for their
+	// first use (CreatePipelineInternal takes from it). Not with --precompile-only.
+	WarmPipelines m_warm_pipelines;
+	// The precompile run has finished: the driver cache is written at the next checkpoint
+	// instead of at the next save interval.
+	std::atomic<bool> m_precompile_save_due {false};
 	// Translated stages of graphics pipelines being precompiled, shared by the pipelines that
 	// use them; released when the precompile stops.
 	struct PrecompiledStage;
@@ -422,10 +510,15 @@ private:
 	PrecompileOutcome
 	PrecompileGraphicsPipeline(const GraphicsPipelineRecord&                               record,
 	                           std::span<const std::shared_ptr<const GraphicsStageRecord>> stages,
-	                           PipelineBuildMode mode, const std::atomic<bool>* cancel = nullptr);
+	                           PipelineBuildMode mode, const std::atomic<bool>* cancel = nullptr,
+	                           KeptPipeline* keep = nullptr);
 	void LogCoverage();
-	// Adds a pipeline the cache is about to create to the pipeline manifest.
-	void RecordGraphicsPipeline(const GraphicsPipelineKey& key, const DrawRenderState& state);
+	// Adds a pipeline the cache is about to create to the pipeline manifest; returns the key
+	// of its record (zero when a stage has none).
+	uint64_t RecordGraphicsPipeline(const GraphicsPipelineKey& key, const DrawRenderState& state);
+	// The renderer builds the pipeline of a record itself: a precompile build of it that has
+	// not started is skipped.
+	void SupersedePrecompile(uint64_t key);
 
 	void LogPrecompileStats(const char* when);
 	// Returns the pipeline of a pending first build, or null when the draw may skip it.
@@ -444,19 +537,24 @@ void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pi
 // Creates the pipeline layout and the pipeline as `mode` says. Unless the build is Optimized,
 // the pipeline may be unoptimized or (Background) still null; the returned job then builds the
 // optimized one (see PipelineCache::DeferOptimization). `history` (optional) learns which
-// pipelines went through `driver_cache` and counts probes that missed one of them.
+// pipelines went through `driver_cache` and counts probes that missed one of them. `warm`
+// (optional, not for a Precompile or Unoptimized build) provides a pipeline the session's
+// precompile built from the same create info: it is taken instead of a driver call, and counts
+// as coming from the driver cache.
 PipelineCompileQueue::Job CreatePipelineInternal(
     GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
     const PipelineRenderingState& rendering, const PipelineVertexInputState& vertex_input,
     const DrawRenderState& state, const PipelineStaticParameters& static_params,
     vk::PipelineCache driver_cache, PipelineBuildMode mode, bool* from_driver_cache = nullptr,
-    const std::atomic<bool>* cancel = nullptr, std::shared_ptr<DriverCacheHistory> history = {});
+    const std::atomic<bool>* cancel = nullptr, std::shared_ptr<DriverCacheHistory> history = {},
+    WarmPipelines* warm = nullptr);
 PipelineCompileQueue::Job
 CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                        const ShaderComputeInputInfo& input_info, vk::ShaderModule compute_module,
                        vk::PipelineCache driver_cache, PipelineBuildMode mode,
                        bool* from_driver_cache = nullptr, const std::atomic<bool>* cancel = nullptr,
-                       std::shared_ptr<DriverCacheHistory> history = {});
+                       std::shared_ptr<DriverCacheHistory> history = {},
+                       WarmPipelines* warm = nullptr);
 
 // Translates a recorded compute program as PipelineCache::GetComputeProgram would and builds
 // its pipeline through `driver_cache`, so that the pipeline cache finds it there on first use.
@@ -465,13 +563,15 @@ CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeli
 // ShaderRecompiler::IR::CodeOnlySpecialization of the translated program (a created shader that
 // no dispatch has specialized yet).
 // `mode` is Precompile, or Unoptimized for a program whose optimized build timed out. Once
-// `cancel` is set, the build stops before its next driver call (and reports TimedOut).
+// `cancel` is set, the build stops before its next driver call (and reports TimedOut). With
+// `keep`, a pipeline that was built is handed on instead of destroyed.
 PrecompileOutcome PrecompileComputeProgram(GraphicContext& graphics, vk::PipelineCache driver_cache,
                                            const ComputeProgramRecord& record,
                                            uint64_t* spirv_hash = nullptr, bool code_only = false,
                                            PipelineBuildMode mode = PipelineBuildMode::Precompile,
                                            const std::atomic<bool>*            cancel  = nullptr,
-                                           std::shared_ptr<DriverCacheHistory> history = {});
+                                           std::shared_ptr<DriverCacheHistory> history = {},
+                                           KeptPipeline*                       keep    = nullptr);
 
 } // namespace Libs::Graphics
 
