@@ -245,6 +245,56 @@ struct ImageResource {
 	bool operator==(const ImageResource& other) const = default;
 };
 
+// A portable image (PortableImageSwizzle) that only raw loads and stores reach is declared with
+// a float format whatever the T#'s numeric class: a T# of an integer format is bound through a
+// view that keeps its texels' bits (RawViewOf), and the accesses take the integer values from
+// what that view gives, as the image's shader-data word says (RawView). So the module built
+// from the shader's code alone also serves the integer textures it cannot know of.
+[[nodiscard]] constexpr bool RawClassImage(const ImageResource& image) {
+	return image.shader_swizzle == PortableImageSwizzle && image.unfiltered_access_only &&
+	       !image.atomic && !image.depth_compare &&
+	       image.conversion_format == Prospero::BufferFormat::kInvalid;
+}
+
+// How a raw-class image's texels are read from and written through its float-declared view:
+// as they are (a float format), by their bits (32-bit integers behind a 32-bit float view), or
+// scaled (8- and 16-bit unsigned integers behind a UNorm view). Bits 12-13 of the image's
+// shader-data word, above the DST_SEL.
+enum class RawView : uint32_t { Float = 0, Bits = 1, Unorm8 = 2, Unorm16 = 3, None = UINT32_MAX };
+inline constexpr uint32_t RawViewShift = 12u;
+
+struct RawViewInfo {
+	RawView                mode = RawView::None;
+	Prospero::BufferFormat view = Prospero::BufferFormat::kInvalid;
+};
+
+// The view of a T# of an integer format for a raw-class image; RawView::None for a format without
+// one (such a T# gets a module of its own).
+[[nodiscard]] constexpr RawViewInfo RawViewOf(Prospero::BufferFormat format) {
+	using F = Prospero::BufferFormat;
+	switch (format) {
+		case F::k32UInt:
+		case F::k32SInt: return {RawView::Bits, F::k32Float};
+		case F::k32_32UInt:
+		case F::k32_32SInt: return {RawView::Bits, F::k32_32Float};
+		case F::k32_32_32_32UInt:
+		case F::k32_32_32_32SInt: return {RawView::Bits, F::k32_32_32_32Float};
+		case F::k8UInt: return {RawView::Unorm8, F::k8UNorm};
+		case F::k8_8UInt: return {RawView::Unorm8, F::k8_8UNorm};
+		case F::k8_8_8_8UInt: return {RawView::Unorm8, F::k8_8_8_8UNorm};
+		case F::k16UInt: return {RawView::Unorm16, F::k16UNorm};
+		case F::k16_16UInt: return {RawView::Unorm16, F::k16_16UNorm};
+		case F::k16_16_16_16UInt: return {RawView::Unorm16, F::k16_16_16_16UNorm};
+		default: return {};
+	}
+}
+
+// Whether a raw-class image serves a T# of format's view: loads through every view, stores only
+// by the bits (stores through the UNorm views have no test).
+[[nodiscard]] constexpr bool RawViewServes(RawView mode, bool written) {
+	return mode != RawView::None && (!written || mode == RawView::Bits);
+}
+
 [[nodiscard]] constexpr Prospero::BufferFormat
 RawSignedStorageFormat(const ImageResource& image, Prospero::BufferFormat format) {
 	if (image.resource_class != ImageResourceClass::Storage || !image.written)
@@ -604,9 +654,10 @@ struct Bindings {
 	[[nodiscard]] uint32_t ShaderDataDwords() const {
 		return MemorySwizzleDword() + (image_swizzles + 1u) / 2u;
 	}
-	void PackImageSwizzle(std::span<uint32_t> shader_data, uint32_t image, uint32_t swizzle) const {
+	// The word holds the T#'s DST_SEL and, above it, the RawView of a raw-class image.
+	void PackImageSwizzle(std::span<uint32_t> shader_data, uint32_t image, uint32_t word) const {
 		const auto shift = (image % 2u) * 16u;
-		shader_data[MemorySwizzleDword() + image / 2u] |= (swizzle & 0xfffu) << shift;
+		shader_data[MemorySwizzleDword() + image / 2u] |= (word & 0xffffu) << shift;
 	}
 	void PackMemoryFormat(std::span<uint32_t> shader_data, uint32_t binding,
 	                      uint32_t format_index) const {

@@ -377,7 +377,8 @@ struct PipelineCache::ProgramCache {
 					        ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
 					                                                 layout.ShaderDataDwords()) ||
 					    !ShaderRecompiler::IR::SpecializationServes(
-					        resource_plan, candidate.specialization, specialization, portable)) {
+					        resource_plan, candidate.specialization, specialization, portable,
+					        &resources)) {
 						continue;
 					}
 					if constexpr (HasCalls) {
@@ -1253,7 +1254,8 @@ struct PipelineCache::ProgramCache {
 					code_only_same++;
 				} else if (code_only.has_value() &&
 				           ShaderRecompiler::IR::SpecializationServes(
-				               entry->second.resource_plan, *code_only, specialization)) {
+				               entry->second.resource_plan, *code_only, specialization, true,
+				               &entry->second.resources)) {
 					exact          = std::move(specialization);
 					specialization = std::move(*code_only);
 					code_only_taken++;

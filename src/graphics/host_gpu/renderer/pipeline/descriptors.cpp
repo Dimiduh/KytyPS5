@@ -310,8 +310,14 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	    Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
 	const bool raw_float_atomic = format == Prospero::BufferFormat::k32Float && uint_resource &&
 	                              resource.atomic && !resource.atomic64;
+	// A raw-class image is declared float and stores an integer T#'s texels by their bits
+	// (IR::RawClassImage).
+	const bool raw_bits =
+	    ShaderRecompiler::IR::RawClassImage(resource) &&
+	    descriptor.TileMode() != Prospero::TileMode::kDepth &&
+	    ShaderRecompiler::IR::RawViewOf(format).mode == ShaderRecompiler::IR::RawView::Bits;
 	const bool format_ok =
-	    raw_sint_storage || raw_float_atomic ||
+	    raw_sint_storage || raw_float_atomic || raw_bits ||
 	    (numeric_class != Prospero::TextureNumericClass::Unsupported &&
 	     numeric_class != Prospero::TextureNumericClass::Sint &&
 	     uint_resource == (numeric_class == Prospero::TextureNumericClass::Uint) &&
@@ -624,9 +630,18 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const auto& surface_format = *found_format;
 	const bool shader_conversion =
 	    surface_format.conversion_format != Prospero::BufferFormat::kInvalid;
+	// A raw-class image is declared float whatever the T#: it binds an integer T# through the
+	// view that keeps the texels' bits, and the shader takes the integers from what that view
+	// gives (IR::RawClassImage, IR::RawViewOf).
+	// A depth or stencil surface has no colour view, and never reaches such an image.
+	const auto raw_view = ShaderRecompiler::IR::RawClassImage(resource) && !depth_tile
+	                          ? ShaderRecompiler::IR::RawViewOf(format)
+	                          : ShaderRecompiler::IR::RawViewInfo {};
+	const bool raw      = raw_view.mode != ShaderRecompiler::IR::RawView::None;
 	const bool sampled_numeric_class =
-	    storage || resource.numeric_class ==
-	                   Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
+	    storage || raw ||
+	    resource.numeric_class ==
+	        Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
 	if (!storage && resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
 	    !sampled_numeric_class) {
 		if (optional) {
@@ -653,8 +668,9 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			pixel_format = depth_format->depth_attachment_format;
 		}
 	}
-	const auto view_format =
-	    storage ? StorageViewFormat(resource, format, pixel_format) : pixel_format;
+	const auto view_format = raw       ? VulkanFormat(raw_view.view)
+	                         : storage ? StorageViewFormat(resource, format, pixel_format)
+	                                   : pixel_format;
 	const auto              block_bytes = Prospero::BlockCompressedBytesPerBlock(format);
 	TextureCache::ImageDesc desc {};
 	desc.info.data         = {address, 0};
@@ -779,8 +795,9 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		return {};
 	} else {
 		// Set after FindImage, whose metadata clears need the attachment-capable format.
-		desc.view_info.format = SampledViewFormat(m_context.GetGraphics(), format, pixel_format,
-		                                          resource.skip_degamma);
+		desc.view_info.format = raw ? view_format
+		                            : SampledViewFormat(m_context.GetGraphics(), format,
+		                                                pixel_format, resource.skip_degamma);
 		(void)SelectSampledColorView(image->info.pixel_format, desc.view_info.format,
 		                             descriptor.DstSelXYZW());
 	}
@@ -809,7 +826,8 @@ static TextureMemoKey MakeTextureMemoKey(const ShaderRecompiler::IR::ImageResour
 	             uint64_t {static_cast<uint8_t>(resource.mip_mode)} << 16u |
 	             uint64_t {static_cast<uint8_t>(resource.dimension)} << 24u |
 	             uint64_t {static_cast<uint8_t>(resource.numeric_class)} << 32u |
-	             uint64_t {value.dword_count} << 40u;
+	             uint64_t {value.dword_count} << 40u |
+	             uint64_t {ShaderRecompiler::IR::RawClassImage(resource)} << 48u;
 	return key;
 }
 

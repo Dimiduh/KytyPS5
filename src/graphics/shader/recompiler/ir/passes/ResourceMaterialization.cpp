@@ -366,6 +366,17 @@ uint32_t DescriptorImageSwizzle(const DescriptorValue& descriptor) {
 	return descriptor.dwords[3] & 0xfffu;
 }
 
+// How a raw-class image views a T# of an integer format (RawViewOf); none for a depth or stencil
+// surface, whose host image has no colour view.
+RawView DescriptorRawView(const DescriptorValue& descriptor) {
+	if (static_cast<Prospero::TileMode>((descriptor.dwords[3] >> 20u) & 0x1fu) ==
+	    Prospero::TileMode::kDepth) {
+		return RawView::None;
+	}
+	return RawViewOf(static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu))
+	    .mode;
+}
+
 Prospero::BufferFormat ImageConversionFormat(Prospero::BufferFormat format) {
 	return Prospero::RemapTextureFormat(format) != format ? format
 	                                                      : Prospero::BufferFormat::kInvalid;
@@ -1975,6 +1986,23 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 			return SpecializationFail(message);
 		}
+		// Tests: an image a portable module accesses whatever its numeric class (RawClassImage)
+		// is specialized as one: declared float, and bound through a view that keeps an integer
+		// T#'s bits.
+		if (g_force_portable_buffer_formats.load(std::memory_order_relaxed) &&
+		    image.conversion_format == Prospero::BufferFormat::kInvalid &&
+		    image.srgb_decode == Prospero::BufferFormat::kInvalid &&
+		    i < program.info.images.size() && base.unfiltered_access_only && !base.atomic &&
+		    !base.depth_compare && image.indirect_root == ImageResource::NoIndirectImage &&
+		    !image.heap && !image.bindless && !image.fmask) {
+			const auto* direct  = Source(program, base.source);
+			const bool  integer = image.numeric_class != Prospero::TextureNumericClass::Float;
+			if ((direct == nullptr || !direct->indirect_descriptor.has_value()) &&
+			    (!integer || RawViewServes(DescriptorRawView(descriptor), base.written))) {
+				image.shader_swizzle = PortableImageSwizzle;
+				image.numeric_class  = Prospero::TextureNumericClass::Float;
+			}
+		}
 	}
 	for (uint32_t root_index = 0; root_index < specialization.images.size(); root_index++) {
 		auto& root = specialization.images[root_index];
@@ -2373,8 +2401,13 @@ static bool ServesBuffer(const ResourcePlan& program, uint32_t resource,
 
 // A module whose storage image takes its store swizzle at run time behaves as one compiled for
 // any swizzle of the image (PortableImageSwizzle).
-static bool ServesImage(const ResourceSpecialization::Image& compiled,
-                        const ResourceSpecialization::Image& current, bool portable) {
+// And one whose image only raw loads and stores reach (RawClassImage) is declared float and
+// behaves as one compiled for an integer T# whose texels a float or UNorm view keeps (RawViewOf);
+// that takes the T#'s format, so the dispatch's resources.
+static bool ServesImage(const ResourcePlan& program, uint32_t index,
+                        const ResourceSpecialization::Image& compiled,
+                        const ResourceSpecialization::Image& current, bool portable,
+                        const ResourceSnapshot* resources) {
 	if (compiled == current) return true;
 	if (!portable || compiled.shader_swizzle != PortableImageSwizzle ||
 	    current.shader_swizzle == PortableImageSwizzle) {
@@ -2382,16 +2415,30 @@ static bool ServesImage(const ResourceSpecialization::Image& compiled,
 	}
 	auto layout           = compiled;
 	layout.shader_swizzle = current.shader_swizzle;
-	return layout == current;
+	if (layout == current) return true;
+	if (resources == nullptr || index >= program.info.images.size() ||
+	    index >= resources->images.size() ||
+	    compiled.numeric_class != Prospero::TextureNumericClass::Float ||
+	    (current.numeric_class != Prospero::TextureNumericClass::Uint &&
+	     current.numeric_class != Prospero::TextureNumericClass::Sint)) {
+		return false;
+	}
+	const auto& image = program.info.images[index];
+	if (!image.unfiltered_access_only || image.atomic || image.depth_compare) return false;
+	layout.numeric_class = current.numeric_class;
+	return layout == current &&
+	       RawViewServes(DescriptorRawView(resources->images[index]), image.written);
 }
 
 bool SpecializationServes(const ResourcePlan& program, const ResourceSpecialization& compiled,
-                          const ResourceSpecialization& current, bool portable) {
+                          const ResourceSpecialization& current, bool portable,
+                          const ResourceSnapshot* resources) {
 	if (compiled.buffers.size() != current.buffers.size() ||
 	    compiled.images.size() != current.images.size() || compiled.samplers != current.samplers)
 		return false;
 	for (uint32_t i = 0; i < current.images.size(); ++i) {
-		if (!ServesImage(compiled.images[i], current.images[i], portable)) return false;
+		if (!ServesImage(program, i, compiled.images[i], current.images[i], portable, resources))
+			return false;
 	}
 	for (uint32_t i = 0; i < current.buffers.size(); ++i) {
 		if (compiled.buffers[i] != current.buffers[i] &&
@@ -3585,7 +3632,10 @@ std::optional<ResourceSpecialization> CodeOnlySpecialization(const Program& prog
 		                         ? Decoder::ImageDimension::Dim2D
 		                         : image.dimension,
 		});
-		if (portable && image.resource_class == ImageResourceClass::Storage) {
+		// An image only raw loads and stores reach is such a portable image too, and declared
+		// float it also serves integer T#s (RawClassImage).
+		if (portable && (image.resource_class == ImageResourceClass::Storage ||
+		                 (image.unfiltered_access_only && !image.atomic && !image.depth_compare))) {
 			entry.shader_swizzle = PortableImageSwizzle;
 		}
 		// Like the materialization, refuse what no descriptor can give the image (an unused
@@ -3953,10 +4003,16 @@ static void FillImageSwizzles(const ShaderInfo& info, const Bindings& bindings,
 	for (uint32_t image = 0; image < info.images.size(); ++image) {
 		if (info.images[image].shader_swizzle != PortableImageSwizzle) continue;
 		const auto& descriptor = snapshot.images[image];
-		bindings.PackImageSwizzle(shader_data, image,
-		                          NullImageDescriptor(descriptor)
-		                              ? ShaderImageIdentitySwizzle
-		                              : DescriptorImageSwizzle(descriptor));
+		uint32_t    word       = ShaderImageIdentitySwizzle;
+		if (!NullImageDescriptor(descriptor)) {
+			word = DescriptorImageSwizzle(descriptor);
+			// How a raw-class image takes an integer T#'s texels from its view.
+			const auto view = DescriptorRawView(descriptor);
+			if (RawClassImage(info.images[image]) && view != RawView::None) {
+				word |= static_cast<uint32_t>(view) << RawViewShift;
+			}
+		}
+		bindings.PackImageSwizzle(shader_data, image, word);
 	}
 }
 

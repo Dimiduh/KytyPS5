@@ -290,6 +290,77 @@ uint32_t ResultVector(ValueEmitContext& ctx, uint32_t value,
 	return result;
 }
 
+uint32_t SplatBool(EmitterState& state, uint32_t condition) {
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeBoolVector(state, 4), result, condition,
+	                          condition, condition, condition);
+	return result;
+}
+
+// The RawView of a raw-class image, from its shader-data word.
+uint32_t RawViewMode(EmitterState& state, uint32_t word) {
+	const auto mode = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBitFieldUExtract, TypeU32(state), mode, word,
+	                          ConstantU32(state, IR::RawViewShift), ConstantU32(state, 2u));
+	return mode;
+}
+
+// The value by which a UNorm view scales the 8- or 16-bit integers behind it.
+uint32_t RawViewScale(EmitterState& state, uint32_t mode) {
+	return Select(state, TypeF32(state),
+	              Binary(state, spv::OpIEqual, TypeBool(state), mode,
+	                     ConstantU32(state, static_cast<uint32_t>(IR::RawView::Unorm16))),
+	              ConstantF32Value(state, 65535.0f), ConstantF32Value(state, 255.0f));
+}
+
+// The register bits of a texel fetched from a raw-class image (IR::RawClassImage): the image is
+// declared float; behind an integer T# the view gives the integers' bits, or the integers scaled
+// to UNorm, and gives 1.0 where the integer view of the T# gives 1.
+uint32_t RawClassResult(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t value) {
+	auto&      state = ctx.state;
+	const auto word  = EmitImageSwizzle(state, mem.resource);
+	const auto mode  = RawViewMode(state, word);
+	const auto u32x4 = TypeU32Vector(state, 4);
+	const auto f32x4 = TypeF32Vector(state, 4);
+	const auto exact = Unary(state, spv::OpBitcast, u32x4, value);
+	const auto scale = RawViewScale(state, mode);
+	const auto half  = ConstantF32Value(state, 0.5f);
+	const auto scales = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, f32x4, scales, scale, scale, scale, scale);
+	const auto halves =
+	    state.builder.Constant(spv::OpConstantComposite, f32x4, half, half, half, half);
+	const auto scaled = Unary(
+	    state, spv::OpConvertFToU, u32x4,
+	    Binary(state, spv::OpFAdd, f32x4, Binary(state, spv::OpFMul, f32x4, value, scales), halves));
+	const auto is_scaled =
+	    Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), mode,
+	           ConstantU32(state, static_cast<uint32_t>(IR::RawView::Unorm8)));
+	const auto integers = Select(state, u32x4, SplatBool(state, is_scaled), scaled, exact);
+	uint32_t   components[4] {};
+	for (uint32_t component = 0; component < 4u; component++) {
+		const auto selector = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpBitFieldUExtract, TypeU32(state), selector, word,
+		                          ConstantU32(state, component * 3u), ConstantU32(state, 3u));
+		const auto texel = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), texel, integers,
+		                          component);
+		components[component] =
+		    Select(state, TypeU32(state),
+		           Binary(state, spv::OpIEqual, TypeBool(state), selector, ConstantU32(state, 1u)),
+		           ConstantU32(state, 1u), texel);
+	}
+	const auto ones = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, u32x4, ones, components[0], components[1],
+	                          components[2], components[3]);
+	const auto as_integer =
+	    ResultVector(ctx, ones, Prospero::TextureNumericClass::Uint, false, mem);
+	const auto as_float =
+	    ResultVector(ctx, value, Prospero::TextureNumericClass::Float, false, mem);
+	const auto is_integer = Binary(state, spv::OpINotEqual, TypeBool(state), mode,
+	                               ConstantU32(state, static_cast<uint32_t>(IR::RawView::Float)));
+	return Select(state, u32x4, SplatBool(state, is_integer), as_integer, as_float);
+}
+
 uint32_t QueryDimensions(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                          const IR::Inst& address, uint32_t resource, uint32_t array_index) {
 	const auto  dimension = ctx.state.program.info.images.at(resource).dimension;
@@ -644,6 +715,10 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 			state.builder.AddFunction(spv::OpBitFieldUExtract, TypeU32(state), selectors[source],
 			                          word, ConstantU32(state, source * 3u), ConstantU32(state, 3u));
 		}
+		// A raw-class image is declared float: behind an integer T# the view takes the integers'
+		// bits (see RawClassResult; RawViewServes admits no other view for stores).
+		const bool raw_class = IR::RawClassImage(state.program.info.images[mem.resource]);
+		const auto mode      = raw_class ? RawViewMode(state, word) : 0u;
 		for (uint32_t component = 0; component < 4u; component++) {
 			auto raw = zero;
 			for (uint32_t source = 4u; source-- != 0u;) {
@@ -657,6 +732,14 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 			                    : mem.data_bits == 16u
 			                        ? EmitF16BitsToF32(state, raw)
 			                        : Unary(state, spv::OpBitcast, TypeF32(state), raw);
+			if (raw_class && mem.data_bits == 16u) {
+				// Packed 16-bit data: a float texel takes the half, an integer one the integer.
+				values[component] = Select(
+				    state, TypeF32(state),
+				    Binary(state, spv::OpINotEqual, TypeBool(state), mode,
+				           ConstantU32(state, static_cast<uint32_t>(IR::RawView::Float))),
+				    Unary(state, spv::OpBitcast, TypeF32(state), raw), values[component]);
+			}
 		}
 		const auto texel = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpCompositeConstruct,
@@ -871,6 +954,9 @@ uint32_t EmitImageResult(ValueEmitContext& ctx, const IR::Inst& inst, const Emit
 	const auto result_bits = [&](uint32_t resource, uint32_t value) {
 		auto candidate_mem = mem;
 		candidate_mem.resource = resource;
+		if (IR::RawClassImage(state.program.info.images[resource]) && !scalar && !gather) {
+			return RawClassResult(ctx, candidate_mem, value);
+		}
 		if (!scalar) {
 			value = gather ? UnpackImageGather(ctx, candidate_mem, value)
 			               : UnpackImageTexel(ctx, candidate_mem, value);

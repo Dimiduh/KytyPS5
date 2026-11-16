@@ -4039,16 +4039,31 @@ void TestCodeOnlySpecializationMatchesPlainDescriptors() {
   options.user_data = image_data;
   const auto image_module = code_only_module(image, options);
   FakeGuestMemory zero_memory;
-  Check(RecompileForTest(image, options).spirv ==
-            image_module,
-        "a plain T# must give the code-only module");
   CheckSpirvBinaryValidates(image_module);
-  // A 3D T# gives another module: the code-only one is a prediction.
+  // Only a raw load reaches the image: the code-only module declares it float
+  // whatever its T# (IR::RawClassImage), and serves the plain T# instead of
+  // being the module compiled for it.
+  const auto served = [&] {
+    namespace IR = ShaderRecompiler::IR;
+    const auto translated = ShaderRecompiler::TranslateProgram(image, options);
+    const auto plan = IR::ExtractResourcePlan(translated.program);
+    const IR::SrtRuntime runtime{.user_data = options.user_data};
+    IR::ResourceSnapshot snapshot;
+    IR::ResourceSpecialization specialization;
+    Check(IR::MaterializeResources(plan, runtime, snapshot, specialization),
+          "the image test resources did not materialize");
+    const auto code_only = IR::CodeOnlySpecialization(translated.program);
+    return code_only.has_value() &&
+           IR::SpecializationServes(plan, *code_only, specialization, true,
+                                    &snapshot);
+  };
+  Check(RecompileForTest(image, options).spirv != image_module && served(),
+        "a plain T# must be served by the code-only module");
+  // A 3D T# is not: the code-only specialization predicts the dimension.
   SetImageTestType(&image_data, 0, Prospero::ImageType::kColor3D);
   image_data[3] |= 0xfacu;
-  Check(RecompileForTest(image, options).spirv !=
-            image_module,
-        "a 3D T# must not give the 2D code-only module");
+  Check(!served(),
+        "a 3D T# must not be served by the 2D code-only module");
 }
 
 void TestPortableBufferFormats() {
@@ -4257,6 +4272,108 @@ void TestPortableImageSwizzle() {
   Check(exact.program.bindings.image_swizzles == 0u &&
             exact.spirv != compiled.spirv,
         "a T# swizzle did not compile its own module");
+}
+
+void TestRawClassImage() {
+  namespace IR = ShaderRecompiler::IR;
+  using Format = Prospero::BufferFormat;
+  // image_load v[4:7] from the T# in s[0:7], buffer_store_dword v4 through the
+  // V# in s[8:11]: only a raw load reaches the image.
+  const uint32_t shader[] = {
+      EncodeMimg0(0x00, 0xf), EncodeMimg1(4, 0, 0, 1), EncodeMubuf0(0x1c, 0),
+      EncodeMubuf1(4, 2, 0),  0xbf810000u,
+  };
+  const auto r001 = DstSel(4, 0, 0, 1);
+  const auto user_data = [&](Format format) {
+    auto data = ImageTestUserData();
+    data[2] = 0x003f003fu; // 64x64
+    data[3] |= r001;
+    std::fill_n(data.begin() + 4, 4, 0u);
+    SetImageTestFormat(&data, 0, format);
+    data[8] = 0x10000u;
+    data[9] = 4u << 16u;
+    data[10] = 0x100u;
+    data[11] = 0xfacu | (3u << 28u);
+    return data;
+  };
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  const auto float_data = user_data(Format::k32Float);
+  options.user_data = float_data;
+  auto translated = ShaderRecompiler::TranslateProgram(shader, options);
+  const auto plan = IR::ExtractResourcePlan(translated.program);
+  const auto materialize = [&](const std::array<uint32_t, 64> &words) {
+    const IR::SrtRuntime runtime{.user_data = words};
+    IR::ResourceSnapshot snapshot;
+    IR::ResourceSpecialization specialization;
+    Check(IR::MaterializeResources(plan, runtime, snapshot, specialization),
+          "the raw-loaded image did not materialize");
+    return std::pair{std::move(specialization), std::move(snapshot)};
+  };
+
+  // Without a descriptor the image is a portable one, declared float.
+  const auto code_only = IR::CodeOnlySpecialization(translated.program);
+  Check(code_only.has_value() && code_only->images.size() == 1u &&
+            code_only->images[0].shader_swizzle == IR::PortableImageSwizzle &&
+            code_only->images[0].numeric_class ==
+                Prospero::TextureNumericClass::Float,
+        "the raw-loaded image was not specialized as a portable float image");
+  // It serves a float T# as it is, and a T# of an integer format that a view
+  // keeps, which takes the dispatch's resources: 32-bit integers by their
+  // bits, 8-bit unsigned ones through UNorm; 8-bit signed ones have no view.
+  const auto [real_float, float_snapshot] = materialize(float_data);
+  Check(real_float.images[0].numeric_class ==
+                Prospero::TextureNumericClass::Float &&
+            IR::SpecializationServes(plan, *code_only, real_float),
+        "the raw-class module did not serve a float T#");
+  const auto [real_uint, uint_snapshot] = materialize(user_data(Format::k32UInt));
+  Check(real_uint.images[0].numeric_class ==
+                Prospero::TextureNumericClass::Uint &&
+            IR::SpecializationServes(plan, *code_only, real_uint, true,
+                                     &uint_snapshot) &&
+            !IR::SpecializationServes(plan, *code_only, real_uint) &&
+            !IR::SpecializationServes(plan, *code_only, real_uint, false,
+                                      &uint_snapshot) &&
+            !IR::SpecializationServes(plan, real_uint, *code_only, true,
+                                      &uint_snapshot),
+        "the raw-class module did not serve a 32-bit integer T# by its "
+        "resources only");
+  const auto [real_byte, byte_snapshot] = materialize(user_data(Format::k8UInt));
+  const auto [real_sbyte, sbyte_snapshot] =
+      materialize(user_data(Format::k8SInt));
+  Check(IR::SpecializationServes(plan, *code_only, real_byte, true,
+                                 &byte_snapshot) &&
+            !IR::SpecializationServes(plan, *code_only, real_sbyte, true,
+                                      &sbyte_snapshot),
+        "the raw-class module served the wrong 8-bit integer T#s");
+
+  // The module's image word holds the T#'s DST_SEL and how to take its texels
+  // from the view.
+  const auto compiled = ShaderRecompiler::CompileProgram(
+      std::move(translated), options, *code_only);
+  CheckSpirvBinaryValidates(compiled.spirv);
+  const auto &bindings = compiled.program.bindings;
+  Check(IR::RawClassImage(compiled.program.info.images[0]) &&
+            bindings.image_swizzles == 1u,
+        "the raw-class module has no image word");
+  const auto word_of = [&](const IR::ResourceSnapshot &snapshot) {
+    std::vector<uint32_t> shader_data(bindings.ShaderDataDwords());
+    IR::FillBufferStrides(compiled.program.info, bindings, snapshot,
+                          shader_data);
+    return shader_data[bindings.MemorySwizzleDword()] & 0xffffu;
+  };
+  const auto mode = [](IR::RawView view) {
+    return static_cast<uint32_t>(view) << IR::RawViewShift;
+  };
+  Check(word_of(float_snapshot) == (r001 | mode(IR::RawView::Float)) &&
+            word_of(uint_snapshot) == (r001 | mode(IR::RawView::Bits)) &&
+            word_of(byte_snapshot) == (r001 | mode(IR::RawView::Unorm8)),
+        "image words did not hold the views of their T# formats");
+  // A store reaches an integer T# by its bits only.
+  Check(IR::RawViewServes(IR::RawView::Bits, true) &&
+            !IR::RawViewServes(IR::RawView::Unorm8, true) &&
+            IR::RawViewServes(IR::RawView::Unorm16, false) &&
+            !IR::RawViewServes(IR::RawView::None, false),
+        "raw views were admitted for the wrong accesses");
 }
 
 void TestImageAddressOperands() {
@@ -15042,6 +15159,7 @@ int main() {
   TestCodeOnlySpecializationMatchesPlainDescriptors();
   TestPortableBufferFormats();
   TestPortableImageSwizzle();
+  TestRawClassImage();
   // Opcode semantics and optimized SPIR-V are exercised by
   // ShaderRecompilerComputeTests; keep the distinct decoder contract checks
   // here.

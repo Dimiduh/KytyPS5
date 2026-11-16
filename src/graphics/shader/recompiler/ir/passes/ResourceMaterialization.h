@@ -128,9 +128,12 @@ std::string TakeSpecializationFailureReport();
 // selects from (PortableBufferFormats), and a layout whose storage image takes its store swizzle
 // at run time (PortableImageSwizzle) for any swizzle: the same values, through a decoding
 // selected per access, so a caller that has a module compiled for the format itself prefers that
-// one (`portable` false).
+// one (`portable` false). With the dispatch's `resources`, so does a layout whose image is
+// declared float for raw loads and stores (RawClassImage) for a T# of an integer format that a
+// float or UNorm view keeps (RawViewOf).
 bool SpecializationServes(const ResourcePlan& program, const ResourceSpecialization& compiled,
-                          const ResourceSpecialization& current, bool portable = true);
+                          const ResourceSpecialization& current, bool portable = true,
+                          const ResourceSnapshot* resources = nullptr);
 
 // Gives the unbound buffers of `target` the bound layouts of `donor` that serve them, so a
 // module compiled for `target` also serves those bound cases.
@@ -184,8 +187,8 @@ std::optional<ResourceSpecialization> CodeOnlySpecialization(const Program& prog
 
 // Writes into the shader data the V# stride of every buffer binding with a runtime stride, the
 // format word (the index of the V#'s format in PortableBufferFormats) of every buffer binding
-// with a run-time format, and the DST_SEL of every image with a run-time store swizzle
-// (PortableImageSwizzle).
+// with a run-time format, and the image word of every portable image (PortableImageSwizzle):
+// the T#'s DST_SEL and, for a raw-class image, the RawView of its format.
 void FillBufferStrides(const ShaderInfo& info, const Bindings& bindings,
                        const ResourceSnapshot& snapshot, std::span<uint32_t> shader_data);
 // Whether CodeOnlySpecialization gives formatted buffers a run-time format (the default),

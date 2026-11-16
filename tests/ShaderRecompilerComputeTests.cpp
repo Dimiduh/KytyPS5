@@ -2386,6 +2386,7 @@ public:
     vk::DeviceMemory memory = nullptr;
     vk::ImageView view = nullptr;
     vk::Format format = vk::Format::eUndefined;
+    vk::Format view_format = vk::Format::eUndefined;
     vk::ImageLayout layout = vk::ImageLayout::eUndefined;
     u32 width = 0;
     u32 height = 0;
@@ -24752,6 +24753,7 @@ public:
     view_info.image = ret.image;
     view_info.viewType = view_type;
     view_info.format = view_format == vk::Format::eUndefined ? format : view_format;
+    ret.view_format = view_info.format;
     view_info.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
     Require(shader_name, "dispatch", view_base_mip < ret.mip_levels,
             "image view base mip is out of bounds");
@@ -25185,9 +25187,18 @@ public:
       auto &infos = image_infos[ShaderRecompiler::IR::ImageBindingIndex(kind)];
       infos.resize(Count(kind));
       const bool sampled = image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      // A raw-class image is declared float whatever its T#: an integer T# still
+      // names the integer fixture (see RawViewFormat in RunCase).
+      const bool integer_texture =
+          ShaderRecompiler::IR::RawClassImage(image) &&
+          resource < compiled.resources.images.size() &&
+          ShaderRecompiler::IR::RawViewOf(
+              static_cast<Prospero::BufferFormat>(
+                  (compiled.resources.images[resource].dwords[1] >> 20u) & 0x1ffu))
+                  .mode != ShaderRecompiler::IR::RawView::None;
       const auto *source_image = !image_resources.empty() ? &image_resources[resource]
           : sampled ? sampled_image
-          : image.numeric_class == Prospero::TextureNumericClass::Float
+          : image.numeric_class == Prospero::TextureNumericClass::Float && !integer_texture
               ? storage_image : storage_image_uint;
       Require(test.name, "dispatch", source_image != nullptr,
               "image descriptor requested but no matching image was provided");
@@ -25202,7 +25213,9 @@ public:
           vk::ImageViewCreateInfo view{};
           view.image = source_image->image;
           view.viewType = test.sampled_image_view_type;
-          view.format = source_image->format;
+          view.format = source_image->view_format != vk::Format::eUndefined
+                            ? source_image->view_format
+                            : source_image->format;
           view.subresourceRange = {
               image.depth_compare ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor, mip, 1,
               test.sampled_image_view_base_layer,
@@ -30416,6 +30429,30 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
     gds_buffer =
         vulkan->CreateStorageBuffer(test.name, test.gds_initial, gds_dwords);
   }
+  // --portable-formats-only: a raw-class image is declared float whatever its T#,
+  // and the fixture of an integer T# is bound through the view that keeps its
+  // texels' bits, as the renderer binds it (IR::RawViewOf). The view must cover
+  // the fixture's texels: a fixture of another texel size keeps its own view.
+  const auto raw_view_format = [&](ShaderRecompiler::IR::ImageResourceClass resource_class,
+                                   vk::Format fixture) {
+    const auto &images = compiled.program.info.images;
+    for (u32 i = 0; i < images.size() && i < compiled.resources.images.size(); ++i) {
+      if (images[i].resource_class != resource_class ||
+          !ShaderRecompiler::IR::RawClassImage(images[i])) {
+        continue;
+      }
+      const auto view = ShaderRecompiler::IR::RawViewOf(
+          static_cast<Prospero::BufferFormat>(
+              (compiled.resources.images[i].dwords[1] >> 20u) & 0x1ffu));
+      if (view.mode == ShaderRecompiler::IR::RawView::None) continue;
+      const auto format = VulkanFormat(view.view);
+      Require(test.name, "raw view",
+              vk::blockSize(format) == vk::blockSize(fixture),
+              "the T#'s integer format does not have the fixture's texel size");
+      return format;
+    }
+    return vk::Format::eUndefined;
+  };
   if (needs_sampled_image) {
     auto sampled_mips = test.sampled_image_rgba_mips;
     auto sampled_format = test.sampled_image_format;
@@ -30433,7 +30470,9 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
         test.sampled_image_type, test.sampled_image_view_type,
         test.sampled_image_layers, test.sampled_image_view_base_layer,
         test.sampled_image_view_layers, vk::SampleCountFlagBits::e1,
-        vk::Format::eUndefined, test.sampled_image_view_base_mip);
+        raw_view_format(ShaderRecompiler::IR::ImageResourceClass::Sampled,
+                        sampled_format),
+        test.sampled_image_view_base_mip);
   }
   if (needs_storage_image) {
     const bool atomic64 = std::ranges::any_of(
@@ -30444,12 +30483,16 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
         test.storage_image_format, vk::ImageUsageFlagBits::eStorage,
         test.storage_image_rgba, test.storage_image_dwords_per_pixel,
         vk::ImageLayout::eGeneral);
+    const auto raw_storage_view = raw_view_format(
+        ShaderRecompiler::IR::ImageResourceClass::Storage, vk::Format::eR32Uint);
     storage_image_uint = vulkan->CreateImage2D(
         test.name, test.image_width, test.image_height,
         atomic64 ? vk::Format::eR32G32Uint : vk::Format::eR32Uint,
         vk::ImageUsageFlagBits::eStorage, test.storage_image_r32ui, atomic64 ? 2 : 1,
         vk::ImageLayout::eGeneral,
-        atomic64 ? vk::Format::eR64Uint : vk::Format::eR32Uint);
+        atomic64                                    ? vk::Format::eR64Uint
+        : raw_storage_view != vk::Format::eUndefined ? raw_storage_view
+                                                     : vk::Format::eR32Uint);
   }
   if (needs_sampler) {
     sampler = vulkan->CreateSampler(
@@ -48441,6 +48484,57 @@ TestCase ImageLoadR32UintUsesIntegerSampledImage() {
   return test;
 }
 
+// Four texels of the row y = 1 of a 4x4 integer texture, loaded and stored as they are. As raw
+// integer loads they must come back bit for bit: NaN payloads, a denormal and the sign of zero
+// through a 32-bit texture, the extremes through the 8- and 16-bit ones (which a module built
+// from the shader's code alone reads through float and UNorm views, IR::RawViewOf).
+template <u32 bits> TestCase ImageLoadUintKeepsEveryBit() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  for (u32 pixel = 0; pixel < 4u; ++pixel) {
+    AppendVMovU32(&code, 20, pixel);
+    AppendVMovU32(&code, 21, 1);
+    code.push_back(EncodeMimg0(0x00, 0x1));
+    code.push_back(EncodeMimg1(0, 20));
+    AppendStoreVgpr(&code, 0, pixel);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = bits == 32u   ? "ImageLoadR32UintKeepsEveryBit"
+              : bits == 16u ? "ImageLoadR16UintKeepsEveryBit"
+                            : "ImageLoadR8UintKeepsEveryBit";
+  test.code = code;
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.sampled_image_dwords_per_pixel = 1;
+  if constexpr (bits == 32u) {
+    test.expected = {0x7fa00001u, 0xffc12345u, 0x00000001u, 0x80000000u};
+    test.sampled_image_rgba.resize(16);
+    std::copy(test.expected.begin(), test.expected.end(),
+              test.sampled_image_rgba.begin() + 4);
+    test.sampled_image_format = vk::Format::eR32Uint;
+    test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32UInt);
+  } else if constexpr (bits == 16u) {
+    test.expected = {0u, 1u, 0x8000u, 0xffffu};
+    test.sampled_image_rgba.resize(8);
+    test.sampled_image_rgba[2] = 0x00010000u;
+    test.sampled_image_rgba[3] = 0xffff8000u;
+    test.sampled_image_format = vk::Format::eR16Uint;
+    test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k16UInt);
+  } else {
+    test.expected = {0u, 1u, 0x80u, 0xffu};
+    test.sampled_image_rgba.resize(4);
+    test.sampled_image_rgba[1] = 0xff800100u;
+    test.sampled_image_format = vk::Format::eR8Uint;
+    test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k8UInt);
+  }
+  test.initial.assign(4, 0xa5a5a5a5u);
+  test.has_user_data = true;
+  return test;
+}
+
 TestCase ImageLoadFmaskUsesNativeSampleMapping() {
   auto test = ImageLoadR32UintUsesIntegerSampledImage();
   test.name = "ImageLoadFmaskUsesNativeSampleMapping";
@@ -54342,6 +54436,24 @@ TestCase ImageStoreR32UintUsesFormatlessStorageImage() {
   return test;
 }
 
+// A signalling NaN's bits stored into an integer texture (which a module built from the
+// shader's code alone writes through a float view).
+TestCase ImageStoreR32UintKeepsEveryBit() {
+  auto test = ImageStoreR32UintUsesFormatlessStorageImage();
+  test.name = "ImageStoreR32UintKeepsEveryBit";
+  bool replaced = false;
+  for (auto &word : test.code) {
+    if (word == 0x12345678u) {
+      word = 0x7fa00001u;
+      replaced = true;
+    }
+  }
+  Require(test.name, "fixture", replaced,
+          "the stored literal was not found in the base case");
+  test.expected_storage_image_r32ui[1 * 4 + 2] = 0x7fa00001u;
+  return test;
+}
+
 TestCase ImageStorePackedUintSaturatesChannels() {
   using O = ShaderOpcode;
 
@@ -56332,6 +56444,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferAtomicFMaxContendedWorkgroup);
   AddCase(ImageLoadVariants);
   AddCase(ImageLoadR32UintUsesIntegerSampledImage);
+  AddCase(ImageLoadUintKeepsEveryBit<32>);
+  AddCase(ImageLoadUintKeepsEveryBit<16>);
+  AddCase(ImageLoadUintKeepsEveryBit<8>);
   AddCase(ImageLoadFmaskUsesNativeSampleMapping);
   AddCase(ImageLoadSintUsesSignedSampledImage<false>);
   AddCase(ImageLoadSintUsesSignedSampledImage<true>);
@@ -56404,6 +56519,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageStoreR32FloatUsesFormatlessStorageImage);
   AddCase(ImageStoreR32SintUsesRawUintView);
   AddCase(ImageStoreR32UintUsesFormatlessStorageImage);
+  AddCase(ImageStoreR32UintKeepsEveryBit);
   AddCase(ImageStorePackedUintSaturatesChannels);
   AddCase(ImageStorePackedUintHonorsSparseDmask);
   AddCase(ImageStorePackedUnorm<false>);
@@ -63253,8 +63369,9 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--portable-formats-only") == 0) {
     // Every formatted buffer of a format a portable module selects from takes its format at run
-    // time (the module a precompile builds from a shader's code alone): every case's results
-    // must come out as with the format compiled in.
+    // time, every storage image its store swizzle, and every image that only raw loads and
+    // stores reach is declared float whatever its T# (the module a precompile builds from a
+    // shader's code alone): every case's results must come out as with all that compiled in.
     ShaderRecompiler::IR::SetForcePortableBufferFormats(true);
     g_check_spirv_text = false;
     VulkanHarness vulkan;
