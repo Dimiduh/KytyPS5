@@ -1,0 +1,25 @@
+#version 450 core
+
+// Frame generation's motion vectors from the velocity image of Unreal Engine 5's temporal
+// upscaler (upscaler/frameGeneration.cpp): a 32_UINT image with x in the low and y in the high
+// half of each texel, each the engine's 16-bit velocity encoding (EncodeVelocityToTexture: the
+// signed square root of the velocity, scaled and biased to 0..65535). The velocity is the
+// pixel's screen position (-1..1, y up) minus its previous one; stored is the way to the previous
+// position in parts of the frame (x right, y down), which is what DLSS takes.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0, r32ui) readonly uniform uimage2D source;
+layout(binding = 1) writeonly uniform image2D destination;
+layout(push_constant) uniform Parameters {
+	uvec2 size;
+} parameters;
+
+void main() {
+	uvec2 at = gl_GlobalInvocationID.xy;
+	if (any(greaterThanEqual(at, parameters.size))) return;
+	uint texel   = imageLoad(source, ivec2(at)).x;
+	vec2 encoded = vec2(float(texel & 0xffffu), float(texel >> 16u));
+	vec2 root    = (encoded - 32767.0) / (65535.0 * 0.499 * 0.5);
+	vec2 velocity = root * abs(root) * 0.5;
+	imageStore(destination, ivec2(at), vec4(-0.5 * velocity.x, 0.5 * velocity.y, 0.0, 0.0));
+}

@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/queueSubmitter.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/upscaler/frameGeneration.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/openxrHeadset.h"
 #include "graphics/presentation/performanceOverlay.h"
@@ -39,6 +40,10 @@ struct Presenter::Frame {
 	bool          busy         = false;
 	bool          hdr          = false;
 	bool          blank        = false;
+	// Frame generation: the frame's depth and motion vectors, and whether a present has given
+	// them to it (a frame shown again is shown as it is).
+	FrameGen::FrameInputs fg;
+	bool                  fg_shown = false;
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
@@ -53,6 +58,7 @@ public:
 	~FramePool() {
 		m_scheduler.Wait(m_scheduler.CurrentTick() - 1);
 		for (auto& frame: m_frames) {
+			FrameGen::DestroyInputs(m_window.graphic_ctx, frame->fg);
 			m_window.graphic_ctx.device.destroyImageView(frame->view, nullptr);
 			if (frame->image.image != nullptr) {
 				m_window.graphic_ctx.DeleteImage(frame->image);
@@ -254,6 +260,9 @@ public:
 		return static_cast<uint32_t>(m_images.size());
 	}
 	[[nodiscard]] vk::Format Format() const noexcept { return m_format; }
+	[[nodiscard]] vk::Extent2D Extent() const noexcept { return m_extent; }
+	// Where the last recorded present put the game's image.
+	[[nodiscard]] vk::Rect2D GameRect() const noexcept { return m_game_rect; }
 	[[nodiscard]] bool IsHdrSupported() const noexcept { return m_hdr_supported.load(); }
 	bool SetHdr(bool hdr) {
 		const bool changed = m_hdr_active != (hdr && IsHdrSupported());
@@ -274,6 +283,7 @@ private:
 	bool             m_hdr_requested = false;
 	bool             m_hdr_active    = false;
 	vk::Extent2D     m_extent {};
+	vk::Rect2D       m_game_rect {};
 	// Drawable pixel size observed when this swapchain was created.
 	vk::Extent2D                   m_window_extent {};
 	std::vector<vk::Image>         m_images;
@@ -552,6 +562,9 @@ void Swapchain::Destroy() {
 }
 
 void Swapchain::Recreate(bool surface_lost) {
+	if (FrameGen::Enabled()) {
+		FrameGen::SwapchainChanging();
+	}
 	Destroy();
 	if (surface_lost) {
 #if defined(__APPLE__)
@@ -798,6 +811,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	const auto  game_rect     = !Config::StretchEnabled() && aspect_source != nullptr
 	                               ? FitAspect(aspect_source->image.extent, m_extent)
 	                               : vk::Rect2D {{0, 0}, m_extent};
+	m_game_rect                   = game_rect;
 	if (source == nullptr || game_rect.extent != m_extent) {
 		const vk::ClearColorValue black {};
 		vk_command.clearColorImage(m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal,
@@ -960,6 +974,11 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
+	frame->fg_shown = false;
+	frame->fg.valid = false;
+	if (FrameGen::Enabled() && !headset) {
+		FrameGen::PrepareInputs(frame->fg);
+	}
 	if (headset) {
 		// The frame holds the raw display-encoded pixels the headset needs.
 		frame->Transit(buffer.Handle(), vk::ImageLayout::eTransferSrcOptimal,
@@ -974,8 +993,9 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	KYTY_PROFILER_FUNCTION();
 	auto              format = m_impl->frames.GetFormat();
 	auto*             frame  = m_impl->frames.Acquire({width, height}, format);
-	frame->hdr   = false;
-	frame->blank = true;
+	frame->hdr      = false;
+	frame->blank    = true;
+	frame->fg.valid = false;
 	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
 	vk::ClearColorValue clear {};
 	clear.float32[3] = opaque ? 1.0f : 0.0f;
@@ -1085,7 +1105,21 @@ void Presenter::Impl::Present() {
 				layer.frame->present_tick = tick;
 			}
 		}
+		// Frame generation: the main frame's inputs go with its first present.
+		auto* main_layer = layers[0].frame;
+		if (FrameGen::Enabled()) {
+			const bool repeated = main_layer != nullptr && main_layer->fg_shown;
+			FrameGen::BeforePresent(main_layer != nullptr && main_layer->fg.valid ? &main_layer->fg : nullptr,
+			                        repeated, swapchain.Extent(), swapchain.GameRect(), swapchain.Format(),
+			                        swapchain.ImageCount());
+		}
 		status = swapchain.Present();
+		if (FrameGen::Enabled()) {
+			FrameGen::AfterPresent();
+		}
+		if (main_layer != nullptr) {
+			main_layer->fg_shown = true;
+		}
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
 			continue;
@@ -1100,6 +1134,9 @@ void Presenter::Impl::Present() {
 }
 
 void Presenter::Discard(Frame& frame) {
+	if (frame.fg.valid && !frame.fg_shown) {
+		FrameGen::NoteDroppedFrame();
+	}
 	m_impl->frames.Release(&frame);
 }
 

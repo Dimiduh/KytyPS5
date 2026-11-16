@@ -442,6 +442,7 @@ add_gpu_blit_shader(gpu_pssr_linear gpu_pssr_linear.comp)
 add_gpu_blit_shader(gpu_bvh_mirror gpu_bvh_mirror.comp)
 add_gpu_blit_shader(gpu_bvh_walk gpu_bvh_mirror.comp -DWALK=1)
 add_gpu_blit_shader(gpu_buffer_scatter gpu_buffer_scatter.comp)
+add_gpu_blit_shader(gpu_framegen_motion gpu_framegen_motion.comp)
 # At SPIR-V 1.6 glslang declares a task shader's workgroup size with LocalSizeId, which needs maintenance4.
 add_gpu_blit_shader(gpu_mesh_indirect gpu_mesh_indirect.task --target-env spirv1.5)
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
@@ -515,7 +516,7 @@ function(add_kyty_full_emulator_test target source)
 	target_link_libraries(${target} ${kyty_emulator_link_libraries})
 	target_include_directories(${target} PRIVATE ${inc_headers})
 	if (WIN32)
-		target_link_libraries(${target} iphlpapi dxgi)
+		target_link_libraries(${target} iphlpapi dxgi wintrust crypt32)
 	endif()
 	if (KYTY_CLANG_CL)
 		target_link_libraries(${target} onecore)
@@ -1297,6 +1298,25 @@ if (WIN32)
 	target_link_libraries(kyty_emulator setupapi)
 	target_link_libraries(kyty_emulator ws2_32)
 	target_link_libraries(kyty_emulator dxgi)
+	# The signature check of NVIDIA's Streamline runtime (frameGeneration.cpp).
+	target_link_libraries(kyty_emulator wintrust crypt32)
+endif()
+# Frame generation (upscaler/frameGeneration.cpp, KYTY_FRAMEGEN): compiled against the NVIDIA
+# Streamline SDK's headers when the SDK is unpacked under _Build/deps/streamline/sdk (it is never
+# part of the repository; a release zip from github.com/NVIDIA-RTX/Streamline/releases). Without
+# them the build has no frame generation. Streamline's DLLs are loaded at run time.
+if (WIN32)
+	set(KYTY_STREAMLINE_SDK "${CMAKE_CURRENT_SOURCE_DIR}/_Build/deps/streamline/sdk" CACHE PATH
+	    "NVIDIA Streamline SDK for frame generation (optional)")
+	if (EXISTS "${KYTY_STREAMLINE_SDK}/include/sl.h")
+		set_property(SOURCE "${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/upscaler/frameGeneration.cpp"
+		             APPEND PROPERTY INCLUDE_DIRECTORIES "${KYTY_STREAMLINE_SDK}/include")
+		set_property(SOURCE "${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/upscaler/frameGeneration.cpp"
+		             APPEND PROPERTY COMPILE_DEFINITIONS KYTY_FRAMEGEN_STREAMLINE=1)
+		message(STATUS "Frame generation: Streamline SDK found in ${KYTY_STREAMLINE_SDK}")
+	else()
+		message(STATUS "Frame generation: off (no Streamline SDK in ${KYTY_STREAMLINE_SDK})")
+	endif()
 endif()
 if (KYTY_CLANG_CL)
 	target_link_libraries(kyty_emulator onecore)

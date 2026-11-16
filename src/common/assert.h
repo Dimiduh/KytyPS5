@@ -30,6 +30,16 @@ public:
 // routines either. The caller has written and flushed what it wants kept.
 [[noreturn]] void FatalExit(int status) noexcept;
 
+// std::quick_exit for this process: once ExitWithoutDetach has been called, the process ends
+// after the quick-exit handlers as FatalExit ends it. For DLLs that do not survive ExitProcess
+// (NVIDIA Streamline's shut their runtime down in their detach routines, after the threads they
+// need are gone: an access violation at every exit).
+// RegisterQuickExit is main's first statement: quick-exit handlers run in reverse order, and the
+// one it registers has to run last.
+void              RegisterQuickExit();
+void              ExitWithoutDetach() noexcept;
+[[noreturn]] void QuickExit(int status);
+
 [[noreturn]] void DbgExitHandler(char const* file, int line, std::string_view text);
 [[noreturn]] void DbgExitIfHandler(char const* expr, char const* file, int line);
 [[noreturn]] void DbgNotImplementedHandler(char const* expr, char const* file, int line);

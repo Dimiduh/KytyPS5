@@ -3,6 +3,7 @@
 #include "common/subsystems.h"
 #include "kytyGitVersion.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <fmt/format.h>
@@ -25,6 +26,27 @@ void FatalExit(int status) noexcept {
 	TerminateProcess(GetCurrentProcess(), static_cast<UINT>(status));
 #endif
 	std::_Exit(status);
+}
+
+static std::atomic<bool> g_exit_without_detach {false};
+static std::atomic<int>  g_quick_exit_status {0};
+
+void RegisterQuickExit() {
+	(void)at_quick_exit([] {
+		if (g_exit_without_detach.load(std::memory_order_relaxed)) {
+			std::fflush(nullptr);
+			FatalExit(g_quick_exit_status.load(std::memory_order_relaxed));
+		}
+	});
+}
+
+void ExitWithoutDetach() noexcept {
+	g_exit_without_detach.store(true, std::memory_order_relaxed);
+}
+
+void QuickExit(int status) {
+	g_quick_exit_status.store(status, std::memory_order_relaxed);
+	std::quick_exit(status);
 }
 
 static thread_local uint32_t g_recoverable_fatal_depth = 0;

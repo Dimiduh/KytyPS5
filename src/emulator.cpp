@@ -158,7 +158,7 @@ static void LoadElf(const std::filesystem::path& elf, bool dbg_print_reloc = fal
 static void Execute(const std::filesystem::path& game_patch) {
 	if (const auto list = Config::ExportPipelineListPath(); !list.empty()) {
 		// The renderer is up; the guest never starts.
-		std::quick_exit(Libs::Graphics::WindowExportPipelineList(list) ? 0 : 1);
+		Common::QuickExit(Libs::Graphics::WindowExportPipelineList(list) ? 0 : 1);
 	}
 	if (Config::PrecompileOnlyEnabled()) {
 		// Shaders from the game's files join the ones the game created in earlier sessions,
@@ -175,13 +175,13 @@ static void Execute(const std::filesystem::path& game_patch) {
 		// The renderer is up; the guest never starts. The driver cache is written when this
 		// returns; builds abandoned past their time budget may still run, so the process ends
 		// without joining them.
-		std::quick_exit(Libs::Graphics::WindowPrecompilePipelines());
+		Common::QuickExit(Libs::Graphics::WindowPrecompilePipelines());
 	}
 	std::thread([game_patch] {
 		Common::Singleton<Loader::RuntimeLinker>::Instance()->Execute(game_patch);
 	}).detach();
 	Libs::Graphics::WindowRun();
-	std::quick_exit(0);
+	Common::QuickExit(0);
 }
 
 void Run(const RunOptions& options) {

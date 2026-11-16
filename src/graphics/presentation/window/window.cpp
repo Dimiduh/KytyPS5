@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/upscaler/frameGeneration.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/renderDoc.h"
@@ -836,6 +837,15 @@ static void WindowCreate(WindowContext& context) {
 		window_flags |= static_cast<uint32_t>(SDL_WINDOW_BORDERLESS);
 	}
 #endif
+	// Frame generation: Streamline is initialized before SDL loads Vulkan with the window, and
+	// is then that loader (the instance, the device and the swapchain are made through it). Not
+	// for a run that only builds or lists pipelines and never presents the game.
+	if (!Config::PrecompileOnlyEnabled() && Config::ExportPipelineListPath().empty()) {
+		FrameGen::Initialize();
+	}
+	if (const char* library = FrameGen::VulkanLibrary(); library != nullptr) {
+		SDL_SetHint(SDL_HINT_VULKAN_LIBRARY, library);
+	}
 	context.window = SDL_CreateWindow(KYTY_SDL_WINDOW_CAPTION, width, height, window_flags);
 
 	if (context.window == nullptr) {

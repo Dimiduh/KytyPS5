@@ -1,9 +1,11 @@
 #include "common/archive.h"
+#include "common/assert.h"
 #include "common/common.h"
 #include "common/file.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "emulator.h"
+#include "graphics/host_gpu/renderer/upscaler/frameGeneration.h"
 #include "kytyGitVersion.h"
 
 #include <algorithm>
@@ -631,6 +633,8 @@ static int Main(int argc, char* argv[]) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
 int wmain(int argc, wchar_t* argv[]) {
+    Common::RegisterQuickExit();
+    Libs::Graphics::FrameGen::HoldDriverAddressSpace();
     std::vector<std::string> utf8_args;
     utf8_args.reserve(static_cast<size_t>(argc));
 

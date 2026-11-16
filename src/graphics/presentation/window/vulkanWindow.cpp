@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/upscaler/dlss.h"
+#include "graphics/host_gpu/renderer/upscaler/frameGeneration.h"
 #include "graphics/host_gpu/renderer/upscaler/fsr.h"
 #include "graphics/host_gpu/subgroupPlan.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -515,6 +516,9 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 	Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
 	Dlss::AppendExtensions(device_extensions, available_extensions, true);
+	// Frame generation: Streamline enables VK_NV_low_latency2 (Reflex) without the present-id
+	// extension it requires; current drivers then refuse the device.
+	const bool present_id = FrameGen::Requested() && add(VK_KHR_PRESENT_ID_EXTENSION_NAME);
 	physical_device.getFeatures2(&supported2);
 	const bool barycentric_supported = barycentric.fragmentShaderBarycentric == VK_TRUE;
 	const bool ray_query_enabled =
@@ -810,9 +814,26 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		create.unlink<vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT>();
 	}
 
-	vk::Device device = nullptr;
-	RequireVulkanSuccess(physical_device.createDevice(&create.get(), nullptr, &device),
-	                     "vkCreateDevice");
+	vk::PhysicalDevicePresentIdFeaturesKHR present_id_feature {.presentId = VK_TRUE};
+	if (present_id) {
+		auto& info               = create.get<vk::DeviceCreateInfo>();
+		present_id_feature.pNext = const_cast<void*>(info.pNext);
+		info.pNext               = &present_id_feature;
+	}
+
+	// (Streamline's own answer whether DLSS-G can run here, asked before the device: a refused
+	// device says nothing itself.)
+	const std::string frame_gen_problem = FrameGen::SupportProblem(physical_device);
+	FrameGen::ReleaseDriverAddressSpace();
+	vk::Device        device            = nullptr;
+	if (const auto result = physical_device.createDevice(&create.get(), nullptr, &device);
+	    result != vk::Result::eSuccess && FrameGen::Requested()) {
+		EXIT("Could not create the Vulkan device with DLSS frame generation (NVIDIA Streamline), %s%s%s: start "
+		     "without frame generation. KYTY_FRAMEGEN_VERBOSE=1 logs why the driver refused it.\n",
+		     vk::to_string(result).c_str(), frame_gen_problem.empty() ? "" : ": ", frame_gen_problem.c_str());
+	} else {
+		RequireVulkanSuccess(result, "vkCreateDevice");
+	}
 	return device;
 }
 
@@ -1114,12 +1135,14 @@ void WindowContext::CreateVulkan() {
 
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, std::move(device_extensions));
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+	FrameGen::BypassCommandHooks(graphic_ctx.device);
 	// From here on the dispatcher's entries are the recording thunks: a thread with a
 	// VulkanRecording::ProducerScope (the GPU thread) queues its commands, every other thread
 	// calls the driver as before.
 	VulkanRecording::Install();
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	FrameGen::OnDevice(graphic_ctx.instance, graphic_ctx.physical_device, graphic_ctx.device);
 	Dlss::Init(graphic_ctx, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
 	           VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
 	Fsr::Init(graphic_ctx, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);

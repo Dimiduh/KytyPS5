@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/upscaler/frameGeneration.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -501,6 +502,10 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	RebindImages(bindings);
 	BindSharedMemory(m_context, input_info, bindings);
 	RebindBuffers(bindings);
+	if (FrameGen::Enabled()) {
+		const uint32_t groups[] {thread_group_x, thread_group_y, thread_group_z};
+		FrameGen::FindInputs(program.shader_hash, resources, bindings, groups);
+	}
 
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
@@ -599,6 +604,9 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		}
 	} else {
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	}
+	if (FrameGen::Enabled()) {
+		FrameGen::CaptureInputs(m_context.GetGraphics(), m_context.GetTextureCache(), buffer);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	// The guest clears color metadata with compute; the texture cache reads the clear code
