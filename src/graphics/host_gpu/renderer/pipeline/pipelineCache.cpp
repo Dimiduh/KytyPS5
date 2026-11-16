@@ -36,6 +36,7 @@
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
@@ -67,6 +68,42 @@ Common::LiveControl::Switch g_warm_pipelines("warm_pipelines", 1);
 // are translated in the background from the boot and kept for their first use
 // (ProgramCache::StartPreparation); 0: such a shader is translated at its first use.
 Common::LiveControl::Switch g_prepare_created("prepare_created", 1);
+// 1: with --skip-pending-draws, a graphics stage program that nothing has translated yet is
+// translated on a helper thread and the draws that need it are left out until it is there
+// (ProgramCache::Get); 0: it is translated on the GPU thread at its first draw, as without the
+// option.
+Common::LiveControl::Switch g_defer_stage_programs("defer_stage_programs", 1);
+
+// Whether a guest program may store to guest memory, GDS or a storage image, going by its
+// instructions alone. A draw of such a program must not be left out (PendingDrawBlocker::
+// WritesMemory), and for a program nothing has translated that has to be known before it is.
+// Stores through flat addresses count, although most of them go to scratch memory; a program
+// that cannot be decoded here counts as one that may.
+bool GuestCodeMayWriteMemory(std::span<const uint32_t> code) {
+	namespace Decoder = ShaderRecompiler::Decoder;
+	using Opcode      = Decoder::Opcode;
+	const auto within = [](Opcode opcode, Opcode first, Opcode last) {
+		return static_cast<uint32_t>(opcode) >= static_cast<uint32_t>(first) &&
+		       static_cast<uint32_t>(opcode) <= static_cast<uint32_t>(last);
+	};
+	try {
+		const Common::RecoverableFatalScope recoverable;
+		Decoder::Program                    program;
+		Decoder::DecodeProgram(code, program);
+		return std::ranges::any_of(program.instructions, [&](const auto& inst) {
+			const auto opcode = inst.opcode;
+			return inst.gds ||
+			       within(opcode, Opcode::BUFFER_STORE_FORMAT_X, Opcode::BUFFER_STORE_FORMAT_D16_XYZW) ||
+			       within(opcode, Opcode::BUFFER_STORE_BYTE, Opcode::BUFFER_STORE_DWORDX4) ||
+			       within(opcode, Opcode::TBUFFER_STORE_FORMAT_X, Opcode::TBUFFER_STORE_FORMAT_XYZW) ||
+			       within(opcode, Opcode::BUFFER_ATOMIC_SWAP, Opcode::BUFFER_ATOMIC_FMAX) ||
+			       within(opcode, Opcode::FLAT_STORE_BYTE, Opcode::FLAT_STORE_DWORDX4) ||
+			       within(opcode, Opcode::IMAGE_STORE, Opcode::IMAGE_ATOMIC_FMAX);
+		});
+	} catch (const Common::RecoverableFatal&) {
+		return true;
+	}
+}
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -311,6 +348,8 @@ struct PipelineCache::ProgramCache {
 		bool                                         code_only = false;
 	};
 
+	struct DeferredTranslation;
+
 	struct SourceEntry {
 		SourceEntry(ShaderRecompiler::IR::ResourcePlan plan,
 		            std::unique_ptr<ShaderRecompiler::ShaderSource> call_source)
@@ -419,6 +458,14 @@ struct PipelineCache::ProgramCache {
 		std::vector<ScalarReadRange>                 walk_read_backs;
 		// The first dispatch served by a module prepared from the code alone has been counted.
 		bool                                         code_only_noted = false;
+		// Modules a helper thread is compiling for draws that are left out meanwhile
+		// (ProgramCache::deferral), by the specialization and push-data cursor they are for.
+		struct PendingModule {
+			ShaderRecompiler::IR::ResourceSpecialization specialization;
+			uint32_t                                     push_data_cursor = 0;
+			std::shared_ptr<DeferredTranslation>         job;
+		};
+		std::vector<PendingModule> pending_modules;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                    permutations;
@@ -456,6 +503,17 @@ struct PipelineCache::ProgramCache {
 		std::unique_ptr<ShaderRecompiler::IR::ResourcePlan> lookahead_plan;
 		std::vector<Permutation>                            permutations;
 		std::vector<uint32_t>                               push_data_cursors;
+	};
+
+	// A translation a helper thread does for a draw that is left out meanwhile (see Deferral):
+	// the program's plans (a program nothing has translated), or one module of a program that
+	// has them. The helper writes `program` before it sets `state`; the GPU thread reads it
+	// after.
+	struct DeferredTranslation {
+		enum State : int { Running, Done, Failed };
+		std::atomic<int>                      state {Running};
+		std::unique_ptr<PreparedProgram>      program;
+		std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
 	};
 
 	// The records of one program key, in the order they were first added (one of the two lists).
@@ -544,8 +602,8 @@ struct PipelineCache::ProgramCache {
 	// `code_only`: a created compute shader's record, which has no specialization: the module is
 	// the one the precompile built from its code alone (PrecompileComputeProgram).
 	template <typename Record>
-	bool PrepareRecord(const Record& record, PreparedProgram& prepared,
-	                   bool code_only = false) const {
+	bool PrepareRecord(const Record& record, PreparedProgram& prepared, bool code_only = false,
+	                   bool plan_only = false) const {
 		ProgramKey                       key;
 		ShaderComputeInputInfo           compute {};
 		ShaderVertexInputInfo            vertex {};
@@ -607,9 +665,11 @@ struct PipelineCache::ProgramCache {
 				if (!from_code.has_value()) return false;
 				specialization = std::move(*from_code);
 			}
+			// `plan_only`: the plans of a program whose draw has no specialization yet.
 			// A recompiler change may give the shader other resources than the record was made
 			// for.
-			if (!ShaderRecompiler::IR::SpecializationApplies(translated.program, specialization))
+			if (!plan_only &&
+			    !ShaderRecompiler::IR::SpecializationApplies(translated.program, specialization))
 				return false;
 			if (first) {
 				prepared.plan = ShaderRecompiler::IR::ExtractResourcePlan(
@@ -622,6 +682,7 @@ struct PipelineCache::ProgramCache {
 					        ShaderRecompiler::IR::SrtWalkerCompilation::Deferred));
 				}
 			}
+			if (plan_only) return true;
 			result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization,
 			                                          record.push_data_cursor);
 		} catch (const Common::RecoverableFatal& fatal) {
@@ -838,6 +899,13 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		if (prepared == nullptr) return programs.end();
+		return AdoptProgram(std::move(prepared), stage, params, input_info);
+	}
+
+	// Makes `prepared` the program of `lookup_key` (see AdoptPrepared).
+	template <typename InputInfo>
+	auto AdoptProgram(std::unique_ptr<PreparedProgram> prepared, ShaderType stage,
+	                  const ShaderParams& params, const InputInfo& input_info) {
 		auto entry = programs.try_emplace(lookup_key, std::move(prepared->plan), nullptr).first;
 		NoteGraphicsShaderUse(stage, params.code);
 		for (size_t i = 0; i < prepared->permutations.size(); i++) {
@@ -862,6 +930,144 @@ struct PipelineCache::ProgramCache {
 			    walker_queue.Submit(std::move(prepared->lookahead_plan)), next_lookahead_helper++);
 		}
 		return entry;
+	}
+
+	// --skip-pending-draws, stage programs. A draw whose pipeline is not built yet is left out
+	// while the pipeline is built in the background; the translation of a stage nothing has
+	// translated used to come first, on the GPU thread (about 5 ms a stage, most of it the SPIR-V
+	// emission), so every new material still cost the game a late frame or two. With `deferral`
+	// set for the draw (GetGraphicsPrograms: the draw is one that may be left out), Get instead
+	// hands such a program to a helper thread and reports the draw as deferred, twice: first for
+	// the program's plans, which the resource walk needs, then, once a draw has been specialized,
+	// for the module of that specialization. Each takes a helper a few milliseconds, so the draw
+	// comes two or three frames later than it would have; nothing waits. A translation that
+	// fails or takes longer than the skip window is done on the GPU thread as before.
+	struct Deferral {
+		std::mutex                        mutex;
+		std::condition_variable           wake;
+		std::deque<std::function<void()>> jobs;
+		std::vector<std::thread>          threads;
+		bool                              stop = false;
+	};
+	static constexpr auto DeferralPatience = std::chrono::milliseconds {2000};
+
+	void StartDeferral() {
+		if (deferral != nullptr) return;
+		deferral = std::make_unique<Deferral>();
+		for (int i = 0; i < 2; i++) {
+			deferral->threads.emplace_back([this] {
+				auto&            state = *deferral;
+				std::unique_lock lock(state.mutex);
+				for (;;) {
+					state.wake.wait(lock, [&] { return state.stop || !state.jobs.empty(); });
+					if (state.stop) return;
+					auto job = std::move(state.jobs.front());
+					state.jobs.pop_front();
+					lock.unlock();
+					job();
+					lock.lock();
+				}
+			});
+		}
+	}
+
+	void StopDeferral() {
+		if (deferral == nullptr) return;
+		{
+			std::lock_guard lock(deferral->mutex);
+			deferral->stop = true;
+		}
+		deferral->wake.notify_all();
+		for (auto& thread: deferral->threads) {
+			thread.join();
+		}
+		deferral->threads.clear();
+	}
+
+	// The stage record of the program a draw asks for, as RecordGraphicsStage makes it.
+	template <typename InputInfo>
+	static std::shared_ptr<GraphicsStageRecord>
+	StageRecordOf(ShaderType stage, const ShaderParams& params, const InputInfo& input,
+	              uint32_t                                             push_data_cursor,
+	              const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+		auto record              = std::make_shared<GraphicsStageRecord>();
+		record->stage            = stage;
+		record->shader_hash      = params.hash;
+		record->user_data_count  = params.user_data_count;
+		record->push_data_cursor = push_data_cursor;
+		if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+			record->pixel = GraphicsStageRecord::StaticInput(input);
+		} else {
+			record->vertex = GraphicsStageRecord::StaticInput(input);
+		}
+		record->specialization = specialization;
+		record->SetCode(
+		    std::make_shared<const std::vector<uint32_t>>(params.code.begin(), params.code.end()),
+		    nullptr);
+		return record;
+	}
+
+	// Hands a stage's translation to the helpers: its plans (`plan_only`), or the module of the
+	// record's specialization.
+	std::shared_ptr<DeferredTranslation> Defer(std::shared_ptr<GraphicsStageRecord> record,
+	                                           bool                                 plan_only) {
+		StartDeferral();
+		auto job = std::make_shared<DeferredTranslation>();
+		{
+			std::lock_guard lock(deferral->mutex);
+			deferral->jobs.push_back([this, job, record = std::move(record), plan_only] {
+				auto       prepared = std::make_unique<PreparedProgram>();
+				const bool done     = PrepareRecord(*record, *prepared, false, plan_only) &&
+				                      (plan_only || prepared->permutations.size() == 1);
+				if (done) job->program = std::move(prepared);
+				job->state.store(done ? DeferredTranslation::Done : DeferredTranslation::Failed,
+				                 std::memory_order_release);
+			});
+		}
+		deferral->wake.notify_one();
+		return job;
+	}
+
+	// Where a deferred translation stands; one that has been running for too long counts as
+	// failed (the caller then translates on the GPU thread, and the helper's result is dropped).
+	static int DeferredState(const DeferredTranslation& job) {
+		const auto state = job.state.load(std::memory_order_acquire);
+		if (state == DeferredTranslation::Running &&
+		    std::chrono::steady_clock::now() - job.started > DeferralPatience) {
+			return DeferredTranslation::Failed;
+		}
+		return state;
+	}
+
+	// Whether the program of a draw that may be left out may be translated by a helper: a plain
+	// vertex, mesh or pixel program that stores nowhere, while nothing dumps or logs
+	// translations (those belong to the first draw).
+	bool MayDeferStage(ShaderType stage, const ShaderParams& params) {
+		if (!defer_stage_programs || !g_defer_stage_programs.On() || !params.back_code.empty() ||
+		    (stage != ShaderType::Vertex && stage != ShaderType::Pixel && stage != ShaderType::Mesh) ||
+		    Config::GetShaderLogDirection() != Config::LogDirection::Silent ||
+		    Config::GraphicsDebugDumpEnabled()) {
+			return false;
+		}
+		const auto [known, added] = code_may_write.try_emplace(params.hash, false);
+		if (added) known->second = GuestCodeMayWriteMemory(params.code);
+		return !known->second;
+	}
+
+	void PrintShaderCounts() const {
+		std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
+		for (const auto& [key, source]: programs) {
+			counts[static_cast<size_t>(key.stage)] += source.permutations.size();
+		}
+		// Guest geometry shaders are compiled through the host mesh stage.
+		std::printf("Shaders: VS %zu | PS %zu | CS %zu | GS %zu | LS %zu | HS %zu | TES %zu\n",
+		            counts[static_cast<size_t>(ShaderType::Vertex)],
+		            counts[static_cast<size_t>(ShaderType::Pixel)],
+		            counts[static_cast<size_t>(ShaderType::Compute)],
+		            counts[static_cast<size_t>(ShaderType::Mesh)],
+		            counts[static_cast<size_t>(ShaderType::Local)],
+		            counts[static_cast<size_t>(ShaderType::TessellationControl)],
+		            counts[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
 	}
 
 	// A draw whose GPU-selected resources cannot be enumerated (unmapped guest memory, more
@@ -1123,6 +1329,30 @@ struct PipelineCache::ProgramCache {
 		if (entry == programs.end() && preparation != nullptr) {
 			entry = AdoptPrepared(stage, params, input_info);
 		}
+		deferred = false;
+		if constexpr (!std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			// A program nothing has translated, of a draw that may be left out: a helper
+			// thread makes its plans (see Deferral).
+			if (entry == programs.end() && MayDeferStage(stage, params)) {
+				auto& job = pending_plans[lookup_key];
+				if (job == nullptr) {
+					job = Defer(StageRecordOf(stage, params, input_info, push_data_cursor, {}), true);
+					deferred_plans++;
+				}
+				const auto state = DeferredState(*job);
+				if (state == DeferredTranslation::Running) {
+					deferred = true;
+					return {};
+				}
+				const auto finished = std::move(job);
+				pending_plans.erase(lookup_key);
+				if (state == DeferredTranslation::Done) {
+					entry = AdoptProgram(std::move(finished->program), stage, params, input_info);
+				} else {
+					deferred_failed++;
+				}
+			}
+		}
 		const auto bind = [&](const Permutation& permutation) {
 			input_info.stage = {.program   = &permutation.program,
 			                    .resources = &entry->second.resources,
@@ -1212,6 +1442,14 @@ struct PipelineCache::ProgramCache {
 			return {};
 		}
 		auto* current = entry == programs.end() ? &source : entry->second.call_source.get();
+		// A program that has its plans, of a draw that may be left out: a helper thread
+		// compiles the module (see Deferral, and below, where the specialization is known), and
+		// nothing is translated here.
+		bool defer_module = false;
+		if constexpr (!std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			defer_module = entry != programs.end() && current == nullptr &&
+			               MayDeferStage(stage, params);
+		}
 		ShaderRecompiler::TranslateResult translated;
 		if (current != nullptr) {
 			if (!current->calls.empty()) {
@@ -1221,7 +1459,7 @@ struct PipelineCache::ProgramCache {
 			} else {
 				translated = ShaderRecompiler::TranslateProgram(current->decoded, options);
 			}
-		} else {
+		} else if (!defer_module) {
 			translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		}
 		if (entry == programs.end()) {
@@ -1256,7 +1494,7 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		// One line per re-translation (never per draw), so it is always on.
-		if (!entry->second.permutations.empty()) {
+		if (!entry->second.permutations.empty() && !defer_module) {
 			LogPermutationDifference(stage_name, params.hash,
 			                         entry->second.permutations.back().specialization,
 			                         entry->second.specialization);
@@ -1315,7 +1553,8 @@ struct PipelineCache::ProgramCache {
 			                                          entry->second.resources,
 			                                          entry->second.specialization);
 		}
-		if (recorded || entry->second.specialization.images.size() != images_before) {
+		if ((recorded || entry->second.specialization.images.size() != images_before) &&
+		    !defer_module) {
 			LOGF("Permutation: %s %016" PRIx64 " %s images %zu->%zu\n", stage_name, params.hash,
 			     recorded ? "recorded layout" : "widened", images_before,
 			     entry->second.specialization.images.size());
@@ -1360,6 +1599,45 @@ struct PipelineCache::ProgramCache {
 				}
 			}
 		}
+		if constexpr (!std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			if (defer_module) {
+				auto&      pending = entry->second.pending_modules;
+				const auto found   = std::ranges::find_if(pending, [&](const auto& module) {
+					return module.push_data_cursor == push_data_cursor &&
+					       module.specialization == specialization;
+				});
+				if (found == pending.end()) {
+					pending.push_back(
+					    {specialization, push_data_cursor,
+					     Defer(StageRecordOf(stage, params, input_info, push_data_cursor,
+					                         specialization),
+					           false)});
+					deferred_modules++;
+					deferred = true;
+					return {};
+				}
+				const auto state = DeferredState(*found->job);
+				if (state == DeferredTranslation::Running) {
+					deferred = true;
+					return {};
+				}
+				const auto finished = std::move(found->job);
+				pending.erase(found);
+				if (state == DeferredTranslation::Done) {
+					auto& added = entry->second.permutations.emplace_back(
+					    std::move(finished->program->permutations.front()));
+					added.handle.id = ++next_shader_id;
+					if (pipeline_manifest != nullptr) {
+						added.handle.record_key =
+						    RecordGraphicsStage(stage, params, input_info, push_data_cursor, added);
+					}
+					PrintShaderCounts();
+					return bind(added);
+				}
+				deferred_failed++;
+				translated = ShaderRecompiler::TranslateProgram(params.code, options);
+			}
+		}
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), std::move(specialization), push_data_cursor,
 		    entry->second.FunctionCode()));
@@ -1380,19 +1658,7 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 
-		std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
-		for (const auto& [key, source]: programs) {
-			counts[static_cast<size_t>(key.stage)] += source.permutations.size();
-		}
-		// Guest geometry shaders are compiled through the host mesh stage.
-		std::printf("Shaders: VS %zu | PS %zu | CS %zu | GS %zu | LS %zu | HS %zu | TES %zu\n",
-		            counts[static_cast<size_t>(ShaderType::Vertex)],
-		            counts[static_cast<size_t>(ShaderType::Pixel)],
-		            counts[static_cast<size_t>(ShaderType::Compute)],
-		            counts[static_cast<size_t>(ShaderType::Mesh)],
-		            counts[static_cast<size_t>(ShaderType::Local)],
-		            counts[static_cast<size_t>(ShaderType::TessellationControl)],
-		            counts[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
+		PrintShaderCounts();
 		return bind(entry->second.permutations.back());
 	}
 
@@ -1495,6 +1761,23 @@ struct PipelineCache::ProgramCache {
 	}
 	~ProgramCache() {
 		StopPreparation();
+		StopDeferral();
+		const auto destroy = [&](const std::shared_ptr<DeferredTranslation>& job) {
+			if (job == nullptr || job->program == nullptr) return;
+			for (const auto& permutation: job->program->permutations) {
+				graphics.device.destroyShaderModule(permutation.handle.module, nullptr);
+			}
+		};
+		for (const auto& [key, job]: pending_plans) {
+			(void)key;
+			destroy(job);
+		}
+		for (const auto& [key, entry]: programs) {
+			(void)key;
+			for (const auto& module: entry.pending_modules) {
+				destroy(module.job);
+			}
+		}
 		if (preparation != nullptr) {
 			for (const auto& [key, slot]: preparation->slots) {
 				(void)key;
@@ -1568,6 +1851,19 @@ struct PipelineCache::ProgramCache {
 	std::chrono::steady_clock::time_point         next_lookahead_report {};
 	// Programs translated ahead of their first use (StartPreparation); null without.
 	std::unique_ptr<Preparation> preparation;
+	// Stage programs helper threads translate while their draws are left out (see Deferral):
+	// whether the option is on, whether the draw Get is asked about may be left out
+	// (GetGraphicsPrograms sets it), whether the last Get left its draw out, the plans under way
+	// by program key, what is known of each program's stores, and the counts.
+	bool                                                           defer_stage_programs = false;
+	bool                                                           deferred             = false;
+	std::unique_ptr<Deferral>                                      deferral;
+	std::unordered_map<ProgramKey, std::shared_ptr<DeferredTranslation>, ProgramKeyHash>
+	                                   pending_plans;
+	std::unordered_map<uint64_t, bool> code_may_write;
+	uint64_t                           deferred_plans   = 0;
+	uint64_t                           deferred_modules = 0;
+	uint64_t                           deferred_failed  = 0;
 	// Compiles the lookahead plans' walkers. Last, so its thread stops before the entries holding
 	// its jobs are destroyed.
 	SrtWalkerCompileQueue walker_queue;
@@ -2015,6 +2311,7 @@ void PipelineCache::WaitForProgramPreparation() {
 void PipelineCache::StopBackgroundCompiles() {
 	// Translations use the SPIR-V simplification store, which the destructor detaches.
 	m_program_cache->StopPreparation();
+	m_program_cache->StopDeferral();
 	if (m_precompile_queue != nullptr) {
 		{
 			// Created shaders stop queueing list entries.
@@ -3035,6 +3332,12 @@ void PipelineCache::LogCoverage() {
 		                 counts.prepared, counts.queued, counts.failed, counts.adopted,
 		                 counts.waited, counts.missed);
 	}
+	if (programs.deferred_plans != 0 || programs.deferred_modules != 0) {
+		PipelineCacheLog("Stage programs translated off the GPU thread while their draws were "
+		                 "left out: {} programs, {} modules ({} done on the GPU thread after all)",
+		                 programs.deferred_plans, programs.deferred_modules,
+		                 programs.deferred_failed);
+	}
 	if (programs.compute_recorded != 0) {
 		PipelineCacheLog("Compute programs this session: {} of {} recorded were predicted",
 		                 programs.compute_predicted, programs.compute_recorded);
@@ -3410,9 +3713,34 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	}
 	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
 	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
+	// Whether this draw may be left out while a stage program of its is translated
+	// (ProgramCache::Deferral): what PendingDrawSkipBlocker asks of a draw whose pipeline is
+	// being built, as far as the registers say it; that no stage stores anywhere is asked of
+	// each program (MayDeferStage). A draw that clears depth or stencil or renders to a linear
+	// target is not.
+	bool may_defer = m_skip_pending_draws && !tess_active;
+	if (may_defer) {
+		const auto& rc = context.GetRenderControl();
+		may_defer      = !rc.depth_clear_enable && !rc.stencil_clear_enable;
+		for (uint32_t slot = 0; may_defer && slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+			const auto& rt = context.GetRenderTarget(slot);
+			if (rt.base.addr != 0 &&
+			    render_target_mask_slot(context.GetRenderTargetMask(), slot) != 0 &&
+			    rt.attrib3.tile_mode == Prospero::TileMode::kLinear) {
+				may_defer = false;
+			}
+		}
+	}
+	m_program_cache->defer_stage_programs = may_defer;
+	const auto unavailable = [&] {
+		state.unavailable = true;
+		if (m_program_cache->deferred) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawsSkippedPending);
+		}
+	};
 	if (pixel_active) {
 		if (!m_program_cache->Get(pixel_params, pixel_info, push_data_cursor)) {
-			state.unavailable = true;
+			unavailable();
 			return;
 		}
 		for (const auto& output: pixel_info.stage.program->info.outputs) {
@@ -3425,7 +3753,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
 		if (!m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor)) {
-			state.unavailable = true;
+			unavailable();
 			return;
 		}
 	}
