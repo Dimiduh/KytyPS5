@@ -7,7 +7,25 @@
 #include <cstdlib>
 #include <fmt/format.h>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace Common {
+
+void FatalExit(int status) noexcept {
+#if defined(_WIN32)
+	// Not ExitProcess (std::_Exit): it kills the other threads wherever they are and then runs
+	// the DLLs' detach routines on this one, where one may wait forever on what a killed thread
+	// held. The crashed emulator then stays a one-thread process that nothing can end, holding
+	// its memory and its files.
+	TerminateProcess(GetCurrentProcess(), static_cast<UINT>(status));
+#endif
+	std::_Exit(status);
+}
 
 static thread_local uint32_t g_recoverable_fatal_depth = 0;
 
@@ -28,7 +46,7 @@ RecoverableFatalScope::~RecoverableFatalScope() {
 	                                      title, text, file, line));
 	Subsystems::EmergencyShutdownActive();
 	std::fflush(nullptr);
-	std::_Exit(321);
+	FatalExit(321);
 }
 
 void DbgExitIfHandler(const char* expr, const char* file, int line) {

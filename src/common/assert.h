@@ -26,6 +26,10 @@ public:
 	RecoverableFatalScope& operator=(const RecoverableFatalScope&) = delete;
 };
 
+// Ends the process after a fatal error, at once: no exit handlers, and on Windows no DLL detach
+// routines either. The caller has written and flushed what it wants kept.
+[[noreturn]] void FatalExit(int status) noexcept;
+
 [[noreturn]] void DbgExitHandler(char const* file, int line, std::string_view text);
 [[noreturn]] void DbgExitIfHandler(char const* expr, char const* file, int line);
 [[noreturn]] void DbgNotImplementedHandler(char const* expr, char const* file, int line);

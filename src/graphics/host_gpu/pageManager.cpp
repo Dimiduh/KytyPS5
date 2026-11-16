@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/pageManager.h"
 
 #include "common/alignment.h"
+#include "common/assert.h"
 #include "common/liveControl.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/regionDefinitions.h"
@@ -52,7 +53,7 @@ Common::LiveControl::Counter g_protect_pages_gpu("protect_pages_gpu");
 	va_end(args);
 	std::fputc('\n', stderr);
 	std::fflush(stderr);
-	std::_Exit(322);
+	Common::FatalExit(322);
 }
 
 class SpinGuard final {
