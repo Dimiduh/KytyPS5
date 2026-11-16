@@ -4051,6 +4051,139 @@ void TestCodeOnlySpecializationMatchesPlainDescriptors() {
         "a 3D T# must not give the 2D code-only module");
 }
 
+void TestPortableBufferFormats() {
+  namespace IR = ShaderRecompiler::IR;
+  using Format = Prospero::BufferFormat;
+  // buffer_load_format_x v2, v0, s[0:3] idxen; buffer_store_format_x v2, v0,
+  // s[4:7] idxen
+  const uint32_t shader[] = {
+      EncodeMubuf0(0x00),    EncodeMubuf1(2, 0, 0), EncodeMubuf0(0x04),
+      EncodeMubuf1(2, 1, 0), 0xbf810000u,
+  };
+  const auto word3 = [](Format format, uint32_t swizzle) {
+    return swizzle | (static_cast<uint32_t>(format) << 12u);
+  };
+  const auto user_data = [](uint32_t load, uint32_t store,
+                            uint32_t load_stride = 4u) {
+    return std::array<uint32_t, 8>{0x10000u, load_stride << 16u, 64u, load,
+                                   0x20000u, 8u << 16u,          64u, store};
+  };
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  auto translated = ShaderRecompiler::TranslateProgram(shader, options);
+  const auto plan = IR::ExtractResourcePlan(translated.program);
+  const auto materialize = [&](const std::array<uint32_t, 8> &words) {
+    const IR::SrtRuntime runtime{.user_data = words};
+    IR::ResourceSnapshot snapshot;
+    IR::ResourceSpecialization specialization;
+    Check(IR::MaterializeResources(plan, runtime, snapshot, specialization),
+          "formatted buffers did not materialize");
+    return std::pair{std::move(specialization), std::move(snapshot)};
+  };
+
+  // Without descriptors, a formatted buffer takes its format at run time,
+  // whether the program reads or writes it.
+  const auto code_only = IR::CodeOnlySpecialization(translated.program);
+  Check(code_only.has_value() && code_only->buffers.size() == 2u &&
+            IR::SpecializationApplies(translated.program, *code_only),
+        "the formatted buffers got no code-only specialization");
+  for (const auto &buffer : code_only->buffers) {
+    Check(buffer.descriptor_format == Format::kInvalid &&
+              buffer.descriptor_swizzle == IR::PortableBufferSwizzle,
+          "a formatted buffer did not take its format at run time");
+  }
+
+  // That module serves V#s of the formats it selects from, and only as a
+  // fallback: a caller that wants the module of the format itself asks without
+  // it.
+  const auto real_words =
+      user_data(word3(Format::k32UInt, DstSel(4, 0, 0, 1)),
+                word3(Format::k16_16_16_16Float, DstSel(4, 5, 6, 7)));
+  const auto [real, real_snapshot] = materialize(real_words);
+  Check(real.buffers.size() == 2u &&
+            real.buffers[0].descriptor_format == Format::k32UInt &&
+            real.buffers[1].descriptor_format == Format::k16_16_16_16Float &&
+            real != *code_only,
+        "V# formats were not specialized");
+  Check(IR::SpecializationServes(plan, *code_only, real) &&
+            !IR::SpecializationServes(plan, *code_only, real, false) &&
+            !IR::SpecializationServes(plan, real, *code_only),
+        "the run-time format module did not serve the formats it selects from");
+  // Not a format outside its list, and not another access form (a zero stride).
+  const auto [other, other_snapshot] =
+      materialize(user_data(word3(Format::k8UNorm, DstSel(4, 0, 0, 1)),
+                            real_words[7]));
+  const auto zero_stride =
+      materialize(user_data(real_words[3], real_words[7], 0u)).first;
+  Check(!IR::SpecializationServes(plan, *code_only, other) &&
+            !IR::SpecializationServes(plan, *code_only, zero_stride),
+        "the run-time format module served a V# it cannot decode");
+
+  // The module reads one format byte per buffer binding from the shader data;
+  // the renderer fills it from the V#s.
+  options.user_data = real_words;
+  const auto compiled = ShaderRecompiler::CompileProgram(
+      std::move(translated), options, *code_only);
+  CheckSpirvBinaryValidates(compiled.spirv);
+  const auto &info = compiled.program.info;
+  const auto &bindings = compiled.program.bindings;
+  Check(info.buffers.size() == 2u && info.buffers[0].portable_format &&
+            info.buffers[1].portable_format && bindings.memory_formats &&
+            bindings.ShaderDataDwords() == bindings.MemoryFormatDword() + 1u,
+        "the run-time format module has no format words in its shader data");
+  const auto format_of = [&](const IR::ResourceSnapshot &snapshot,
+                             uint32_t resource) {
+    std::vector<uint32_t> shader_data(bindings.ShaderDataDwords());
+    IR::FillBufferStrides(info, bindings, snapshot, shader_data);
+    return (shader_data[bindings.MemoryFormatDword()] >>
+            (info.buffers[resource].descriptor_index * 8u)) &
+           0xffu;
+  };
+  Check(format_of(real_snapshot, 0) ==
+                IR::PortableBufferFormatIndex(Format::k32UInt,
+                                              DstSel(4, 0, 0, 1)) &&
+            format_of(real_snapshot, 1) ==
+                IR::PortableBufferFormatIndex(Format::k16_16_16_16Float,
+                                              DstSel(4, 5, 6, 7)) &&
+            format_of(real_snapshot, 0) != format_of(real_snapshot, 1),
+        "format words did not name the V# formats of their bindings");
+  Check(format_of(other_snapshot, 0) == 0xffu,
+        "a V# format outside the list got a format word");
+  // The module of the formats themselves has no format words.
+  const auto exact = RecompileForTest(shader, options);
+  Check(!exact.program.bindings.memory_formats &&
+            exact.spirv != compiled.spirv,
+        "V# formats did not compile their own module");
+
+  // Atomics are on DWORDs: a formatted buffer with one is 32_UINT.
+  const uint32_t atomic[] = {
+      EncodeMubuf0(0x00),
+      EncodeMubuf1(2, 0, 0),
+      EncodeMubuf0(0x32, 0, true, true),
+      EncodeMubuf1(2, 0, 0),
+      0xbf810000u,
+  };
+  const auto atomic_program =
+      ShaderRecompiler::TranslateProgram(atomic, options);
+  const auto atomic_only = IR::CodeOnlySpecialization(atomic_program.program);
+  Check(atomic_only.has_value() && atomic_only->buffers.size() == 1u &&
+            atomic_program.program.info.buffers[0].formatted &&
+            atomic_program.program.info.buffers[0].atomic &&
+            atomic_only->buffers[0].descriptor_format == Format::k32UInt &&
+            atomic_only->buffers[0].descriptor_swizzle == DstSel(4, 0, 0, 1),
+        "a formatted buffer with atomics was not specialized as 32_UINT");
+
+  // Switched off, formatted buffers are 32_32_32_32_FLOAT as before.
+  IR::SetPortableBufferFormats(false);
+  const auto fixed = IR::CodeOnlySpecialization(
+      ShaderRecompiler::TranslateProgram(shader, options).program);
+  IR::SetPortableBufferFormats(true);
+  Check(fixed.has_value() && fixed->buffers.size() == 2u &&
+            fixed->buffers[0].descriptor_format ==
+                Format::k32_32_32_32Float &&
+            fixed->buffers[0].descriptor_swizzle == DstSel(4, 5, 6, 7),
+        "switching run-time formats off did not restore the fixed format");
+}
+
 void TestImageAddressOperands() {
   using namespace ShaderRecompiler;
   // Captured at PC 0x10cc in compute shader 0041b6a03db7472d.
@@ -14832,6 +14965,7 @@ int main() {
   TestCreatedComputeShaderInput();
   TestShaderSeedImport();
   TestCodeOnlySpecializationMatchesPlainDescriptors();
+  TestPortableBufferFormats();
   // Opcode semantics and optimized SPIR-V are exercised by
   // ShaderRecompilerComputeTests; keep the distinct decoder contract checks
   // here.

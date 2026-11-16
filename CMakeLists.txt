@@ -1172,6 +1172,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bindless-slot-reuse-only)
 	add_test(NAME shader_recompiler_lane_local
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --lane-local-only)
+	add_test(NAME shader_recompiler_portable_formats
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --portable-formats-only)
 	add_test(NAME buffer_cache_ranges
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
 

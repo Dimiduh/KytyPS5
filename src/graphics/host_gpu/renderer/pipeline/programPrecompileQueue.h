@@ -50,6 +50,13 @@ public:
 		EXIT_IF(m_open != 0);
 		m_open = 1;
 	}
+	// Holds a run open for queueing after the first queueing has ended (a build asked for while
+	// the guest runs): the run that is still open, or a new one, whose counts add to the earlier
+	// ones. Returns whether it started a run. Ends with EndQueueing like BeginQueueing.
+	[[nodiscard]] bool JoinQueueing() {
+		std::lock_guard lock(m_mutex);
+		return m_open++ == 0;
+	}
 	// Accounts for a job the queue accepted; call before the job can run.
 	void Queued() {
 		std::lock_guard lock(m_mutex);

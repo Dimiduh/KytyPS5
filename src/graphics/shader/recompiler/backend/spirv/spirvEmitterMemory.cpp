@@ -703,8 +703,12 @@ FormattedSource ResolveFormattedSource(ValueEmitContext& ctx, const IR::MemoryIn
 		           ? FormattedSource {FormattedSourceKind::Memory, output_component}
 		           : FormattedSource {};
 	}
-	const auto selector = GetDstSel(ctx.state.program.info.buffers[mem.resource].descriptor_swizzle,
-	                                output_component);
+	const auto& buffer = ctx.state.program.info.buffers[mem.resource];
+	const auto selector =
+	    GetDstSel(buffer.portable_format && ctx.state.portable_format < IR::PortableBufferFormats.size()
+	                  ? IR::PortableBufferFormats[ctx.state.portable_format].swizzle
+	                  : buffer.descriptor_swizzle,
+	              output_component);
 	const auto source = Format::ResolveFormattedSource(info, selector);
 	if (source.kind == FormattedSourceKind::Invalid) {
 		ExitDescriptorBindingFailure(ctx.state, IR::DescriptorBindingKind::Buffers, mem.resource,
@@ -1063,8 +1067,15 @@ void StoreFormattedPrepared(ValueEmitContext& ctx, const IR::Inst& inst,
 	// RDNA2 formatted stores transfer the entire format, zero-filling missing VGPRs.
 	const auto count = mem.data_bits == 16u ? mem.component_count : components;
 	const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, info);
+	// A portable buffer is accessed through DWORD elements: the 16-bit components of its formats
+	// (16_16 and 16_16_16_16) are stored two to a DWORD, which they fill, instead of each merged
+	// into its DWORD by a compare-exchange loop.
+	const bool pairs = ctx.state.portable_format != UINT32_MAX && !info.packed_bitfield &&
+	                   plan.resource.element_bits == 32u && info.component_count % 2u == 0u &&
+	                   info.component_bits[0] == 16u;
 	EmitIfCondition(ctx.state, plan.in_bounds, [&]() {
 		auto packed = ConstantU32(ctx.state, 0);
+		auto low    = ConstantU32(ctx.state, 0);
 		for (uint32_t component = 0; component < info.component_count; component++) {
 			auto value = ConstantU32(ctx.state, 0);
 			if (component < count) {
@@ -1088,7 +1099,19 @@ void StoreFormattedPrepared(ValueEmitContext& ctx, const IR::Inst& inst,
 				    ConstantU32(ctx.state, bits));
 			} else {
 				const auto [address, index] = FormattedComponentAddress(ctx.state, plan, component);
-				if (bits == 8u || bits == 16u) {
+				if (pairs) {
+					const auto half = Binary(ctx.state, spv::OpBitwiseAnd, TypeU32(ctx.state), value,
+					                         ConstantU32(ctx.state, 0xffffu));
+					if ((component & 1u) == 0u) {
+						low = half;
+					} else {
+						StoreWordInBounds(
+						    ctx, plan.resource, index,
+						    Binary(ctx.state, spv::OpBitwiseOr, TypeU32(ctx.state), low,
+						           Binary(ctx.state, spv::OpShiftLeftLogical, TypeU32(ctx.state), half,
+						                  ConstantU32(ctx.state, 16u))));
+					}
+				} else if (bits == 8u || bits == 16u) {
 					StoreSubwordInBounds(ctx, mem, plan.resource, address, index, bits, value);
 				} else {
 					StoreWordInBounds(ctx, plan.resource, index, value);
@@ -1681,6 +1704,30 @@ uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compon
 	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU32Composite(state, components),
 	    ConstantU32CompositeZero(state, components), [&]() {
 		    return EmitBufferAccess(ctx, inst, mem, components, [&](const auto& selected, const auto& resource) {
+			    // A buffer that takes its format at run time: the decoding of the format its
+			    // format word names (IR::PortableBufferFormats); zero for any other word, which
+			    // only the unbound buffer has, every access of which misses.
+			    if (selected.formatted && !selected.typed &&
+			        selected.kind != IR::ResourceKind::IndirectBuffer &&
+			        state.program.info.buffers[selected.resource].portable_format) {
+				    const auto type  = TypeU32Composite(state, components);
+				    const auto index = EmitBufferFormatIndex(state, selected);
+				    auto       value = ConstantU32CompositeZero(state, components);
+				    for (uint32_t format = 0; format < IR::PortableBufferFormats.size(); ++format) {
+					    const auto named = Binary(state, spv::OpIEqual, TypeBool(state), index,
+					                              ConstantU32(state, format));
+					    value = EmitValueOrDefaultIfCondition(state, named, type, value, [&]() {
+						    state.portable_format = format;
+						    const auto decoded    = LoadFormattedPrepared(
+						        ctx, inst, selected, resource,
+						        Format::GetFormatInfo(IR::PortableBufferFormats[format].format),
+						        components);
+						    state.portable_format = UINT32_MAX;
+						    return decoded;
+					    });
+				    }
+				    return value;
+			    }
 			    const auto info = Format::GetFormatInfo(
 			        selected.formatted ? BufferFormat(ctx, selected) : Prospero::BufferFormat::kInvalid);
 			    if (info.type != Format::ComponentType::Unknown) {
@@ -1698,6 +1745,26 @@ void StoreBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t component
 		const auto mem = ctx.Memory(inst);
 		const auto composite = ctx.Arg(inst, inst.NumArgs() - 2);
 		EmitBufferAccess(ctx, inst, mem, 0u, [&](const auto& selected, const auto& resource) {
+			// A buffer that takes its format at run time: the store of the format its format
+			// word names (see LoadBuffer); none for any other word.
+			if (selected.formatted && !selected.typed &&
+			    selected.kind != IR::ResourceKind::IndirectBuffer &&
+			    state.program.info.buffers[selected.resource].portable_format) {
+				const auto index = EmitBufferFormatIndex(state, selected);
+				for (uint32_t format = 0; format < IR::PortableBufferFormats.size(); ++format) {
+					const auto named = Binary(state, spv::OpIEqual, TypeBool(state), index,
+					                          ConstantU32(state, format));
+					EmitIfCondition(state, named, [&]() {
+						state.portable_format = format;
+						StoreFormattedPrepared(
+						    ctx, inst, selected, resource,
+						    Format::GetFormatInfo(IR::PortableBufferFormats[format].format),
+						    composite, components);
+						state.portable_format = UINT32_MAX;
+					});
+				}
+				return;
+			}
 			const auto info = Format::GetFormatInfo(
 			    selected.formatted ? BufferFormat(ctx, selected) : Prospero::BufferFormat::kInvalid);
 			if (info.type != Format::ComponentType::Unknown) {

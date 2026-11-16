@@ -63247,6 +63247,18 @@ int main(int argc, char **argv) {
     }
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--portable-formats-only") == 0) {
+    // Every formatted buffer of a format a portable module selects from takes its format at run
+    // time (the module a precompile builds from a shader's code alone): every case's results
+    // must come out as with the format compiled in.
+    ShaderRecompiler::IR::SetForcePortableBufferFormats(true);
+    g_check_spirv_text = false;
+    VulkanHarness vulkan;
+    for (const auto &test : MakeCases()) {
+      RunCase(&vulkan, test);
+    }
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--mul-hi24-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorMulHi24(32));

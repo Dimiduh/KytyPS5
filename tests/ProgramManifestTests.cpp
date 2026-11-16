@@ -501,6 +501,37 @@ void TestPrecompileProgress() {
           "the run completes only after its last job");
     Check(queue.Remaining() == 0, "the queue is drained");
   }
+  {
+    // A build queued while the guest runs (PipelineCache's build_later): it
+    // joins the run that is still open, or is a run of its own once that has
+    // ended; the counts go on.
+    PrecompileProgress progress;
+    progress.BeginQueueing();
+    progress.Queued();
+    Check(!progress.EndQueueing(), "the first run is open while its job runs");
+    Check(!progress.JoinQueueing(), "a late build joins the open run");
+    progress.Queued();
+    Check(!progress.EndQueueing() &&
+              !progress.Finish(PrecompileOutcome::Cached, 0) &&
+              progress.Finish(PrecompileOutcome::Compiled, 10),
+          "the joined run completes with its last job");
+    Check(progress.Complete(), "the run is complete");
+    Check(progress.JoinQueueing(), "a late build after the run starts one");
+    progress.Queued();
+    Check(!progress.Complete() && !progress.EndQueueing() &&
+              progress.Finish(PrecompileOutcome::Compiled, 5),
+          "the late run completes with its job");
+    // A key the queue rejects (queued before) ends the late run at once.
+    Check(progress.JoinQueueing(), "a second late run starts");
+    progress.Queued();
+    progress.Rejected();
+    Check(progress.EndQueueing() && progress.Complete(),
+          "a late run without a job ends with its queueing");
+    const auto counts = progress.Get();
+    Check(counts.queued == 3 && counts.finished == 3 && counts.cached == 1 &&
+              counts.compiled == 2,
+          "late builds add to the counts");
+  }
 }
 } // namespace
 

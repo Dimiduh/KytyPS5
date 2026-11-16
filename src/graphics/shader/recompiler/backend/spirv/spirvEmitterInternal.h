@@ -122,6 +122,9 @@ struct EmitterState {
 	std::vector<uint32_t>                           memory_byte_offsets;
 	std::vector<uint32_t>                           memory_byte_sizes;
 	std::vector<uint32_t>                              memory_strides;
+	// While the decoding of one format of a portable buffer is emitted: that format's index in
+	// IR::PortableBufferFormats (the buffer's format and swizzle for the emission), else UINT32_MAX.
+	uint32_t                                           portable_format = UINT32_MAX;
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
@@ -470,6 +473,9 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 // The V# stride of a buffer access: a constant, or the binding's shader-data stride word.
 uint32_t EmitBufferStride(EmitterState& state, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess* access);
+// The shader-data format word of a portable buffer's binding: the index of the bound V#'s format
+// in IR::PortableBufferFormats (0xff: none of them).
+uint32_t EmitBufferFormatIndex(EmitterState& state, const IR::MemoryInfo& mem);
 
 MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         state,
                                                         const IR::MemoryInfo& mem,

@@ -129,6 +129,41 @@ struct ExportInfo {
 	bool operator==(const ExportInfo& other) const = default;
 };
 
+// A formatted buffer whose format the module reads at run time instead of having it compiled in
+// (BufferResource::portable_format): the module holds the decoding of every format below and takes
+// the one the binding's shader-data format word names. Such a module needs nothing from the V#
+// descriptor, so it can be built before any dispatch has bound one, from the shader's code alone
+// (CodeOnlySpecialization), and it serves every dispatch whose buffers have one of these formats
+// with the swizzle its component count gives (SpecializationServes). The formats are the ones the
+// formatted buffers of Saros' compute shaders have in about 97% of the cases, read or written;
+// all are accessed through DWORD elements with records of whole DWORDs (16-bit integer formats
+// are not: their buffers need not end on a DWORD). Buffers with atomics are not portable.
+struct PortableBufferFormat {
+	Prospero::BufferFormat format;
+	uint32_t               swizzle;
+};
+inline constexpr std::array<PortableBufferFormat, 7> PortableBufferFormats {{
+    {Prospero::BufferFormat::k32UInt, DstSel(4, 0, 0, 1)},
+    {Prospero::BufferFormat::k32_32_32_32Float, DstSel(4, 5, 6, 7)},
+    {Prospero::BufferFormat::k16_16_16_16Float, DstSel(4, 5, 6, 7)},
+    {Prospero::BufferFormat::k32_32_32_32UInt, DstSel(4, 5, 6, 7)},
+    {Prospero::BufferFormat::k32Float, DstSel(4, 0, 0, 1)},
+    {Prospero::BufferFormat::k16_16Float, DstSel(4, 5, 0, 1)},
+    {Prospero::BufferFormat::k32SInt, DstSel(4, 0, 0, 1)},
+}};
+// The descriptor_swizzle of a portable buffer (its descriptor_format is kInvalid): no V# has it.
+inline constexpr uint32_t PortableBufferSwizzle = UINT32_MAX;
+// The index of a format and swizzle in PortableBufferFormats, or UINT32_MAX.
+[[nodiscard]] constexpr uint32_t PortableBufferFormatIndex(Prospero::BufferFormat format,
+                                                           uint32_t               swizzle) {
+	for (uint32_t index = 0; index < PortableBufferFormats.size(); ++index) {
+		if (PortableBufferFormats[index].format == format &&
+		    PortableBufferFormats[index].swizzle == swizzle)
+			return index;
+	}
+	return UINT32_MAX;
+}
+
 struct BufferResource {
 	static constexpr uint32_t NoIndirectBuffer = UINT32_MAX;
 
@@ -154,6 +189,9 @@ struct BufferResource {
 	// The stride field of packed_stride only says whether the V# stride is nonzero; indexed
 	// accesses read the stride from the binding's shader-data stride word.
 	bool runtime_stride = false;
+	// See PortableBufferFormats: formatted loads and stores take the format from the binding's
+	// shader-data format word.
+	bool portable_format = false;
 
 	bool operator==(const BufferResource& other) const = default;
 };
@@ -529,8 +567,10 @@ struct Bindings {
 	uint32_t ray_query_dword       = PushData::NoStart; // Device address of the context.
 	uint32_t memory_offset_dword = 0;
 	// Shader data ends with one 16-bit stride word per buffer binding (two per dword) when a
-	// buffer takes its stride at run time.
+	// buffer takes its stride at run time, then one 8-bit format word per buffer binding (four
+	// per dword) when a buffer takes its format at run time (PortableBufferFormats).
 	bool memory_strides = false;
+	bool memory_formats = false;
 
 	[[nodiscard]] uint32_t BufferBindingCount() const {
 		return descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)];
@@ -544,8 +584,17 @@ struct Bindings {
 	[[nodiscard]] uint32_t MemoryStrideDword() const {
 		return MemorySizeDword() + BufferBindingCount();
 	}
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	// Then the 8-bit format words, four per dword.
+	[[nodiscard]] uint32_t MemoryFormatDword() const {
 		return MemoryStrideDword() + (memory_strides ? (BufferBindingCount() + 1u) / 2u : 0u);
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return MemoryFormatDword() + (memory_formats ? (BufferBindingCount() + 3u) / 4u : 0u);
+	}
+	void PackMemoryFormat(std::span<uint32_t> shader_data, uint32_t binding,
+	                      uint32_t format_index) const {
+		const auto shift = (binding % 4u) * 8u;
+		shader_data[MemoryFormatDword() + binding / 4u] |= (format_index & 0xffu) << shift;
 	}
 	void PackMemoryStride(std::span<uint32_t> shader_data, uint32_t binding,
 	                      uint32_t stride) const {

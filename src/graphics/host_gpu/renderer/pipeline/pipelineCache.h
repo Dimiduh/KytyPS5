@@ -382,6 +382,8 @@ private:
 	// its definition); null without a driver cache file.
 	class FinishedBuilds;
 	std::unique_ptr<FinishedBuilds> m_finished_created;
+	// The created compute shaders' record keys by shader hash (guarded by m_list_mutex).
+	std::unordered_map<uint64_t, uint64_t> m_created_keys;
 	// Graphics pipelines of this title and their stages (_PipelineCache/<title>.v5.pipelines),
 	// and the code of every shader the guest created (<title>.v5.created); null without a driver
 	// cache file.
@@ -447,6 +449,9 @@ private:
 	// The precompile run has finished: the driver cache is written at the next checkpoint
 	// instead of at the next save interval.
 	std::atomic<bool> m_precompile_save_due {false};
+	// The open precompile run was started by a build queued while the guest runs: it ends
+	// without a report and without writing the driver cache at once (PrecompileRunEnded).
+	std::atomic<bool> m_precompile_late {false};
 	// Translated stages of graphics pipelines being precompiled, shared by the pipelines that
 	// use them; released when the precompile stops.
 	struct PrecompiledStage;
@@ -525,6 +530,10 @@ private:
 	void SupersedePrecompile(uint64_t key);
 
 	void LogPrecompileStats(const char* when);
+	// A precompile run is complete (PrecompileProgress): the boot's run is reported and the
+	// driver cache written at the next checkpoint; a run of builds queued while the guest runs
+	// leaves the cache to the next save interval.
+	void PrecompileRunEnded();
 	// Returns the pipeline of a pending first build, or null when the draw may skip it.
 	Pipeline* ResolvePendingBuild(Pipeline& pipeline, PendingDrawBlocker blocker);
 };

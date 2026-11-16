@@ -123,9 +123,13 @@ std::string TakeSpecializationFailureReport();
 // Whether a module compiled for `compiled` behaves exactly as one compiled for `current`
 // would. Equal layouts do; so does any layout of an unbound direct buffer when both layouts read
 // zero out of bounds, since an unbound buffer is bound so that every access is out of bounds
-// (loads read the out-of-bounds value, stores and atomics are dropped).
+// (loads read the out-of-bounds value, stores and atomics are dropped). With `portable`, so does
+// a layout whose buffer takes its format at run time for a buffer of one of the formats it
+// selects from (PortableBufferFormats): the same values, through a decoding selected per access,
+// so a caller that has a module compiled for the format itself prefers that one (`portable`
+// false).
 bool SpecializationServes(const ResourcePlan& program, const ResourceSpecialization& compiled,
-                          const ResourceSpecialization& current);
+                          const ResourceSpecialization& current, bool portable = true);
 
 // Gives the unbound buffers of `target` the bound layouts of `donor` that serve them, so a
 // module compiled for `target` also serves those bound cases.
@@ -168,16 +172,27 @@ ImageResource ImageHeapResource(const ImageResource& root, uint32_t kind);
 // another recompiler version may not.
 bool SpecializationApplies(const Program& program, const ResourceSpecialization& specialization);
 // The specialization a translated program gets from descriptors that are as plain as its code
-// allows: direct buffers with a nonzero stride (formatted ones 32_32_32_32_FLOAT), direct images
-// of a float 2D format unless the code says otherwise, no candidates. It needs no guest memory,
-// so a pipeline can be built before the first dispatch; the many shaders whose resources are
-// plain get the module their dispatches use. Empty when no descriptors can specialize the
-// program's resources.
+// allows: direct buffers with a nonzero stride (formatted ones take their format at run time,
+// see PortableBufferFormats; 32_UINT when the program has atomics on them), direct images of a
+// float 2D format unless the code says otherwise, no candidates. It needs no guest memory, so a
+// pipeline can be built before the first dispatch; the shaders whose resources are plain get the
+// module their dispatches use, or one that serves them (SpecializationServes). Empty when no
+// descriptors can specialize the program's resources.
 std::optional<ResourceSpecialization> CodeOnlySpecialization(const Program& program);
 
-// Writes the V# stride of every buffer binding with a runtime stride into the shader data.
+// Writes into the shader data the V# stride of every buffer binding with a runtime stride, and the
+// format word (the index of the V#'s format in PortableBufferFormats) of every buffer binding
+// with a run-time format.
 void FillBufferStrides(const ShaderInfo& info, const Bindings& bindings,
                        const ResourceSnapshot& snapshot, std::span<uint32_t> shader_data);
+// Whether CodeOnlySpecialization gives formatted buffers a run-time format (the default),
+// instead of 32_32_32_32_FLOAT.
+void SetPortableBufferFormats(bool enabled);
+[[nodiscard]] bool PortableBufferFormatsEnabled();
+// For tests: a specialization made from descriptors also takes a run-time format for every
+// buffer a portable module can access, so that whatever reads or writes such buffers runs the
+// portable decoding.
+void SetForcePortableBufferFormats(bool enabled);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

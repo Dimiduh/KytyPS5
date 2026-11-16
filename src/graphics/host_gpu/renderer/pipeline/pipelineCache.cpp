@@ -368,19 +368,23 @@ struct PipelineCache::ProgramCache {
 		// Requires a successful Materialize for the current draw.
 		template <bool HasCalls>
 		Permutation* FindPermutation(uint32_t push_data_cursor) {
-			for (auto& candidate: permutations) {
-				const auto& layout = candidate.program.bindings;
-				if (layout.push_data_start_dword !=
-				        ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
-				                                                 layout.ShaderDataDwords()) ||
-				    !ShaderRecompiler::IR::SpecializationServes(
-				        resource_plan, candidate.specialization, specialization)) {
-					continue;
+			// A module compiled for the draw's buffer formats before one that reads them at run
+			// time (IR::PortableBufferFormats).
+			for (const bool portable: {false, true}) {
+				for (auto& candidate: permutations) {
+					const auto& layout = candidate.program.bindings;
+					if (layout.push_data_start_dword !=
+					        ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
+					                                                 layout.ShaderDataDwords()) ||
+					    !ShaderRecompiler::IR::SpecializationServes(
+					        resource_plan, candidate.specialization, specialization, portable)) {
+						continue;
+					}
+					if constexpr (HasCalls) {
+						if (!std::ranges::equal(candidate.function_code, FunctionCode())) continue;
+					}
+					return &candidate;
 				}
-				if constexpr (HasCalls) {
-					if (!std::ranges::equal(candidate.function_code, FunctionCode())) continue;
-				}
-				return &candidate;
 			}
 			// A module whose candidate slots hold this draw's candidates serves it once they are
 			// moved there; the latest module has the widest layout.
@@ -937,6 +941,25 @@ struct PipelineCache::ProgramCache {
 		return key;
 	}
 
+	// Records the specialization a dispatch asked for when its first use took the shader's
+	// code-only module instead (see Get): the next session prepares and precompiles the module of
+	// that specialization, and this one builds its pipeline in the background.
+	void RecordExactComputeProgram(const ShaderParams& params, const ShaderComputeInputInfo& input,
+	                               uint32_t push_data_cursor,
+	                               ShaderRecompiler::IR::ResourceSpecialization specialization) {
+		ComputeProgramRecord record;
+		record.shader_hash = params.hash;
+		record.code =
+		    std::make_shared<const std::vector<uint32_t>>(params.code.begin(), params.code.end());
+		record.user_data_count  = params.user_data_count;
+		record.input            = ComputeProgramRecord::StaticInput(input);
+		record.push_data_cursor = push_data_cursor;
+		record.specialization   = std::move(specialization);
+		if (manifest->Add(record) && build_later) {
+			build_later(std::make_shared<const ComputeProgramRecord>(std::move(record)));
+		}
+	}
+
 	// Adds a compiled graphics stage permutation to the title's pipeline manifest and returns
 	// its key. Shaders with calls are not recorded.
 	template <typename InputInfo>
@@ -1216,6 +1239,29 @@ struct PipelineCache::ProgramCache {
 				ShaderRecompiler::IR::AdoptServingBuffers(entry->second.resource_plan,
 				                                          specialization, it->specialization);
 		}
+		// A shader whose pipeline the precompile built from its code alone, before any dispatch
+		// (a created shader, or one imported from the game's files): when that code-only module
+		// serves this dispatch, it is the one taken, and the pipeline needs no compile. It reads
+		// the formats of its buffers at run time; the module for the formats themselves is left
+		// to the next session.
+		std::optional<ShaderRecompiler::IR::ResourceSpecialization> exact;
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			if (!recorded && manifest != nullptr && !entry->second.call_source && code_only_built &&
+			    code_only_built(params.hash)) {
+				auto code_only = ShaderRecompiler::IR::CodeOnlySpecialization(translated.program);
+				if (code_only.has_value() && *code_only == specialization) {
+					code_only_same++;
+				} else if (code_only.has_value() &&
+				           ShaderRecompiler::IR::SpecializationServes(
+				               entry->second.resource_plan, *code_only, specialization)) {
+					exact          = std::move(specialization);
+					specialization = std::move(*code_only);
+					code_only_taken++;
+				} else {
+					code_only_other++;
+				}
+			}
+		}
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), std::move(specialization), push_data_cursor,
 		    entry->second.FunctionCode()));
@@ -1224,6 +1270,10 @@ struct PipelineCache::ProgramCache {
 				auto& added = entry->second.permutations.back();
 				added.handle.record_key =
 				    RecordComputeProgram(params, input_info, push_data_cursor, added);
+				if (exact.has_value()) {
+					RecordExactComputeProgram(params, input_info, push_data_cursor,
+					                          std::move(*exact));
+				}
 			}
 		} else {
 			if (pipeline_manifest != nullptr && !entry->second.call_source) {
@@ -1377,6 +1427,16 @@ struct PipelineCache::ProgramCache {
 	PipelineManifest* pipeline_manifest = nullptr;
 	// Whether an imported pipeline list predicts a compute program key (may be empty).
 	std::function<bool(uint64_t)> list_predicts;
+	// Whether the pipeline of a compute shader's code-only module is in the driver cache (the
+	// precompile built it), by shader hash; and the build of a program record on the precompile
+	// queue. Null without a driver cache file.
+	std::function<bool(uint64_t)>                                        code_only_built;
+	std::function<void(std::shared_ptr<const ComputeProgramRecord>)>     build_later;
+	// First uses of shaders whose code-only module the precompile built: the dispatch's own
+	// module is that one, that one serves the dispatch (and was taken), or neither.
+	uint64_t code_only_same  = 0;
+	uint64_t code_only_taken = 0;
+	uint64_t code_only_other = 0;
 	// Compute permutations recorded this session, and those a record or the list predicted.
 	uint64_t compute_recorded  = 0;
 	uint64_t compute_predicted = 0;
@@ -1713,16 +1773,23 @@ void PipelineCache::ReleasePrecompiledStages() {
 class PipelineCache::FinishedBuilds {
 public:
 	FinishedBuilds(std::filesystem::path path, std::string signature, bool keep)
-	    : m_path(std::move(path)), m_line("KytyFinishedBuilds1 " + std::move(signature)) {
+	    : m_path(std::move(path)), m_line("KytyFinishedBuilds2 " + std::move(signature)) {
+		// The header is one line; the driver cache signature ends with a line break of its own,
+		// which made the header two lines that never compared equal to the first line read.
+		std::erase_if(m_line, [](char c) { return c == '\n' || c == '\r'; });
 		if (keep) {
 			std::ifstream in(m_path);
 			std::string   text;
 			if (std::getline(in, text) && text == m_line) {
 				while (std::getline(in, text)) {
+					// "b <key>": built; "s <key>": the shader does not translate.
+					if (text.size() < 3 || (text[0] != 'b' && text[0] != 's') || text[1] != ' ') {
+						continue;
+					}
 					char*      end = nullptr;
-					const auto key = std::strtoull(text.c_str(), &end, 16);
-					if (end != text.c_str()) {
-						m_keys.insert(key);
+					const auto key = std::strtoull(text.c_str() + 2, &end, 16);
+					if (end != text.c_str() + 2) {
+						m_keys[key] = text[0] == 'b';
 					}
 				}
 			}
@@ -1735,14 +1802,20 @@ public:
 		std::lock_guard lock(m_mutex);
 		return m_keys.contains(key);
 	}
+	// The key's pipeline is in the driver cache.
+	[[nodiscard]] bool Built(uint64_t key) const {
+		std::lock_guard lock(m_mutex);
+		const auto      entry = m_keys.find(key);
+		return entry != m_keys.end() && entry->second;
+	}
 	[[nodiscard]] size_t Size() const {
 		std::lock_guard lock(m_mutex);
 		return m_keys.size();
 	}
-	void Add(uint64_t key) {
+	void Add(uint64_t key, bool built) {
 		std::lock_guard lock(m_mutex);
-		if (m_keys.insert(key).second && m_file.is_open()) {
-			m_file << fmt::format("{:016x}\n", key);
+		if (m_keys.try_emplace(key, built).second && m_file.is_open()) {
+			m_file << fmt::format("{} {:016x}\n", built ? 'b' : 's', key);
 			m_file.flush();
 		}
 	}
@@ -1758,17 +1831,17 @@ private:
 		m_file.close();
 		m_file.open(m_path, std::ios::trunc);
 		m_file << m_line << '\n';
-		for (const auto key: m_keys) {
-			m_file << fmt::format("{:016x}\n", key);
+		for (const auto& [key, built]: m_keys) {
+			m_file << fmt::format("{} {:016x}\n", built ? 'b' : 's', key);
 		}
 		m_file.flush();
 	}
 
 	std::filesystem::path        m_path;
 	std::string                  m_line;
-	mutable std::mutex           m_mutex;
-	std::unordered_set<uint64_t> m_keys;
-	std::ofstream                m_file;
+	mutable std::mutex                 m_mutex;
+	std::unordered_map<uint64_t, bool> m_keys;
+	std::ofstream                      m_file;
 };
 
 PipelineCache::PipelineCache(GraphicContext&                         graphics,
@@ -2088,6 +2161,31 @@ void PipelineCache::InitializeDriverCache() {
 	m_finished_created = std::make_unique<FinishedBuilds>(
 	    directory / (title_id + ".v1.finished"), signature + ":" + KYTY_GIT_VERSION,
 	    !initial_data.empty());
+	m_program_cache->code_only_built = [this](uint64_t shader_hash) {
+		std::lock_guard lock(m_list_mutex);
+		if (m_created_keys.empty() && m_created != nullptr) {
+			// Once, at the first shader no session has used: the created shaders by hash.
+			for (const auto& record: m_created->Records()) {
+				m_created_keys.try_emplace(record->shader_hash, record->Key());
+			}
+		}
+		const auto entry = m_created_keys.find(shader_hash);
+		return entry != m_created_keys.end() && m_finished_created->Built(entry->second);
+	};
+	m_program_cache->build_later = [this](std::shared_ptr<const ComputeProgramRecord> record) {
+		std::lock_guard lock(m_list_mutex);
+		if (m_precompile_queue == nullptr || m_precompile_only) {
+			return;
+		}
+		// Part of the boot's precompile run while that is open, else a run of its own.
+		if (m_precompile_progress.JoinQueueing()) {
+			m_precompile_late.store(true, std::memory_order_relaxed);
+		}
+		EnqueuePrecompile(std::move(record), false, 0);
+		if (m_precompile_progress.EndQueueing()) {
+			PrecompileRunEnded();
+		}
+	};
 	m_title_id = title_id;
 	SetPipelineManifest(
 	    std::make_unique<PipelineManifest>(PipelineManifest::PathFor(directory, title_id),
@@ -2240,9 +2338,8 @@ void PipelineCache::EnqueuePrecompileJob(uint64_t key, std::string label, Precom
 		}
 		if (superseded) {
 			// The renderer needed the pipeline first and built it itself.
-			if (m_precompile_progress.Finish(PrecompileOutcome::Skipped, 0) && !m_precompile_only) {
-				LogPrecompileStats("done");
-				m_precompile_save_due.store(true, std::memory_order_relaxed);
+			if (m_precompile_progress.Finish(PrecompileOutcome::Skipped, 0)) {
+				PrecompileRunEnded();
 			}
 			return;
 		}
@@ -2294,7 +2391,7 @@ void PipelineCache::EnqueuePrecompileJob(uint64_t key, std::string label, Precom
 		// A created shader's code-only build that ended is not queued by later sessions.
 		if (order >= PrecompileCreatedOrder && outcome != PrecompileOutcome::TimedOut &&
 		    m_finished_created != nullptr) {
-			m_finished_created->Add(key);
+			m_finished_created->Add(key, outcome != PrecompileOutcome::Skipped);
 		}
 		if (attempts != nullptr) {
 			attempts->End(key);
@@ -2305,10 +2402,8 @@ void PipelineCache::EnqueuePrecompileJob(uint64_t key, std::string label, Precom
 			m_driver_cache_dirty.store(true, std::memory_order_relaxed);
 			m_precompile_dirty.store(true, std::memory_order_relaxed);
 		}
-		if (m_precompile_progress.Finish(outcome, static_cast<uint64_t>(ms)) &&
-		    !m_precompile_only) {
-			LogPrecompileStats("done");
-			m_precompile_save_due.store(true, std::memory_order_relaxed);
+		if (m_precompile_progress.Finish(outcome, static_cast<uint64_t>(ms))) {
+			PrecompileRunEnded();
 		}
 	};
 	const bool queued = m_precompile_queue->Enqueue(key, std::move(job), order);
@@ -2621,10 +2716,18 @@ void PipelineCache::QueuePrecompile(uint32_t thread_count) {
 	    finished_before);
 	// Entries of the list whose shaders the guest has not created stay queueable while it runs.
 	m_list_open = !m_precompile_only && m_list_resolver != nullptr && m_list_resolver->Pending();
-	if (!m_list_open && progress.EndQueueing() && !m_precompile_only) {
-		LogPrecompileStats("done");
-		m_precompile_save_due.store(true, std::memory_order_relaxed);
+	if (!m_list_open && progress.EndQueueing()) {
+		PrecompileRunEnded();
 	}
+}
+
+void PipelineCache::PrecompileRunEnded() {
+	// The precompile-only pass reports and saves itself (PrecompileAll).
+	if (m_precompile_only || m_precompile_late.exchange(false, std::memory_order_relaxed)) {
+		return;
+	}
+	LogPrecompileStats("done");
+	m_precompile_save_due.store(true, std::memory_order_relaxed);
 }
 
 void PipelineCache::LogPrecompileStats(const char* when) {
@@ -2762,6 +2865,13 @@ void PipelineCache::LogCoverage() {
 		                 "{} of {} recorded were predicted (by earlier sessions or the list)",
 		                 m_graphics_from_cache, m_graphics_compiled, m_graphics_predicted,
 		                 m_graphics_recorded);
+	}
+	if (programs.code_only_same + programs.code_only_taken + programs.code_only_other != 0) {
+		PipelineCacheLog("Compute programs this session: of the first uses of shaders built "
+		                 "from their code alone, {} were that module, {} took it (it serves "
+		                 "them), {} needed their own",
+		                 programs.code_only_same, programs.code_only_taken,
+		                 programs.code_only_other);
 	}
 	if (const auto warm = m_warm_pipelines.GetCounts(); warm.kept != 0) {
 		PipelineCacheLog("Pipelines the precompile kept ready: {} taken at their first use of {} "

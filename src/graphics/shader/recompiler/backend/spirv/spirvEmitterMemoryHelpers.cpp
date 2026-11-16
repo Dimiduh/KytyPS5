@@ -142,7 +142,11 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
 		                             "buffer specialization is missing");
 	}
-	return state.program.info.buffers[mem.resource].descriptor_format;
+	const auto& buffer = state.program.info.buffers[mem.resource];
+	if (buffer.portable_format && state.portable_format < IR::PortableBufferFormats.size()) {
+		return IR::PortableBufferFormats[state.portable_format].format;
+	}
+	return buffer.descriptor_format;
 }
 
 uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resource) {
@@ -237,6 +241,20 @@ uint32_t EmitBufferStride(EmitterState& state, const IR::MemoryInfo& mem,
 		return state.memory_strides[binding];
 	}
 	return EmitMemoryStrideAt(state, ConstantU32(state, binding));
+}
+
+uint32_t EmitBufferFormatIndex(EmitterState& state, const IR::MemoryInfo& mem) {
+	const auto& buffer  = state.program.info.buffers[mem.resource];
+	const auto  binding = buffer.descriptor_index;
+	if (!buffer.portable_format || binding == UINT32_MAX ||
+	    !state.program.bindings.memory_formats) {
+		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
+		                             "buffer format word was not laid out");
+	}
+	const auto word =
+	    EmitShaderDataDwordLoad(state, state.program.bindings.MemoryFormatDword() + binding / 4u);
+	return EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
+	    state, word, ConstantU32(state, (binding % 4u) * 8u), ConstantU32(state, 8u));
 }
 
 void EmitMemoryBindings(EmitterState& state) {

@@ -190,6 +190,9 @@ struct FailureReasons {
 thread_local FailureReasons t_failure_reasons;
 
 std::atomic<uint64_t> g_failure_reports {0};
+// See SetPortableBufferFormats and SetForcePortableBufferFormats.
+std::atomic<bool> g_portable_buffer_formats {true};
+std::atomic<bool> g_force_portable_buffer_formats {false};
 // The line this thread's last MaterializeResources call printed (TakeSpecializationFailureReport).
 thread_local std::string t_last_report;
 
@@ -2335,10 +2338,19 @@ static bool FormattedOutOfBoundsZero(const ResourcePlan& program, uint32_t resou
 // buffer therefore behaves identically whenever both layouts read zero out of bounds.
 static bool ServesBuffer(const ResourcePlan& program, uint32_t resource,
                          const ResourceSpecialization::Buffer& compiled,
-                         const ResourceSpecialization::Buffer& current) {
+                         const ResourceSpecialization::Buffer& current, bool portable) {
 	auto layout    = compiled;
 	layout.unbound = current.unbound;
 	if (layout == current) return true;
+	// A module that reads the buffer's format at run time behaves as one compiled for any of
+	// the formats it can read (PortableBufferFormats).
+	if (compiled.descriptor_swizzle == PortableBufferSwizzle) {
+		layout.descriptor_format  = current.descriptor_format;
+		layout.descriptor_swizzle = current.descriptor_swizzle;
+		return portable && layout == current &&
+		       PortableBufferFormatIndex(current.descriptor_format, current.descriptor_swizzle) !=
+		           UINT32_MAX;
+	}
 	return current.unbound && resource < program.info.buffers.size() &&
 	       compiled.indirect_root == BufferResource::NoIndirectBuffer &&
 	       current.indirect_root == BufferResource::NoIndirectBuffer &&
@@ -2349,13 +2361,13 @@ static bool ServesBuffer(const ResourcePlan& program, uint32_t resource,
 }
 
 bool SpecializationServes(const ResourcePlan& program, const ResourceSpecialization& compiled,
-                          const ResourceSpecialization& current) {
+                          const ResourceSpecialization& current, bool portable) {
 	if (compiled.buffers.size() != current.buffers.size() || compiled.images != current.images ||
 	    compiled.samplers != current.samplers)
 		return false;
 	for (uint32_t i = 0; i < current.buffers.size(); ++i) {
 		if (compiled.buffers[i] != current.buffers[i] &&
-		    !ServesBuffer(program, i, compiled.buffers[i], current.buffers[i]))
+		    !ServesBuffer(program, i, compiled.buffers[i], current.buffers[i], portable))
 			return false;
 	}
 	return true;
@@ -2366,7 +2378,7 @@ void AdoptServingBuffers(const ResourcePlan& program, ResourceSpecialization& ta
 	if (donor.buffers.size() != target.buffers.size()) return;
 	for (uint32_t i = 0; i < target.buffers.size(); ++i) {
 		if (target.buffers[i].unbound && !donor.buffers[i].unbound &&
-		    ServesBuffer(program, i, donor.buffers[i], target.buffers[i])) {
+		    ServesBuffer(program, i, donor.buffers[i], target.buffers[i], false)) {
 			target.buffers[i]         = donor.buffers[i];
 			target.buffers[i].unbound = true;
 		}
@@ -2667,7 +2679,7 @@ bool AdaptToSpecialization(const ResourcePlan& program, const ResourceSpecializa
 	if (compiled.buffers.size() != current.buffers.size()) return false;
 	for (uint32_t i = 0; i < current.buffers.size(); ++i) {
 		if (!SameExceptSearch(compiled.buffers[i], current.buffers[i]) &&
-		    !ServesBuffer(program, i, compiled.buffers[i], current.buffers[i]))
+		    !ServesBuffer(program, i, compiled.buffers[i], current.buffers[i], false))
 			return false;
 	}
 	const bool samplers = compiled.samplers != current.samplers;
@@ -3234,6 +3246,15 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 		buffer.packed_stride      = layout.packed_stride;
 		buffer.descriptor_format  = layout.format;
 		buffer.descriptor_swizzle = layout.swizzle;
+		// Tests: every buffer a portable module can read is specialized as one.
+		if (g_force_portable_buffer_formats.load(std::memory_order_relaxed) && base.formatted &&
+		    !base.atomic &&
+		    buffer.indirect_root == BufferResource::NoIndirectBuffer &&
+		    !Source(program, base.source)->indirect_descriptor.has_value() &&
+		    PortableBufferFormatIndex(layout.format, layout.swizzle) != UINT32_MAX) {
+			buffer.descriptor_format  = Prospero::BufferFormat::kInvalid;
+			buffer.descriptor_swizzle = PortableBufferSwizzle;
+		}
 		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
 		buffer.scalar_empty       = base.scalar && descriptor.GetSize() == 0u;
 		// The renderer binds a direct V# without base or records as the null buffer, which every
@@ -3507,12 +3528,20 @@ std::optional<ResourceSpecialization> CodeOnlySpecialization(const Program& prog
 	specialization.buffers.reserve(program.info.buffers.size());
 	for (const auto& buffer: program.info.buffers) {
 		// A nonzero stride whose value the module reads from the shader data, without swizzle,
-		// index stride or ADD_TID.
+		// index stride or ADD_TID. A formatted buffer takes its format at run time too
+		// (PortableBufferFormats), unless the program has atomics on it: those are on DWORDs,
+		// and the buffer is 32_UINT.
+		const bool portable = PortableBufferFormatsEnabled() && buffer.formatted && !buffer.atomic;
+		const bool integer  = buffer.formatted && buffer.atomic && PortableBufferFormatsEnabled();
 		specialization.buffers.push_back({
 		    .packed_stride      = 1u,
-		    .descriptor_format  = buffer.formatted ? Prospero::BufferFormat::k32_32_32_32Float
-		                                           : Prospero::BufferFormat::kInvalid,
-		    .descriptor_swizzle = DstSel(4, 5, 6, 7),
+		    .descriptor_format  = integer    ? Prospero::BufferFormat::k32UInt
+		                          : portable ? Prospero::BufferFormat::kInvalid
+		                          : buffer.formatted ? Prospero::BufferFormat::k32_32_32_32Float
+		                                             : Prospero::BufferFormat::kInvalid,
+		    .descriptor_swizzle = portable  ? PortableBufferSwizzle
+		                          : integer ? DstSel(4, 0, 0, 1)
+		                                    : DstSel(4, 5, 6, 7),
 		});
 	}
 	specialization.images.reserve(program.info.images.size());
@@ -3560,6 +3589,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		buffer.runtime_stride             = (source.packed_stride & 0x3fffu) != 0u;
 		buffer.descriptor_format          = source.descriptor_format;
 		buffer.descriptor_swizzle         = source.descriptor_swizzle;
+		buffer.portable_format = buffer.formatted && source.descriptor_swizzle == PortableBufferSwizzle;
 		buffer.indirect_root              = source.indirect_root;
 		buffer.indirect_mapping_offset    = source.indirect_mapping_offset;
 		buffer.indirect_search_iterations = source.indirect_search_iterations;
@@ -3877,8 +3907,12 @@ bool LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan) {
 	return reader.ok && reader.bytes.empty() && DerivePlanState(plan);
 }
 
+static void FillBufferFormats(const ShaderInfo& info, const Bindings& bindings,
+                              const ResourceSnapshot& snapshot, std::span<uint32_t> shader_data);
+
 void FillBufferStrides(const ShaderInfo& info, const Bindings& bindings,
                        const ResourceSnapshot& snapshot, std::span<uint32_t> shader_data) {
+	FillBufferFormats(info, bindings, snapshot, shader_data);
 	if (!bindings.memory_strides) return;
 	EXIT_IF(shader_data.size() < bindings.ShaderDataDwords() ||
 	        snapshot.buffers.size() < info.buffers.size());
@@ -3893,6 +3927,39 @@ void FillBufferStrides(const ShaderInfo& info, const Bindings& bindings,
 		bindings.PackMemoryStride(shader_data, buffer.descriptor_index,
 		                          descriptor.PackedStride() & 0x3fffu);
 	}
+}
+
+static void FillBufferFormats(const ShaderInfo& info, const Bindings& bindings,
+                              const ResourceSnapshot& snapshot, std::span<uint32_t> shader_data) {
+	if (!bindings.memory_formats) return;
+	EXIT_IF(shader_data.size() < bindings.ShaderDataDwords() ||
+	        snapshot.buffers.size() < info.buffers.size());
+	for (uint32_t resource = 0; resource < info.buffers.size(); ++resource) {
+		const auto& buffer = info.buffers[resource];
+		if (!buffer.portable_format || buffer.descriptor_index == UINT32_MAX) continue;
+		// A V# of no portable format never reaches a portable module (SpecializationServes),
+		// except as the unbound buffer every access of which misses: no decoding is taken then,
+		// and the read is zero.
+		ShaderBufferResource descriptor;
+		uint32_t             index = 0xffu;
+		if (DecodeBufferDescriptor(snapshot.buffers[resource], descriptor) &&
+		    descriptor.Type() == 0) {
+			index = PortableBufferFormatIndex(descriptor.Format(), descriptor.DstSelXYZW()) & 0xffu;
+		}
+		bindings.PackMemoryFormat(shader_data, buffer.descriptor_index, index);
+	}
+}
+
+void SetPortableBufferFormats(bool enabled) {
+	g_portable_buffer_formats.store(enabled, std::memory_order_relaxed);
+}
+
+void SetForcePortableBufferFormats(bool enabled) {
+	g_force_portable_buffer_formats.store(enabled, std::memory_order_relaxed);
+}
+
+bool PortableBufferFormatsEnabled() {
+	return g_portable_buffer_formats.load(std::memory_order_relaxed);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
