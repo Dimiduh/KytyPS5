@@ -4123,10 +4123,11 @@ void TestPortableBufferFormats() {
             !IR::SpecializationServes(plan, *code_only, real, false) &&
             !IR::SpecializationServes(plan, real, *code_only),
         "the run-time format module did not serve the formats it selects from");
-  // Not a format outside its list, and not a zero stride that makes every
-  // access miss (bounds mode 0), which the V#'s own module folds away.
+  // Not a V# no decoding reads (a reserved selector), and not a zero stride
+  // that makes every access miss (bounds mode 0), which the V#'s own module
+  // folds away.
   const auto [other, other_snapshot] =
-      materialize(user_data(word3(Format::k8SNorm, DstSel(4, 0, 0, 1)),
+      materialize(user_data(word3(Format::k8SNorm, DstSel(2, 0, 0, 1)),
                             real_words[7]));
   const auto zero_stride =
       materialize(user_data(real_words[3], real_words[7], 0u)).first;
@@ -4148,6 +4149,24 @@ void TestPortableBufferFormats() {
               IR::SpecializationServes(plan, *code_only, narrow),
           "the run-time format module did not serve a buffer of shorts");
   }
+  // A format outside the list is served too, loaded or stored: the format
+  // functions handle it.
+  const auto [loaded_other, loaded_other_snapshot] =
+      materialize(user_data(word3(Format::k8SNorm, DstSel(4, 0, 0, 1)),
+                            real_words[7], 1u));
+  const auto stored_other =
+      materialize(user_data(real_words[3],
+                            word3(Format::k8_8_8_8SNorm, DstSel(4, 5, 6, 7))))
+          .first;
+  Check(IR::PortableGenericBufferFormat(Format::k8SNorm, DstSel(4, 0, 0, 1)) &&
+            !IR::PortableGenericBufferFormat(Format::k8SNorm,
+                                             DstSel(2, 0, 0, 1)) &&
+            !IR::PortableGenericBufferFormat(Format::kInvalid,
+                                             DstSel(4, 5, 6, 7)) &&
+            IR::SpecializationServes(plan, *code_only, loaded_other) &&
+            IR::SpecializationServes(plan, *code_only, stored_other) &&
+            !IR::SpecializationServes(plan, *code_only, stored_other, false),
+        "a format outside the list was not served");
   // A zero stride that leaves the accesses in bounds (raw bounds, mode 3) only
   // drops the index from the address, which a zero stride word does too.
   const auto raw_zero_stride =
@@ -4177,7 +4196,9 @@ void TestPortableBufferFormats() {
   const auto &bindings = compiled.program.bindings;
   Check(info.buffers.size() == 2u && info.buffers[0].portable_format &&
             info.buffers[1].portable_format && bindings.memory_formats &&
-            bindings.ShaderDataDwords() == bindings.MemoryFormatDword() + 1u,
+            bindings.MemoryFormatSwizzleDword() ==
+                bindings.MemoryFormatDword() + 1u &&
+            bindings.ShaderDataDwords() == bindings.MemoryFormatDword() + 2u,
         "the run-time format module has no format words in its shader data");
   const auto format_of = [&](const IR::ResourceSnapshot &snapshot,
                              uint32_t resource) {
@@ -4196,7 +4217,19 @@ void TestPortableBufferFormats() {
             format_of(real_snapshot, 0) != format_of(real_snapshot, 1),
         "format words did not name the V# formats of their bindings");
   Check(format_of(other_snapshot, 0) == 0xffu,
-        "a V# format outside the list got a format word");
+        "a V# no decoding reads got a format word");
+  {
+    std::vector<uint32_t> shader_data(bindings.ShaderDataDwords());
+    IR::FillBufferStrides(info, bindings, loaded_other_snapshot, shader_data);
+    const auto slot = info.buffers[0].descriptor_index;
+    Check(((shader_data[bindings.MemoryFormatDword()] >> (slot * 8u)) & 0xffu) ==
+                  (IR::PortableBufferGenericFormat |
+                   static_cast<uint32_t>(Format::k8SNorm)) &&
+              ((shader_data[bindings.MemoryFormatSwizzleDword()] >>
+                (slot * 16u)) &
+               0xffffu) == DstSel(4, 0, 0, 1),
+          "a format outside the list did not get its format and swizzle words");
+  }
   // The module of the formats themselves has no format words.
   const auto exact = RecompileForTest(shader, options);
   Check(!exact.program.bindings.memory_formats &&

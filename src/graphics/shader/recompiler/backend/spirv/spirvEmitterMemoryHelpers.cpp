@@ -257,6 +257,20 @@ uint32_t EmitBufferFormatIndex(EmitterState& state, const IR::MemoryInfo& mem) {
 	    state, word, ConstantU32(state, (binding % 4u) * 8u), ConstantU32(state, 8u));
 }
 
+uint32_t EmitBufferFormatSwizzle(EmitterState& state, const IR::MemoryInfo& mem) {
+	const auto& buffer  = state.program.info.buffers[mem.resource];
+	const auto  binding = buffer.descriptor_index;
+	if (!buffer.portable_format || binding == UINT32_MAX ||
+	    !state.program.bindings.memory_formats) {
+		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
+		                             "buffer format swizzle word was not laid out");
+	}
+	const auto word = EmitShaderDataDwordLoad(
+	    state, state.program.bindings.MemoryFormatSwizzleDword() + binding / 2u);
+	return EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
+	    state, word, ConstantU32(state, (binding % 2u) * 16u), ConstantU32(state, 16u));
+}
+
 uint32_t EmitImageSwizzle(EmitterState& state, uint32_t image) {
 	EXIT_IF(image >= state.program.bindings.image_swizzles);
 	const auto word =

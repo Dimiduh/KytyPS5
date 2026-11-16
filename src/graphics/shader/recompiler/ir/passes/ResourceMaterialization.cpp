@@ -2414,9 +2414,12 @@ static bool ServesBuffer(const ResourcePlan& program, uint32_t resource,
 		}
 		layout.descriptor_format  = current.descriptor_format;
 		layout.descriptor_swizzle = current.descriptor_swizzle;
-		return layout == current &&
-		       PortableBufferFormatIndex(current.descriptor_format, current.descriptor_swizzle) !=
-		           UINT32_MAX;
+		if (layout != current) return false;
+		if (PortableBufferFormatIndex(current.descriptor_format, current.descriptor_swizzle) !=
+		    UINT32_MAX)
+			return true;
+		// Any other format the format functions handle (PortableBufferGenericFormat).
+		return PortableGenericBufferFormat(current.descriptor_format, current.descriptor_swizzle);
 	}
 	return current.unbound && resource < program.info.buffers.size() &&
 	       compiled.indirect_root == BufferResource::NoIndirectBuffer &&
@@ -3359,12 +3362,16 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 		buffer.packed_stride      = layout.packed_stride;
 		buffer.descriptor_format  = layout.format;
 		buffer.descriptor_swizzle = layout.swizzle;
-		// Tests: every buffer a portable module can read is specialized as one.
+		// Tests: every buffer a portable module can read is specialized as one. (Not one whose
+		// zero stride makes every access miss: its loads are folded to what the V#'s format
+		// reads out of bounds, which a module without the format does not know; no module built
+		// from a shader's code has such a buffer, see CodeOnlySpecialization.)
 		if (g_force_portable_buffer_formats.load(std::memory_order_relaxed) && base.formatted &&
-		    !base.atomic &&
+		    !base.atomic && !(descriptor.OutOfBounds() == 0u && stride == 0u) &&
 		    buffer.indirect_root == BufferResource::NoIndirectBuffer &&
 		    !Source(program, base.source)->indirect_descriptor.has_value() &&
-		    PortableBufferFormatIndex(layout.format, layout.swizzle) != UINT32_MAX) {
+		    (PortableBufferFormatIndex(layout.format, layout.swizzle) != UINT32_MAX ||
+		     PortableGenericBufferFormat(layout.format, layout.swizzle))) {
 			buffer.descriptor_format  = Prospero::BufferFormat::kInvalid;
 			buffer.descriptor_swizzle = PortableBufferSwizzle;
 		}
@@ -4098,9 +4105,29 @@ static void FillBufferFormats(const ShaderInfo& info, const Bindings& bindings,
 		if (DecodeBufferDescriptor(snapshot.buffers[resource], descriptor) &&
 		    descriptor.Type() == 0) {
 			index = PortableBufferFormatIndex(descriptor.Format(), descriptor.DstSelXYZW()) & 0xffu;
+			// A format outside the list: the format itself and its DST_SEL, for the loads'
+			// conversion function.
+			if (index == 0xffu &&
+			    PortableGenericBufferFormat(descriptor.Format(), descriptor.DstSelXYZW())) {
+				index = PortableBufferGenericFormat | static_cast<uint32_t>(descriptor.Format());
+				bindings.PackMemoryFormatSwizzle(shader_data, buffer.descriptor_index,
+				                                 descriptor.DstSelXYZW());
+			}
 		}
 		bindings.PackMemoryFormat(shader_data, buffer.descriptor_index, index);
 	}
+}
+
+bool PortableGenericBufferFormat(Prospero::BufferFormat format, uint32_t swizzle) {
+	if (static_cast<uint32_t>(format) >= PortableBufferGenericFormat - 1u ||
+	    Format::GetFormatInfo(format).type == Format::ComponentType::Unknown) {
+		return false;
+	}
+	for (uint32_t component = 0; component < 4u; ++component) {
+		const auto selector = GetDstSel(swizzle, component);
+		if (selector == 2u || selector == 3u) return false;
+	}
+	return true;
 }
 
 void SetPortableBufferFormats(bool enabled) {

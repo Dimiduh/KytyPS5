@@ -160,6 +160,13 @@ inline constexpr std::array<PortableBufferFormat, 8> PortableBufferFormats {{
 }};
 // The descriptor_swizzle of a portable buffer (its descriptor_format is kInvalid): no V# has it.
 inline constexpr uint32_t PortableBufferSwizzle = UINT32_MAX;
+// A format word with this bit names the V#'s format itself (the low seven bits) instead of an
+// entry of PortableBufferFormats: a format outside the list, which the module's loads and
+// stores access through one function each that takes the format (and, for a load, the DST_SEL:
+// the binding's format swizzle word) as a value. Slower than the accesses of the list, but there
+// is one copy of it in a module however many accesses there are, and it handles every format a
+// V# can have. 0xff is no format (an unbound buffer).
+inline constexpr uint32_t PortableBufferGenericFormat = 0x80u;
 // The index of a format and swizzle in PortableBufferFormats, or UINT32_MAX.
 [[nodiscard]] constexpr uint32_t PortableBufferFormatIndex(Prospero::BufferFormat format,
                                                            uint32_t               swizzle) {
@@ -638,7 +645,8 @@ struct Bindings {
 	uint32_t memory_offset_dword = 0;
 	// Shader data ends with one 16-bit stride word per buffer binding (two per dword) when a
 	// buffer takes its stride at run time, then one 8-bit format word per buffer binding (four
-	// per dword) when a buffer takes its format at run time (PortableBufferFormats).
+	// per dword) and one 16-bit format swizzle word per buffer binding (two per dword) when a
+	// buffer takes its format at run time (PortableBufferFormats, PortableBufferGenericFormat).
 	bool memory_strides = false;
 	bool memory_formats = false;
 	// Then one 16-bit swizzle word per image resource (two per dword) when a storage image takes
@@ -661,9 +669,14 @@ struct Bindings {
 	[[nodiscard]] uint32_t MemoryFormatDword() const {
 		return MemoryStrideDword() + (memory_strides ? (BufferBindingCount() + 1u) / 2u : 0u);
 	}
+	// Then the 16-bit format swizzle words (the V#'s DST_SEL), two per dword.
+	[[nodiscard]] uint32_t MemoryFormatSwizzleDword() const {
+		return MemoryFormatDword() + (memory_formats ? (BufferBindingCount() + 3u) / 4u : 0u);
+	}
 	// Then the 16-bit image swizzle words, two per dword.
 	[[nodiscard]] uint32_t MemorySwizzleDword() const {
-		return MemoryFormatDword() + (memory_formats ? (BufferBindingCount() + 3u) / 4u : 0u);
+		return MemoryFormatSwizzleDword() +
+		       (memory_formats ? (BufferBindingCount() + 1u) / 2u : 0u);
 	}
 	[[nodiscard]] uint32_t ShaderDataDwords() const {
 		return MemorySwizzleDword() + (image_swizzles + 1u) / 2u;
@@ -677,6 +690,11 @@ struct Bindings {
 	                      uint32_t format_index) const {
 		const auto shift = (binding % 4u) * 8u;
 		shader_data[MemoryFormatDword() + binding / 4u] |= (format_index & 0xffu) << shift;
+	}
+	void PackMemoryFormatSwizzle(std::span<uint32_t> shader_data, uint32_t binding,
+	                             uint32_t swizzle) const {
+		const auto shift = (binding % 2u) * 16u;
+		shader_data[MemoryFormatSwizzleDword() + binding / 2u] |= (swizzle & 0xffffu) << shift;
 	}
 	void PackMemoryStride(std::span<uint32_t> shader_data, uint32_t binding,
 	                      uint32_t stride) const {

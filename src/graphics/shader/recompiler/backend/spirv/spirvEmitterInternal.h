@@ -131,6 +131,12 @@ struct EmitterState {
 	uint32_t                                         indirect_format_function = 0;
 	uint32_t                                         indirect_format_geometry_function = 0;
 	std::map<std::array<uint32_t, 4>, uint32_t>        indirect_buffer_load_functions;
+	// The functions that load from a run-time format buffer of a format outside
+	// IR::PortableBufferFormats, by PortableBufferLoadKey.
+	std::map<std::array<uint32_t, 4>, uint32_t>        portable_buffer_load_functions;
+	// ... and those that store to one, by the same key; their format conversions by data size.
+	std::map<std::array<uint32_t, 4>, uint32_t>        portable_buffer_store_functions;
+	std::map<uint32_t, uint32_t>                       portable_store_format_functions;
 	uint32_t                                         bvh_intersect_function  = 0;
 	uint32_t                                         bvh8_result_type       = 0;
 	uint32_t                                         bvh8_intersect_function = 0;
@@ -476,6 +482,9 @@ uint32_t EmitBufferStride(EmitterState& state, const IR::MemoryInfo& mem,
 // The shader-data format word of a portable buffer's binding: the index of the bound V#'s format
 // in IR::PortableBufferFormats (0xff: none of them).
 uint32_t EmitBufferFormatIndex(EmitterState& state, const IR::MemoryInfo& mem);
+// The shader-data format swizzle word of the same binding: the V#'s DST_SEL, for a format word
+// that names a format outside the list (IR::PortableBufferGenericFormat).
+uint32_t EmitBufferFormatSwizzle(EmitterState& state, const IR::MemoryInfo& mem);
 // The shader-data swizzle word of an image whose stores take the T#'s DST_SEL at run time
 // (IR::PortableImageSwizzle): four 3-bit selectors.
 uint32_t EmitImageSwizzle(EmitterState& state, uint32_t image);
@@ -580,6 +589,8 @@ void EmitProgram(EmitterState& state);
 void DefineGetBdaPointer(EmitterState& state);
 void DefineIndirectBufferFormats(ValueEmitContext& ctx);
 void DefineIndirectBufferLoads(ValueEmitContext& ctx);
+void DefinePortableBufferLoads(ValueEmitContext& ctx);
+void DefinePortableBufferStores(ValueEmitContext& ctx);
 void DefineBvhIntersect(EmitterState& state);
 void DefineTrinityBvhIntersect(EmitterState& state);
 uint32_t BvhNode(EmitterState& state, uint32_t address);

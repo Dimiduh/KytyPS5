@@ -18,8 +18,12 @@ A seeds file is the game's code: it stays on the PC of whoever owns the game. Gi
 
 What it does and does not cover:
 
-- Compute shaders: all of them are built. At a first use the prebuilt module serves about four
-  in five; the rest depend on what the game binds at that moment and are compiled then.
+- Compute shaders: all of them are built, and translated again in the background at every start
+  so that a first use takes its module without translating anything. The prebuilt module reads
+  what it cannot know from the code at run time (buffer formats and strides, texture channel
+  orders, level counts), so it serves a first use whatever the game binds, with these exceptions,
+  which are compiled when they are first used: shaders that pick their textures from a table (the
+  table's size is built into the module) and integer textures read through a filtering sampler.
 - Graphics pipelines: not covered. A pipeline is a pair of shaders with render state that only
   the running game decides, and the game's files do not list them. They come from what sessions
   record (and from `pipeline-lists`); `-SkipPendingDraws on` keeps a new one from stalling the

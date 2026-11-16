@@ -653,6 +653,10 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 							info.buffer_u8 |= format.element_bits == 8u;
 							info.buffer_u16 |= format.element_bits == 16u;
 						}
+						// ... and, for a format outside the list, byte by byte
+						// (PortableBufferGenericFormat).
+						info.buffer_u8 |= buffer_access == BufferAccess::Read ||
+						                  buffer_access == BufferAccess::Write;
 					}
 				};
 				collect_element(memory.resource);

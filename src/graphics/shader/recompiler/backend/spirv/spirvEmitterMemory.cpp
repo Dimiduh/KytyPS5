@@ -1683,6 +1683,20 @@ uint32_t LoadIndirectFormattedD16X(ValueEmitContext& ctx, const IndirectBufferAc
 	});
 }
 
+// The function that loads from a run-time format buffer whose format is outside the list the
+// module holds decodings of (IR::PortableBufferGenericFormat), by the load's data size, result
+// components, 16-bit component count (a D16 load) and cache bypass.
+std::array<uint32_t, 4> PortableBufferLoadKey(const IR::MemoryInfo& mem, uint32_t components) {
+	return {mem.data_bits, components, mem.data_bits == 16u ? mem.component_count : 0u,
+	        uint32_t(mem.coherent)};
+}
+
+bool IsPortableBufferLoad(const EmitterState& state, const IR::MemoryInfo& mem) {
+	return mem.kind == IR::ResourceKind::Buffer && mem.formatted && !mem.typed &&
+	       mem.resource < state.program.info.buffers.size() &&
+	       state.program.info.buffers[mem.resource].portable_format;
+}
+
 // The access of a buffer that takes its format at run time, for the format being emitted
 // (state.portable_format): the DWORD view the buffer access prepared, or the byte or short view
 // of the same binding for a format of bytes or shorts, which is how the module of the format
@@ -1741,7 +1755,27 @@ uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compon
 						    return decoded;
 					    });
 				    }
-				    return value;
+				    // A format outside the list: the load function, with the format and the
+				    // DST_SEL as values (IR::PortableBufferGenericFormat). A word of no format
+				    // (0xff, an unbound buffer) names none the function decodes: zero.
+				    const auto generic =
+				        Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), index,
+				               ConstantU32(state, IR::PortableBufferGenericFormat));
+				    return EmitValueOrDefaultIfCondition(state, generic, type, value, [&]() {
+					    const auto function = state.portable_buffer_load_functions.at(
+					        PortableBufferLoadKey(selected, components));
+					    const auto slot = ConstantU32(
+					        state, state.program.info.buffers[selected.resource].descriptor_index);
+					    const auto start  = ByteAddress(ctx, inst, selected, &resource);
+					    const auto format = Binary(
+					        state, spv::OpBitwiseAnd, TypeU32(state), index,
+					        ConstantU32(state, IR::PortableBufferGenericFormat - 1u));
+					    const auto swizzle = EmitBufferFormatSwizzle(state, selected);
+					    const auto result  = state.builder.AllocateId();
+					    state.builder.AddFunction(spv::OpFunctionCall, type, result, function, slot,
+					                              start, format, swizzle);
+					    return result;
+				    });
 			    }
 			    const auto info = Format::GetFormatInfo(
 			        selected.formatted ? BufferFormat(ctx, selected) : Prospero::BufferFormat::kInvalid);
@@ -1778,6 +1812,35 @@ void StoreBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t component
 						state.portable_format = UINT32_MAX;
 					});
 				}
+				// A format outside the list: the store function, with the format as a value
+				// (IR::PortableBufferGenericFormat). A word of no format (0xff, an unbound
+				// buffer) names none the function stores.
+				const auto generic = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), index,
+				                            ConstantU32(state, IR::PortableBufferGenericFormat));
+				EmitIfCondition(state, generic, [&]() {
+					const auto function = state.portable_buffer_store_functions.at(
+					    PortableBufferLoadKey(selected, components));
+					std::vector<uint32_t> words {
+					    spv::OpFunctionCall, TypeVoid(state), state.builder.AllocateId(), function,
+					    ConstantU32(state,
+					                state.program.info.buffers[selected.resource].descriptor_index),
+					    ByteAddress(ctx, inst, selected, &resource),
+					    Binary(state, spv::OpBitwiseAnd, TypeU32(state), index,
+					           ConstantU32(state, IR::PortableBufferGenericFormat - 1u))};
+					for (uint32_t word = 0; word < 4u; ++word) {
+						auto value = ConstantU32(state, 0);
+						if (word < components) {
+							value = composite;
+							if (components != 1u) {
+								value = state.builder.AllocateId();
+								state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state),
+								                          value, composite, word);
+							}
+						}
+						words.push_back(value);
+					}
+					state.builder.AddFunction(words);
+				});
 				return;
 			}
 			const auto info = Format::GetFormatInfo(
@@ -1918,6 +1981,398 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 			    : memory.data_bits == 16u ? LoadIndirectFormattedD16X(ctx, buffer, active)
 			                              : LoadIndirectFormattedX(ctx, buffer, active);
 			state.builder.AddFunction(spv::OpReturnValue, result);
+			state.builder.AddFunction(spv::OpFunctionEnd);
+		}
+	}
+}
+
+// load_portable_buffer(slot, start, format, swizzle): the formatted load of the record at byte
+// `start` of the buffer binding `slot`, decoded as the V# format `format` with the DST_SEL
+// `swizzle`, both values. The bounds, the component addresses and the conversion are those of the
+// load compiled for the format (LoadFormattedPrepared), taken from the format's geometry and
+// conversion functions, which the loads through GPU-selected V#s use; the bytes of a component
+// are read one by one through the binding's view of bytes, since nothing is known of the
+// format's element size when the module is compiled. Never inlined: one copy serves every such
+// load of the module, which is what keeps a shader with many formatted loads small.
+void DefinePortableBufferLoads(ValueEmitContext& ctx) {
+	auto&      state = ctx.state;
+	const auto key   = [&](const IR::Inst& inst) -> std::optional<std::array<uint32_t, 4>> {
+		const auto components = IR::BufferComponentCount(inst.GetOpcode());
+		if (components == 0u || inst.GetOpcode() == IR::ValueOpcode::ReadConstBuffer ||
+		    IR::BufferAccessOf(inst.GetOpcode()) != IR::BufferAccess::Read) {
+			return std::nullopt;
+		}
+		const auto& memory = ctx.Memory(inst);
+		if (!IsPortableBufferLoad(state, memory)) return std::nullopt;
+		return PortableBufferLoadKey(memory, components);
+	};
+	for (const auto* block: state.program.blocks) {
+		for (const auto& inst: *block) {
+			const auto found = key(inst);
+			if (!found) continue;
+			auto [entry, inserted] = state.portable_buffer_load_functions.try_emplace(*found, 0u);
+			if (!inserted) continue;
+			if (state.indirect_format_function == 0u) DefineIndirectBufferFormats(ctx);
+			const auto& memory     = ctx.Memory(inst);
+			const auto  components = (*found)[1];
+			const bool  d16        = memory.data_bits == 16u;
+			const auto  decoded    = d16 ? (*found)[2] : components;
+			EXIT_IF(decoded == 0u || decoded > 4u);
+			const auto  function   = entry->second = state.builder.AllocateId();
+			const auto  u32        = TypeU32(state);
+			const auto  boolean    = TypeBool(state);
+			const auto  result_type = TypeU32Composite(state, components);
+			const auto  signature =
+			    state.builder.Type(spv::OpTypeFunction, result_type, u32, u32, u32, u32);
+			const auto name = "load_portable_buffer_" + std::to_string(memory.data_bits) + "x" +
+			                  std::to_string(components) + (d16 ? "c" + std::to_string(decoded) : "") +
+			                  (memory.coherent ? "_coherent" : "");
+			state.builder.AddName(function, name.c_str());
+			state.builder.AddFunction(spv::OpFunction, result_type, function,
+			                          spv::FunctionControlDontInlineMask, signature);
+			std::array<uint32_t, 4> args;
+			for (auto& arg: args) {
+				arg = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpFunctionParameter, u32, arg);
+			}
+			const auto slot = args[0], start = args[1], format = args[2], swizzle = args[3];
+			EmitLabel(state, state.builder.AllocateId());
+			const auto call = [&](uint32_t type, uint32_t callee,
+			                      std::initializer_list<uint32_t> values) {
+				const auto            result = state.builder.AllocateId();
+				std::vector<uint32_t> words {spv::OpFunctionCall, type, result, callee};
+				words.insert(words.end(), values.begin(), values.end());
+				state.builder.AddFunction(words);
+				return result;
+			};
+			const auto constant = [&](uint32_t value) { return ConstantU32(state, value); };
+			// The binding's bytes; its length is the bound range's.
+			auto bytes_view = PrepareStorageBufferResourceAccess(state, memory,
+			                                                     state.storage_buffers[0], slot);
+			bytes_view.element_bits = 8u;
+			const auto geometry =
+			    call(TypeU32Composite(state, 4), state.indirect_format_geometry_function, {format});
+			const auto field = [&](uint32_t index) {
+				const auto value = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeExtract, u32, value, geometry, index);
+				return value;
+			};
+			const auto record = field(0), count = field(1), step = field(2), mask = field(3);
+			// The elements a module of the format accesses the buffer through: the components,
+			// or DWORDs for a packed format (a step of zero).
+			const auto element =
+			    Select(state, u32, Binary(state, spv::OpIEqual, boolean, step, constant(0)),
+			           constant(4), step);
+			const auto shift = Binary(state, spv::OpShiftRightLogical, u32, element, constant(1));
+			const auto end   = Binary(state, spv::OpIAdd, u32, start,
+			                          Binary(state, spv::OpISub, u32, record, constant(1)));
+			const auto in_bounds = AndCondition(
+			    state, Binary(state, spv::OpINotEqual, boolean, record, constant(0)),
+			    AndCondition(
+			        state, Binary(state, spv::OpUGreaterThanEqual, boolean, end, start),
+			        Binary(state, spv::OpULessThan, boolean,
+			               Binary(state, spv::OpShiftRightLogical, u32, end, shift),
+			               Binary(state, spv::OpShiftRightLogical, u32, bytes_view.length, shift))));
+			const auto base =
+			    Binary(state, spv::OpBitwiseAnd, u32, start, Unary(state, spv::OpNot, u32, mask));
+			std::array<uint32_t, 4> values {};
+			for (uint32_t output = 0; output < decoded; ++output) {
+				const auto selector = EmitBitFieldUExtract(state, swizzle, constant(output * 3u),
+				                                           constant(3u));
+				const auto component =
+				    Binary(state, spv::OpUMod, u32,
+				           Binary(state, spv::OpISub, u32, selector, constant(4)), count);
+				const auto address = Binary(state, spv::OpIAdd, u32, base,
+				                            Binary(state, spv::OpIMul, u32, component, step));
+				const auto wanted = AndCondition(
+				    state, in_bounds,
+				    Binary(state, spv::OpUGreaterThanEqual, boolean, selector, constant(4)));
+				auto raw = constant(0);
+				for (uint32_t byte = 0; byte < 4u; ++byte) {
+					const auto present =
+					    byte == 0u ? wanted
+					               : AndCondition(state, wanted,
+					                              Binary(state, spv::OpUGreaterThan, boolean, element,
+					                                     constant(byte)));
+					const auto loaded = EmitValueOrZeroIfCondition(state, present, [&]() {
+						const auto index = byte == 0u ? address
+						                              : Binary(state, spv::OpIAdd, u32, address,
+						                                       constant(byte));
+						return LoadSubwordInBounds(ctx, bytes_view, index, index, 8u);
+					});
+					raw = byte == 0u ? loaded
+					                 : Binary(state, spv::OpBitwiseOr, u32, raw,
+					                          Binary(state, spv::OpShiftLeftLogical, u32, loaded,
+					                                 constant(byte * 8u)));
+				}
+				values[output] =
+				    call(u32, state.indirect_format_function, {format, selector, component, raw});
+			}
+			uint32_t result = 0;
+			if (!d16) {
+				result = ConstructU32Composite(state, components, values);
+			} else {
+				// The 16-bit VGPR form, as LoadFormattedPrepared packs it, by the format's number
+				// type: integers saturate, everything else converts to half.
+				constexpr auto format_count =
+				    static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float) + 1u;
+				const auto in_table =
+				    Binary(state, spv::OpULessThan, boolean, format, constant(format_count));
+				const auto meta_index =
+				    Binary(state, spv::OpIAdd, u32,
+				           Binary(state, spv::OpIMul, u32,
+				                  Select(state, u32, in_table, format, constant(0)), constant(3)),
+				           constant(2));
+				const auto pointer = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpAccessChain,
+				                          TypePointer(state, spv::StorageClassPrivate, u32), pointer,
+				                          IndirectFormatTable(state), meta_index);
+				const auto meta = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpLoad, u32, meta, pointer);
+				const auto number = Binary(state, spv::OpBitwiseAnd, u32, meta, constant(0xfu));
+				const auto is_uint =
+				    Binary(state, spv::OpIEqual, boolean, number,
+				           constant(static_cast<uint32_t>(Format::ComponentType::Uint)));
+				const auto is_sint =
+				    Binary(state, spv::OpIEqual, boolean, number,
+				           constant(static_cast<uint32_t>(Format::ComponentType::Sint)));
+				const auto integer = Binary(state, spv::OpLogicalOr, boolean, is_uint, is_sint);
+				const auto integer_half = [&](uint32_t index) {
+					if (index >= decoded) return constant(0u);
+					const auto lower = EmitSMax32(state, values[index], constant(0xffff8000u));
+					return Select(state, u32, is_sint, EmitSMin32(state, lower, constant(0x7fffu)),
+					              EmitUMin32(state, values[index], constant(0xffffu)));
+				};
+				const auto float_half = [&](uint32_t index) {
+					return index >= decoded ? ConstantF32(state, 0)
+					                        : EmitBitCastF32U32(state, values[index]);
+				};
+				std::array<uint32_t, 4> packed {};
+				for (uint32_t word = 0; word < components; ++word) {
+					const auto integers = Binary(
+					    state, spv::OpBitwiseOr, u32,
+					    Binary(state, spv::OpBitwiseAnd, u32, integer_half(word * 2u),
+					           constant(0xffffu)),
+					    Binary(state, spv::OpShiftLeftLogical, u32, integer_half(word * 2u + 1u),
+					           constant(16u)));
+					const auto pair = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair,
+					                          float_half(word * 2u), float_half(word * 2u + 1u));
+					packed[word] =
+					    Select(state, u32, integer, integers, EmitPackHalf2x16(state, pair));
+				}
+				result = ConstructU32Composite(state, components, packed);
+			}
+			state.builder.AddFunction(spv::OpReturnValue, result);
+			state.builder.AddFunction(spv::OpFunctionEnd);
+		}
+	}
+}
+
+// The components a formatted store instruction stores, or 0.
+uint32_t PortableStoreComponents(const ValueEmitContext& ctx, const IR::Inst& inst) {
+	const auto op = inst.GetOpcode();
+	if (IR::BufferAccessOf(op) != IR::BufferAccess::Write) return 0u;
+	const auto components = IR::BufferComponentCount(op);
+	if (components > 1u) return components;
+	return op == IR::ValueOpcode::StoreBufferU32 && ctx.Memory(inst).formatted ? 1u : 0u;
+}
+
+// convert_store_format(format, component, value): the bits a formatted store of the V# format
+// `format` writes for its component `component` from the VGPR value `value`, as
+// EncodeFormattedStoreComponent encodes them for a format known when the module is compiled.
+uint32_t PortableStoreFormatFunction(ValueEmitContext& ctx, uint32_t data_bits) {
+	auto& state               = ctx.state;
+	auto [entry, inserted]    = state.portable_store_format_functions.try_emplace(data_bits, 0u);
+	if (!inserted) return entry->second;
+	constexpr auto format_count =
+	    static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float) + 1u;
+	const auto u32      = TypeU32(state);
+	const auto function = entry->second = state.builder.AllocateId();
+	const auto signature = state.builder.Type(spv::OpTypeFunction, u32, u32, u32, u32);
+	const auto name      = "convert_store_format_" + std::to_string(data_bits);
+	state.builder.AddName(function, name.c_str());
+	state.builder.AddFunction(spv::OpFunction, u32, function, spv::FunctionControlMaskNone,
+	                          signature);
+	const auto format = state.builder.AllocateId(), component = state.builder.AllocateId(),
+	           value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpFunctionParameter, u32, format);
+	state.builder.AddFunction(spv::OpFunctionParameter, u32, component);
+	state.builder.AddFunction(spv::OpFunctionParameter, u32, value);
+	EmitLabel(state, state.builder.AllocateId());
+	const auto result =
+	    EmitIndexSwitch(state, format, format_count, u32, [&](uint32_t item) {
+		    const auto info = Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(item));
+		    if (info.type == Format::ComponentType::Unknown) return ConstantU32(state, 0);
+		    // The components of a format that is not packed are encoded alike.
+		    auto encoded = EncodeFormattedStoreComponent(state, info, 0u, value, data_bits);
+		    for (uint32_t index = 1; info.packed_bitfield && index < info.component_count; index++) {
+			    encoded = Select(state, u32,
+			                     Binary(state, spv::OpIEqual, TypeBool(state), component,
+			                            ConstantU32(state, index)),
+			                     EncodeFormattedStoreComponent(state, info, index, value, data_bits),
+			                     encoded);
+		    }
+		    return encoded;
+	    });
+	state.builder.AddFunction(spv::OpReturnValue, result);
+	state.builder.AddFunction(spv::OpFunctionEnd);
+	return function;
+}
+
+// store_portable_buffer(slot, start, format, word0..word3): the formatted store of the
+// instruction's VGPR words to the record at byte `start` of the buffer binding `slot`, in the V#
+// format `format`, a value. As the store compiled for the format (StoreFormattedPrepared): the
+// whole record is written, components the instruction does not give as zero, and nothing when the
+// record is out of bounds; the bytes go through the binding's view of bytes. Never inlined (see
+// DefinePortableBufferLoads).
+void DefinePortableBufferStores(ValueEmitContext& ctx) {
+	auto& state = ctx.state;
+	for (const auto* block: state.program.blocks) {
+		for (const auto& inst: *block) {
+			const auto components = PortableStoreComponents(ctx, inst);
+			if (components == 0u || !IsPortableBufferLoad(state, ctx.Memory(inst))) continue;
+			const auto& memory = ctx.Memory(inst);
+			auto [entry, inserted] = state.portable_buffer_store_functions.try_emplace(
+			    PortableBufferLoadKey(memory, components), 0u);
+			if (!inserted) continue;
+			if (state.indirect_format_function == 0u) DefineIndirectBufferFormats(ctx);
+			const auto convert  = PortableStoreFormatFunction(ctx, memory.data_bits);
+			const bool d16      = memory.data_bits == 16u;
+			const auto given    = d16 ? memory.component_count : components;
+			const auto function = entry->second = state.builder.AllocateId();
+			const auto u32      = TypeU32(state);
+			const auto boolean  = TypeBool(state);
+			const auto signature = state.builder.Type(spv::OpTypeFunction, TypeVoid(state), u32, u32,
+			                                          u32, u32, u32, u32, u32);
+			const auto name = "store_portable_buffer_" + std::to_string(memory.data_bits) + "x" +
+			                  std::to_string(components) + (d16 ? "c" + std::to_string(given) : "") +
+			                  (memory.coherent ? "_coherent" : "");
+			state.builder.AddName(function, name.c_str());
+			state.builder.AddFunction(spv::OpFunction, TypeVoid(state), function,
+			                          spv::FunctionControlDontInlineMask, signature);
+			std::array<uint32_t, 7> args;
+			for (auto& arg: args) {
+				arg = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpFunctionParameter, u32, arg);
+			}
+			const auto slot = args[0], start = args[1], format = args[2];
+			EmitLabel(state, state.builder.AllocateId());
+			const auto call = [&](uint32_t type, uint32_t callee,
+			                      std::initializer_list<uint32_t> values) {
+				const auto            result = state.builder.AllocateId();
+				std::vector<uint32_t> words {spv::OpFunctionCall, type, result, callee};
+				words.insert(words.end(), values.begin(), values.end());
+				state.builder.AddFunction(words);
+				return result;
+			};
+			const auto constant = [&](uint32_t value) { return ConstantU32(state, value); };
+			auto bytes_view = PrepareStorageBufferResourceAccess(state, memory,
+			                                                     state.storage_buffers[0], slot);
+			bytes_view.element_bits = 8u;
+			const auto geometry =
+			    call(TypeU32Composite(state, 4), state.indirect_format_geometry_function, {format});
+			const auto field = [&](uint32_t index) {
+				const auto value = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeExtract, u32, value, geometry, index);
+				return value;
+			};
+			const auto record = field(0), count = field(1), step = field(2), mask = field(3);
+			const auto packed_format = Binary(state, spv::OpIEqual, boolean, step, constant(0));
+			const auto element = Select(state, u32, packed_format, constant(4), step);
+			const auto shift   = Binary(state, spv::OpShiftRightLogical, u32, element, constant(1));
+			const auto end     = Binary(state, spv::OpIAdd, u32, start,
+			                            Binary(state, spv::OpISub, u32, record, constant(1)));
+			const auto in_bounds = AndCondition(
+			    state, Binary(state, spv::OpINotEqual, boolean, record, constant(0)),
+			    AndCondition(
+			        state, Binary(state, spv::OpUGreaterThanEqual, boolean, end, start),
+			        Binary(state, spv::OpULessThan, boolean,
+			               Binary(state, spv::OpShiftRightLogical, u32, end, shift),
+			               Binary(state, spv::OpShiftRightLogical, u32, bytes_view.length, shift))));
+			const auto base =
+			    Binary(state, spv::OpBitwiseAnd, u32, start, Unary(state, spv::OpNot, u32, mask));
+			const auto store_byte = [&](uint32_t address, uint32_t value) {
+				StoreSubwordInBounds(ctx, memory, bytes_view, address, address, 8u,
+				                     Binary(state, spv::OpBitwiseAnd, u32, value, constant(0xffu)));
+			};
+			EmitIfCondition(state, in_bounds, [&]() {
+				// The format's components, each encoded from the VGPR word that holds it.
+				std::array<uint32_t, 4> fields {};
+				for (uint32_t component = 0; component < 4u; ++component) {
+					auto value = constant(0);
+					if (component < given) {
+						value = args[3u + (d16 ? component / 2u : component)];
+						if (d16 && (component & 1u) != 0u) {
+							value = Binary(state, spv::OpShiftRightLogical, u32, value, constant(16u));
+						}
+					}
+					fields[component] = call(u32, convert, {format, constant(component), value});
+				}
+				// A format of bytes, shorts or DWORDs: each component at its place.
+				for (uint32_t component = 0; component < 4u; ++component) {
+					const auto exists =
+					    Binary(state, spv::OpULessThan, boolean, constant(component), count);
+					const auto address =
+					    component == 0u
+					        ? base
+					        : Binary(state, spv::OpIAdd, u32, base,
+					                 Binary(state, spv::OpIMul, u32, constant(component), step));
+					for (uint32_t byte = 0; byte < 4u; ++byte) {
+						const auto present = AndCondition(
+						    state, exists,
+						    Binary(state, spv::OpUGreaterThan, boolean, step, constant(byte)));
+						EmitIfCondition(state, present, [&]() {
+							store_byte(byte == 0u ? address
+							                      : Binary(state, spv::OpIAdd, u32, address,
+							                               constant(byte)),
+							           byte == 0u ? fields[component]
+							                      : Binary(state, spv::OpShiftRightLogical, u32,
+							                               fields[component], constant(byte * 8u)));
+						});
+					}
+				}
+				// A packed format: its fields in one DWORD (their widths and bit offsets are in the
+				// format table; a component the format does not have is zero bits wide).
+				EmitIfCondition(state, packed_format, [&]() {
+					constexpr auto format_count =
+					    static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float) + 1u;
+					const auto row = Binary(
+					    state, spv::OpIMul, u32,
+					    Select(state, u32,
+					           Binary(state, spv::OpULessThan, boolean, format, constant(format_count)),
+					           format, constant(0)),
+					    constant(3));
+					const auto entry_of = [&](uint32_t column) {
+						const auto pointer = state.builder.AllocateId();
+						state.builder.AddFunction(
+						    spv::OpAccessChain, TypePointer(state, spv::StorageClassPrivate, u32),
+						    pointer, IndirectFormatTable(state),
+						    column == 0u ? row : Binary(state, spv::OpIAdd, u32, row, constant(column)));
+						const auto value = state.builder.AllocateId();
+						state.builder.AddFunction(spv::OpLoad, u32, value, pointer);
+						return value;
+					};
+					const auto widths  = entry_of(0);
+					const auto offsets = entry_of(1);
+					auto       word    = constant(0);
+					for (uint32_t component = 0; component < 4u; ++component) {
+						const auto width  = EmitBitFieldUExtract(state, widths, constant(component * 8u),
+						                                         constant(8u));
+						const auto offset = EmitBitFieldUExtract(state, offsets,
+						                                         constant(component * 8u), constant(8u));
+						word = EmitBitFieldInsert(state, word, fields[component], offset, width);
+					}
+					for (uint32_t byte = 0; byte < 4u; ++byte) {
+						store_byte(byte == 0u ? base
+						                      : Binary(state, spv::OpIAdd, u32, base, constant(byte)),
+						           byte == 0u ? word
+						                      : Binary(state, spv::OpShiftRightLogical, u32, word,
+						                               constant(byte * 8u)));
+					}
+				});
+			});
+			state.builder.AddFunction(spv::OpReturn);
 			state.builder.AddFunction(spv::OpFunctionEnd);
 		}
 	}

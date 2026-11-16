@@ -191,6 +191,10 @@ std::optional<ResourceSpecialization> CodeOnlySpecialization(const Program& prog
 // the T#'s DST_SEL and, for a raw-class image, the RawView of its format.
 void FillBufferStrides(const ShaderInfo& info, const Bindings& bindings,
                        const ResourceSnapshot& snapshot, std::span<uint32_t> shader_data);
+// Whether a run-time format module accesses a V# of this format and DST_SEL through its format
+// functions (PortableBufferGenericFormat): any format with a decoding, with selectors that name
+// a component, zero or one.
+[[nodiscard]] bool PortableGenericBufferFormat(Prospero::BufferFormat format, uint32_t swizzle);
 // Whether CodeOnlySpecialization gives formatted buffers a run-time format (the default),
 // instead of 32_32_32_32_FLOAT.
 void SetPortableBufferFormats(bool enabled);
