@@ -636,9 +636,36 @@ static int Main(int argc, char* argv[]) {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
+// NVIDIA's driver compresses the pipelines it compiles with a dictionary that it trains once a
+// process has made a few hundred of them and keeps in its shader disk cache; it reads the entries
+// of a pipeline cache file only with the dictionary its disk cache holds at that time. In the
+// driver's default disk cache, which every program shares, that dictionary changes behind the
+// emulator's back (another data folder's precompile, another game), and the title's pipeline
+// cache then holds entries the driver keeps but no longer provides: every pipeline is compiled
+// again at its first use (the "stale entries" of DriverCacheHistory). So the driver gets a disk
+// cache of this data folder's own, next to the pipeline caches it belongs to, for the precompile
+// and the game alike: what trains and holds the dictionary is then only what reads it. An
+// environment that names a disk cache keeps it. Must run before the driver is loaded.
+static void UsePrivateDriverDiskCache() {
+    constexpr const wchar_t* Name = L"__GL_SHADER_DISK_CACHE_PATH";
+    if (const wchar_t* given = _wgetenv(Name); given != nullptr && given[0] != L'\0') {
+        return;
+    }
+    std::error_code error;
+    const auto path = std::filesystem::current_path(error) / "_PipelineCache" / "nvidia";
+    if (error) {
+        return;
+    }
+    std::filesystem::create_directories(path, error);
+    if (!error) {
+        (void)_wputenv_s(Name, path.c_str());
+    }
+}
+
 int wmain(int argc, wchar_t* argv[]) {
     Common::RegisterQuickExit();
     Libs::Graphics::FrameGen::HoldDriverAddressSpace();
+    UsePrivateDriverDiskCache();
     std::vector<std::string> utf8_args;
     utf8_args.reserve(static_cast<size_t>(argc));
 
