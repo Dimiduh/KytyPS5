@@ -22,4 +22,4 @@ data folder has recorded:
 
 | File | Game | Recorded |
 |---|---|---|
-| `PPSA07631.pipelinelist` | Saros | 2026-11-15, the start of the game |
+| `PPSA07631.pipelinelist` | Saros | 2026-11-16, the start of the game: 610 graphics pipelines (the patterns of `shader-pairs/PPSA07631.pairs` are among them) and 12,655 compute programs |
