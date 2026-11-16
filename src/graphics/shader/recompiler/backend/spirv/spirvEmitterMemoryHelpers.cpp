@@ -257,6 +257,14 @@ uint32_t EmitBufferFormatIndex(EmitterState& state, const IR::MemoryInfo& mem) {
 	    state, word, ConstantU32(state, (binding % 4u) * 8u), ConstantU32(state, 8u));
 }
 
+uint32_t EmitImageSwizzle(EmitterState& state, uint32_t image) {
+	EXIT_IF(image >= state.program.bindings.image_swizzles);
+	const auto word =
+	    EmitShaderDataDwordLoad(state, state.program.bindings.MemorySwizzleDword() + image / 2u);
+	return EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
+	    state, word, ConstantU32(state, (image % 2u) * 16u), ConstantU32(state, 16u));
+}
+
 void EmitMemoryBindings(EmitterState& state) {
 	const auto count = state.program.bindings.descriptor_counts[static_cast<size_t>(IR::DescriptorBindingKind::Buffers)];
 	state.memory_byte_offsets.resize(count);

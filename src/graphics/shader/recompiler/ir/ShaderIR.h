@@ -199,6 +199,12 @@ struct BufferResource {
 enum class ImageMipMode { None, Dynamic };
 
 constexpr uint32_t ShaderImageIdentitySwizzle = 0x00000facu;
+// The shader_swizzle of a storage image whose stores take the T#'s DST_SEL at run time instead
+// of having it compiled in: the image's shader-data swizzle word holds it (Bindings::
+// MemorySwizzleDword). Like PortableBufferFormats, it is for modules built from a shader's code
+// alone (CodeOnlySpecialization), which then serve every channel order; no T# has it. Loads of
+// an image without a conversion format do not use the swizzle.
+inline constexpr uint32_t PortableImageSwizzle = UINT32_MAX;
 
 struct ImageResource {
 	static constexpr uint32_t NoIndirectImage = UINT32_MAX;
@@ -571,6 +577,9 @@ struct Bindings {
 	// per dword) when a buffer takes its format at run time (PortableBufferFormats).
 	bool memory_strides = false;
 	bool memory_formats = false;
+	// Then one 16-bit swizzle word per image resource (two per dword) when a storage image takes
+	// its store swizzle at run time (PortableImageSwizzle): the number of image resources, or 0.
+	uint32_t image_swizzles = 0;
 
 	[[nodiscard]] uint32_t BufferBindingCount() const {
 		return descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)];
@@ -588,8 +597,16 @@ struct Bindings {
 	[[nodiscard]] uint32_t MemoryFormatDword() const {
 		return MemoryStrideDword() + (memory_strides ? (BufferBindingCount() + 1u) / 2u : 0u);
 	}
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	// Then the 16-bit image swizzle words, two per dword.
+	[[nodiscard]] uint32_t MemorySwizzleDword() const {
 		return MemoryFormatDword() + (memory_formats ? (BufferBindingCount() + 3u) / 4u : 0u);
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return MemorySwizzleDword() + (image_swizzles + 1u) / 2u;
+	}
+	void PackImageSwizzle(std::span<uint32_t> shader_data, uint32_t image, uint32_t swizzle) const {
+		const auto shift = (image % 2u) * 16u;
+		shader_data[MemorySwizzleDword() + image / 2u] |= (swizzle & 0xfffu) << shift;
 	}
 	void PackMemoryFormat(std::span<uint32_t> shader_data, uint32_t binding,
 	                      uint32_t format_index) const {

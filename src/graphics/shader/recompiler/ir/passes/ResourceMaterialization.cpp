@@ -1907,6 +1907,17 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		const auto raw_sint_format = RawSignedStorageFormat(base, format);
 		const bool raw_sint_storage = raw_sint_format != Prospero::BufferFormat::kInvalid;
 		if (raw_sint_format == Prospero::BufferFormat::k16UInt) image.conversion_format = format;
+		// Tests: every storage image a portable module can store to is specialized as one.
+		if (g_force_portable_buffer_formats.load(std::memory_order_relaxed) && storage &&
+		    image.conversion_format == Prospero::BufferFormat::kInvalid &&
+		    i < program.info.images.size() &&
+		    image.indirect_root == ImageResource::NoIndirectImage && !image.heap &&
+		    !image.bindless) {
+			const auto* direct = Source(program, base.source);
+			if (direct == nullptr || !direct->indirect_descriptor.has_value()) {
+				image.shader_swizzle = PortableImageSwizzle;
+			}
+		}
 		image.numeric_class = Prospero::SampledTextureNumericClass(
 		    depth_bits ? Prospero::BufferFormat::k16UNorm : Prospero::RemapTextureFormat(format));
 		if (!storage && format == Prospero::BufferFormat::k11_11_10UNorm) {
@@ -2360,11 +2371,28 @@ static bool ServesBuffer(const ResourcePlan& program, uint32_t resource,
 	       FormattedOutOfBoundsZero(program, resource, current.descriptor_swizzle);
 }
 
+// A module whose storage image takes its store swizzle at run time behaves as one compiled for
+// any swizzle of the image (PortableImageSwizzle).
+static bool ServesImage(const ResourceSpecialization::Image& compiled,
+                        const ResourceSpecialization::Image& current, bool portable) {
+	if (compiled == current) return true;
+	if (!portable || compiled.shader_swizzle != PortableImageSwizzle ||
+	    current.shader_swizzle == PortableImageSwizzle) {
+		return false;
+	}
+	auto layout           = compiled;
+	layout.shader_swizzle = current.shader_swizzle;
+	return layout == current;
+}
+
 bool SpecializationServes(const ResourcePlan& program, const ResourceSpecialization& compiled,
                           const ResourceSpecialization& current, bool portable) {
-	if (compiled.buffers.size() != current.buffers.size() || compiled.images != current.images ||
-	    compiled.samplers != current.samplers)
+	if (compiled.buffers.size() != current.buffers.size() ||
+	    compiled.images.size() != current.images.size() || compiled.samplers != current.samplers)
 		return false;
+	for (uint32_t i = 0; i < current.images.size(); ++i) {
+		if (!ServesImage(compiled.images[i], current.images[i], portable)) return false;
+	}
 	for (uint32_t i = 0; i < current.buffers.size(); ++i) {
 		if (compiled.buffers[i] != current.buffers[i] &&
 		    !ServesBuffer(program, i, compiled.buffers[i], current.buffers[i], portable))
@@ -3545,9 +3573,11 @@ std::optional<ResourceSpecialization> CodeOnlySpecialization(const Program& prog
 		});
 	}
 	specialization.images.reserve(program.info.images.size());
+	const bool portable = PortableBufferFormatsEnabled();
 	for (const auto& image: program.info.images) {
 		// A single-level, identity-swizzled T# of the dimension the instructions name, with a
-		// float format (an integer one for atomics), as BuildResourceSpecialization reads it.
+		// float format (an integer one for atomics), as BuildResourceSpecialization reads it. A
+		// storage image takes its store swizzle at run time (PortableImageSwizzle).
 		auto& entry = specialization.images.emplace_back(ResourceSpecialization::Image {
 		    .numeric_class = image.atomic ? Prospero::TextureNumericClass::Uint
 		                                  : Prospero::TextureNumericClass::Float,
@@ -3555,6 +3585,9 @@ std::optional<ResourceSpecialization> CodeOnlySpecialization(const Program& prog
 		                         ? Decoder::ImageDimension::Dim2D
 		                         : image.dimension,
 		});
+		if (portable && image.resource_class == ImageResourceClass::Storage) {
+			entry.shader_swizzle = PortableImageSwizzle;
+		}
 		// Like the materialization, refuse what no descriptor can give the image (an unused
 		// image without a class, an atomic sampled image).
 		auto specialized          = image;
@@ -3910,9 +3943,27 @@ bool LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan) {
 static void FillBufferFormats(const ShaderInfo& info, const Bindings& bindings,
                               const ResourceSnapshot& snapshot, std::span<uint32_t> shader_data);
 
+// The DST_SEL of the T# of every image with a run-time store swizzle; the identity for a null T#.
+static void FillImageSwizzles(const ShaderInfo& info, const Bindings& bindings,
+                              const ResourceSnapshot& snapshot, std::span<uint32_t> shader_data) {
+	if (bindings.image_swizzles == 0u) return;
+	EXIT_IF(shader_data.size() < bindings.ShaderDataDwords() ||
+	        bindings.image_swizzles != info.images.size() ||
+	        snapshot.images.size() < info.images.size());
+	for (uint32_t image = 0; image < info.images.size(); ++image) {
+		if (info.images[image].shader_swizzle != PortableImageSwizzle) continue;
+		const auto& descriptor = snapshot.images[image];
+		bindings.PackImageSwizzle(shader_data, image,
+		                          NullImageDescriptor(descriptor)
+		                              ? ShaderImageIdentitySwizzle
+		                              : DescriptorImageSwizzle(descriptor));
+	}
+}
+
 void FillBufferStrides(const ShaderInfo& info, const Bindings& bindings,
                        const ResourceSnapshot& snapshot, std::span<uint32_t> shader_data) {
 	FillBufferFormats(info, bindings, snapshot, shader_data);
+	FillImageSwizzles(info, bindings, snapshot, shader_data);
 	if (!bindings.memory_strides) return;
 	EXIT_IF(shader_data.size() < bindings.ShaderDataDwords() ||
 	        snapshot.buffers.size() < info.buffers.size());

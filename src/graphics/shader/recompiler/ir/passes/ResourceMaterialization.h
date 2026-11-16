@@ -125,9 +125,10 @@ std::string TakeSpecializationFailureReport();
 // zero out of bounds, since an unbound buffer is bound so that every access is out of bounds
 // (loads read the out-of-bounds value, stores and atomics are dropped). With `portable`, so does
 // a layout whose buffer takes its format at run time for a buffer of one of the formats it
-// selects from (PortableBufferFormats): the same values, through a decoding selected per access,
-// so a caller that has a module compiled for the format itself prefers that one (`portable`
-// false).
+// selects from (PortableBufferFormats), and a layout whose storage image takes its store swizzle
+// at run time (PortableImageSwizzle) for any swizzle: the same values, through a decoding
+// selected per access, so a caller that has a module compiled for the format itself prefers that
+// one (`portable` false).
 bool SpecializationServes(const ResourcePlan& program, const ResourceSpecialization& compiled,
                           const ResourceSpecialization& current, bool portable = true);
 
@@ -174,15 +175,17 @@ bool SpecializationApplies(const Program& program, const ResourceSpecialization&
 // The specialization a translated program gets from descriptors that are as plain as its code
 // allows: direct buffers with a nonzero stride (formatted ones take their format at run time,
 // see PortableBufferFormats; 32_UINT when the program has atomics on them), direct images of a
-// float 2D format unless the code says otherwise, no candidates. It needs no guest memory, so a
+// float 2D format unless the code says otherwise, storage images with a run-time store swizzle
+// (PortableImageSwizzle), no candidates. It needs no guest memory, so a
 // pipeline can be built before the first dispatch; the shaders whose resources are plain get the
 // module their dispatches use, or one that serves them (SpecializationServes). Empty when no
 // descriptors can specialize the program's resources.
 std::optional<ResourceSpecialization> CodeOnlySpecialization(const Program& program);
 
-// Writes into the shader data the V# stride of every buffer binding with a runtime stride, and the
+// Writes into the shader data the V# stride of every buffer binding with a runtime stride, the
 // format word (the index of the V#'s format in PortableBufferFormats) of every buffer binding
-// with a run-time format.
+// with a run-time format, and the DST_SEL of every image with a run-time store swizzle
+// (PortableImageSwizzle).
 void FillBufferStrides(const ShaderInfo& info, const Bindings& bindings,
                        const ResourceSnapshot& snapshot, std::span<uint32_t> shader_data);
 // Whether CodeOnlySpecialization gives formatted buffers a run-time format (the default),

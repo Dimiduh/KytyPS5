@@ -617,6 +617,53 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 	uint32_t values[4] {zero, zero, zero, zero};
 	auto packed_value = zero;
 	const auto dmask = mem.dmask != 0u ? mem.dmask : 1u;
+	if (swizzle == IR::PortableImageSwizzle) {
+		// The T#'s DST_SEL at run time: texel component c takes the first stored VGPR component
+		// whose selector names it (4 + c), zero when none does, like InverseSwizzle below.
+		EXIT_IF(converted);
+		auto&      state = ctx.state;
+		const auto word  = EmitImageSwizzle(state, mem.resource);
+		uint32_t   raws[4] {};
+		uint32_t   selectors[4] {};
+		for (uint32_t source = 0; source < 4u; source++) {
+			if (((dmask >> source) & 1u) == 0u) continue;
+			const auto packed_index = DmaskComponentIndex(dmask, source);
+			auto       raw          = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), raw, data,
+			                          mem.data_bits == 16u ? packed_index / 2u : packed_index);
+			if (mem.data_bits == 16u) {
+				if ((packed_index & 1u) != 0u) {
+					raw = Binary(state, spv::OpShiftRightLogical, TypeU32(state), raw,
+					             ConstantU32(state, 16u));
+				}
+				raw = Binary(state, spv::OpBitwiseAnd, TypeU32(state), raw,
+				             ConstantU32(state, 0xffffu));
+			}
+			raws[source]      = raw;
+			selectors[source] = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpBitFieldUExtract, TypeU32(state), selectors[source],
+			                          word, ConstantU32(state, source * 3u), ConstantU32(state, 3u));
+		}
+		for (uint32_t component = 0; component < 4u; component++) {
+			auto raw = zero;
+			for (uint32_t source = 4u; source-- != 0u;) {
+				if (raws[source] == 0u) continue;
+				raw = Select(state, TypeU32(state),
+				             Binary(state, spv::OpIEqual, TypeBool(state), selectors[source],
+				                    ConstantU32(state, 4u + component)),
+				             raws[source], raw);
+			}
+			values[component] = integer ? raw
+			                    : mem.data_bits == 16u
+			                        ? EmitF16BitsToF32(state, raw)
+			                        : Unary(state, spv::OpBitcast, TypeF32(state), raw);
+		}
+		const auto texel = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeConstruct,
+		                          integer ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4), texel,
+		                          values[0], values[1], values[2], values[3]);
+		return texel;
+	}
 	for (uint32_t component = 0; component < (converted ? info.component_count : 4u); component++) {
 		const auto source = InverseSwizzle(swizzle, component);
 		const bool selected = source < 4u && ((dmask >> source) & 1u) != 0u;

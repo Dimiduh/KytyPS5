@@ -30358,9 +30358,13 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   auto compiled = CompileCase(test, vulkan != nullptr ? vulkan->SubgroupSize() : 64u);
   if (test.image_descriptor_swizzle != DstSel(4, 5, 6, 7) &&
       !compiled.program.info.images.empty()) {
+    // With run-time store swizzles forced (--portable-formats-only), the
+    // swizzle reaches the program through the image's shader-data word.
     Require(test.name, "resource specialization",
             compiled.program.info.images[0].shader_swizzle ==
-                    test.image_descriptor_swizzle,
+                    test.image_descriptor_swizzle ||
+                compiled.program.info.images[0].shader_swizzle ==
+                    ShaderRecompiler::IR::PortableImageSwizzle,
             "storage image descriptor swizzle did not reach the specialized "
             "program");
   }

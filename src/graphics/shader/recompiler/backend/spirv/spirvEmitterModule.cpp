@@ -279,6 +279,13 @@ void DefineDescriptors(EmitterState& state) {
 	    std::ranges::any_of(info.buffers, [](const IR::BufferResource& buffer) {
 		    return buffer.portable_format && buffer.descriptor_index != UINT32_MAX;
 	    });
+	bindings.image_swizzles =
+	    std::ranges::any_of(info.images,
+	                        [](const IR::ImageResource& image) {
+		                        return image.shader_swizzle == IR::PortableImageSwizzle;
+	                        })
+	        ? static_cast<uint32_t>(info.images.size())
+	        : 0u;
 	bindings.push_data_start_dword =
 	    IR::PushData::StartFor(bindings.push_data_start_dword, bindings.ShaderDataDwords());
 	counts[static_cast<size_t>(Kind::ShaderData)] =

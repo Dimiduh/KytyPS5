@@ -476,6 +476,9 @@ uint32_t EmitBufferStride(EmitterState& state, const IR::MemoryInfo& mem,
 // The shader-data format word of a portable buffer's binding: the index of the bound V#'s format
 // in IR::PortableBufferFormats (0xff: none of them).
 uint32_t EmitBufferFormatIndex(EmitterState& state, const IR::MemoryInfo& mem);
+// The shader-data swizzle word of an image whose stores take the T#'s DST_SEL at run time
+// (IR::PortableImageSwizzle): four 3-bit selectors.
+uint32_t EmitImageSwizzle(EmitterState& state, uint32_t image);
 
 MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         state,
                                                         const IR::MemoryInfo& mem,

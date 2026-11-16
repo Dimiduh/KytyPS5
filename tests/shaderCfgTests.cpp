@@ -4184,6 +4184,81 @@ void TestPortableBufferFormats() {
         "switching run-time formats off did not restore the fixed format");
 }
 
+void TestPortableImageSwizzle() {
+  namespace IR = ShaderRecompiler::IR;
+  // image_store v[0:3] at v[20:21] to the T# in s[0:7]
+  const uint32_t shader[] = {EncodeMimg0(0x08, 0xf), EncodeMimg1(0, 0, 0, 20),
+                             EncodeSopp(0x01)};
+  const auto bgra = DstSel(6, 5, 4, 7);
+  auto user_data = ImageTestUserData();
+  user_data[2] = 0x003f003fu; // 64x64
+  std::fill_n(user_data.begin() + 4, 4, 0u);
+  SetImageTestFormat(&user_data, 0, Prospero::BufferFormat::k8_8_8_8UNorm);
+  user_data[3] |= bgra;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+  auto translated = ShaderRecompiler::TranslateProgram(shader, options);
+  const auto plan = IR::ExtractResourcePlan(translated.program);
+  const auto materialize = [&](const std::array<uint32_t, 64> &words) {
+    const IR::SrtRuntime runtime{.user_data = words};
+    IR::ResourceSnapshot snapshot;
+    IR::ResourceSpecialization specialization;
+    Check(IR::MaterializeResources(plan, runtime, snapshot, specialization),
+          "the storage image did not materialize");
+    return std::pair{std::move(specialization), std::move(snapshot)};
+  };
+
+  // Without a descriptor, a storage image takes its store swizzle at run time.
+  const auto code_only = IR::CodeOnlySpecialization(translated.program);
+  Check(code_only.has_value() && code_only->images.size() == 1u &&
+            code_only->images[0].shader_swizzle == IR::PortableImageSwizzle &&
+            IR::SpecializationApplies(translated.program, *code_only),
+        "the storage image got no run-time store swizzle");
+  // That module serves every swizzle, as a fallback for the module of the
+  // swizzle itself.
+  const auto [real, real_snapshot] = materialize(user_data);
+  Check(real.images.size() == 1u && real.images[0].shader_swizzle == bgra,
+        "the T#'s swizzle was not specialized");
+  Check(IR::SpecializationServes(plan, *code_only, real) &&
+            !IR::SpecializationServes(plan, *code_only, real, false) &&
+            !IR::SpecializationServes(plan, real, *code_only),
+        "the run-time swizzle module did not serve a T# swizzle");
+  // Not another image type.
+  auto volume_data = user_data;
+  SetImageTestType(&volume_data, 0, Prospero::ImageType::kColor3D);
+  volume_data[3] |= bgra;
+  Check(!IR::SpecializationServes(plan, *code_only,
+                                  materialize(volume_data).first),
+        "the run-time swizzle module served another image dimension");
+
+  // The module reads one swizzle word per image from the shader data; the
+  // renderer fills it from the T#, and with the identity for a null T#.
+  const auto compiled = ShaderRecompiler::CompileProgram(
+      std::move(translated), options, *code_only);
+  CheckSpirvBinaryValidates(compiled.spirv);
+  const auto &bindings = compiled.program.bindings;
+  Check(bindings.image_swizzles == 1u &&
+            bindings.ShaderDataDwords() == bindings.MemorySwizzleDword() + 1u,
+        "the run-time swizzle module has no swizzle word in its shader data");
+  const auto word_of = [&](const IR::ResourceSnapshot &snapshot) {
+    std::vector<uint32_t> shader_data(bindings.ShaderDataDwords());
+    IR::FillBufferStrides(compiled.program.info, bindings, snapshot,
+                          shader_data);
+    return shader_data[bindings.MemorySwizzleDword()] & 0xffffu;
+  };
+  Check(word_of(real_snapshot) == bgra,
+        "the swizzle word did not hold the T#'s DST_SEL");
+  auto null_data = user_data;
+  std::fill_n(null_data.begin(), 8, 0u);
+  Check(word_of(materialize(null_data).second) ==
+            IR::ShaderImageIdentitySwizzle,
+        "a null T# did not get the identity swizzle word");
+  const auto exact = RecompileForTest(shader, options);
+  Check(exact.program.bindings.image_swizzles == 0u &&
+            exact.spirv != compiled.spirv,
+        "a T# swizzle did not compile its own module");
+}
+
 void TestImageAddressOperands() {
   using namespace ShaderRecompiler;
   // Captured at PC 0x10cc in compute shader 0041b6a03db7472d.
@@ -14966,6 +15041,7 @@ int main() {
   TestShaderSeedImport();
   TestCodeOnlySpecializationMatchesPlainDescriptors();
   TestPortableBufferFormats();
+  TestPortableImageSwizzle();
   // Opcode semantics and optimized SPIR-V are exercised by
   // ShaderRecompilerComputeTests; keep the distinct decoder contract checks
   // here.
