@@ -8,6 +8,7 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <array>
+#include <cstring>
 #include <filesystem>
 #include <functional>
 #include <span>
@@ -348,6 +349,21 @@ struct ShaderMappedData {
 };
 
 void ShaderInit();
+// The bytes of a shader binary that are its program: the code and, at align16(code size), its
+// literal buffer, as sized by the 0x30-byte footer that ends a binary; the whole binary when the
+// footer is unknown. A mapped shader's hash and its translation cover these bytes.
+inline uint32_t ShaderProgramSize(const uint32_t* binary, uint32_t size) {
+	constexpr uint32_t FooterSize = 0x30;
+	if (size < FooterSize) return size;
+	// Magic, then version, code size and literal buffer size at +0x10.
+	const auto* footer = binary + (size - FooterSize) / 4;
+	const auto  end    = ((uint64_t {footer[5]} + 15u) & ~uint64_t {15}) + footer[6];
+	if (std::memcmp(footer, "barefoot", 8) != 0 || footer[4] != 1 || footer[5] == 0 ||
+	    end % 4 != 0 || end > size - FooterSize) {
+		return size;
+	}
+	return static_cast<uint32_t>(end);
+}
 // Returns the shader's hash (of its code).
 uint64_t ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
 

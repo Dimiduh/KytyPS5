@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -398,6 +399,35 @@ void TestCodeStore() {
         "codes are counted by type");
   const auto found = store.Find(ShaderCodeId::Of(*a));
   Check(found != nullptr && *found == *a, "code is found by content");
+  // A shader binary ends with a footer that sizes its program (16 words of
+  // code here, no literals); records and lists name the shader by the program,
+  // so the store holds that, whichever of the two it is given.
+  std::vector<uint32_t> binary(*Code(3, 16));
+  const std::vector<uint32_t> program = binary;
+  const char name[8] = {'b', 'a', 'r', 'e', 'f', 'o', 'o', 't'};
+  std::vector<uint32_t> footer(12, 0u);
+  std::memcpy(footer.data(), name, sizeof(name));
+  footer[4] = 1u;
+  footer[5] = 64u;
+  binary.insert(binary.end(), footer.begin(), footer.end());
+  Check(Libs::Graphics::ShaderProgramWords(binary).size() == 16u &&
+            Libs::Graphics::ShaderProgramWords(program).size() == 16u,
+        "a binary's program ends before its footer");
+  const auto program_path = TempPath("programs.v5.created");
+  {
+    ShaderCodeStore programs(program_path);
+    Check(programs.Add(1, binary) && !programs.Add(1, program) &&
+              !programs.Add(1, binary),
+          "a binary and its program are one shader");
+    const auto stored = programs.Find(ShaderCodeId::Of(program));
+    Check(stored != nullptr && *stored == program &&
+              programs.Find(ShaderCodeId::Of(binary)) == nullptr,
+          "a binary is stored as and found by its program");
+  }
+  ShaderCodeStore reopened(program_path);
+  const auto kept = reopened.Find(ShaderCodeId::Of(program));
+  Check(reopened.Size() == 1 && kept != nullptr && *kept == program,
+        "the program is read back");
   Check(store.Find({.hash = 1, .words = 30}) == nullptr,
         "unknown content is not found");
 }

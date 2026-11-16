@@ -39,6 +39,11 @@ struct ShaderCodeIdHash {
 
 using ShaderCode = std::shared_ptr<const std::vector<uint32_t>>;
 
+// The program of a shader binary (ShaderProgramSize): the words a stage or program record holds
+// and names its shader by, since they are what a draw's shader parameters carry. The binary a
+// guest creates, or one taken from the game's files, also has a footer after them.
+[[nodiscard]] std::span<const uint32_t> ShaderProgramWords(std::span<const uint32_t> binary);
+
 // A graphics shader stage program as the pipeline cache translated it (ProgramCache::Get): the
 // guest code, the static input the translation reads and the resource specialization the module
 // was compiled for. Like ComputeProgramRecord, it re-translates with any later recompiler.
@@ -177,7 +182,9 @@ private:
 // The code of every shader the guest created (sceAgcCreateShader), of every stage, by content
 // (_PipelineCache/<title>.v5.created). The shareable pipeline list names shaders by content
 // only; their code comes from here, so a list resolves against what this player's game created.
-// Append-only, checksummed, code once per content.
+// Append-only, checksummed, code once per content. The store holds and names a shader's program
+// (ShaderProgramWords), as records and lists do; an entry of a file that holds a whole binary is
+// read as its program.
 //
 // Thread-safe.
 class ShaderCodeStore {
@@ -191,8 +198,8 @@ public:
 	static std::filesystem::path PathFor(const std::filesystem::path& directory,
 	                                     const std::string&           title_id);
 
-	// Adds the code of a created shader of the given ShaderBinaryType unless its content is
-	// known. Returns whether it was new.
+	// Adds the program of a created shader (its binary or its program) of the given
+	// ShaderBinaryType unless its content is known. Returns whether it was new.
 	bool                     Add(uint8_t binary_type, std::span<const uint32_t> code);
 	[[nodiscard]] ShaderCode Find(const ShaderCodeId& id) const;
 	[[nodiscard]] size_t     Size() const;

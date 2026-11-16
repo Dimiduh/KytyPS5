@@ -357,6 +357,12 @@ bool GetCode(Reader& r, ShaderCodeId& id, std::vector<uint32_t>& code) {
 
 } // namespace
 
+std::span<const uint32_t> ShaderProgramWords(std::span<const uint32_t> binary) {
+	if (binary.size() > UINT32_MAX / sizeof(uint32_t)) return binary;
+	const auto bytes = ShaderProgramSize(binary.data(), static_cast<uint32_t>(binary.size_bytes()));
+	return binary.first(std::min<size_t>(bytes / sizeof(uint32_t), binary.size()));
+}
+
 ShaderCodeId ShaderCodeId::Of(std::span<const uint32_t> code) {
 	return {.hash  = XXH3_64bits(code.data(), code.size_bytes()),
 	        .words = static_cast<uint32_t>(code.size())};
@@ -813,6 +819,11 @@ ShaderCodeStore::ShaderCodeStore(std::filesystem::path path): m_path(std::move(p
 		        !r.Get(type) || type >= m_by_type.size() || !GetCode(r, id, *code)) {
 			    return false;
 		    }
+		    // An entry written with the whole binary: its program is what it is found by.
+		    if (const auto program = ShaderProgramWords(*code); program.size() != code->size()) {
+			    code->resize(program.size());
+			    id = ShaderCodeId::Of(*code);
+		    }
 		    if (m_code.try_emplace(id, std::move(code)).second) {
 			    m_by_type[type]++;
 			    kept.emplace_back(payload.begin(), payload.end());
@@ -831,6 +842,7 @@ ShaderCodeStore::ShaderCodeStore(std::filesystem::path path): m_path(std::move(p
 ShaderCodeStore::~ShaderCodeStore() = default;
 
 bool ShaderCodeStore::Add(uint8_t binary_type, std::span<const uint32_t> code) {
+	code = ShaderProgramWords(code);
 	if (code.empty() || code.size() > MaxCodeWords || binary_type >= m_by_type.size()) {
 		return false;
 	}

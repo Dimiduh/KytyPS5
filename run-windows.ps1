@@ -25,6 +25,11 @@
 #                                            to the emulator as given)
 #   .\run-windows.ps1 -Precompile            compile every recorded shader and pipeline into the driver cache, then
 #                                            exit: its "Precompile done:" line and the time it took at the end
+#   .\run-windows.ps1 -PipelineList <file>   also compile the shaders and pipelines of a shared pipeline list (what
+#                                            another data folder or player recorded, without shader code; the code
+#                                            comes from what this game has created or imported): with -Precompile
+#                                            in that pass, otherwise in the background beside the game
+#   .\run-windows.ps1 -ExportPipelineList <file>   write what this data folder has recorded as such a list, then exit
 #   .\run-windows.ps1 -Log file              the emulator's own log into the logs folder (console: into the run log,
 #                                            which -Follow shows, slow; off: none)
 #   .\run-windows.ps1 -Set KEY=VALUE         an environment switch of the emulator (KYTY_*, SDL_*; KEY= removes one);
@@ -56,6 +61,8 @@ param(
 	[switch]$SkipNotice,
 	[ValidateSet('', 'on', 'off')][string]$PrecompilePipelines = '',
 	[switch]$Precompile,
+	[string]$PipelineList = '',
+	[string]$ExportPipelineList = '',
 	[ValidateSet('', 'off', 'file', 'console')][string]$Log = '',
 	[string[]]$Set = @(),
 	[string]$ExtraArgs = '',
@@ -181,6 +188,16 @@ if ($PrecompilePipelines) {
 # into the driver cache; the emulator saves it and exits (0: done, 1: the cache could not be saved, 2: stopped). The
 # game does not start.
 if ($Precompile) { Add-Flag '--precompile-only' }
+# -PipelineList: a shared list of recorded programs and pipelines (--import-pipeline-list). It names shaders by
+# content and carries none: an entry is built once the emulator has its shaders' code, from what the game created in
+# any session or from shader binaries imported with --import-shaders. -ExportPipelineList writes this data folder's
+# recordings as such a list and exits (--export-pipeline-list).
+if ($PipelineList) {
+	Set-Option '--import-pipeline-list' ($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($PipelineList))
+}
+if ($ExportPipelineList) {
+	Set-Option '--export-pipeline-list' ($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ExportPipelineList))
+}
 # -Log: the emulator's own log (--printf-direction). What the pipeline cache and the precompile report reaches the
 # run log (the emulator's console output, logs\<time>.out.log) in every mode.
 switch ($Log) {

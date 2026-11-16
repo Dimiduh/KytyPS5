@@ -945,9 +945,18 @@ struct PipelineCache::ProgramCache {
 	// Records the specialization a dispatch asked for when its first use took the shader's
 	// code-only module instead (see Get): the next session prepares and precompiles the module of
 	// that specialization, and this one builds its pipeline in the background.
-	void RecordExactComputeProgram(const ShaderParams& params, const ShaderComputeInputInfo& input,
-	                               uint32_t push_data_cursor,
-	                               ShaderRecompiler::IR::ResourceSpecialization specialization) {
+	void RecordExactComputeProgram(ComputeProgramRecord record) {
+		if (manifest->Add(record) && build_later) {
+			build_later(std::make_shared<const ComputeProgramRecord>(std::move(record)));
+		}
+	}
+
+	// The record of the program a dispatch asks for (see RecordComputeProgram), without the
+	// module's hash, which is not part of its key.
+	static ComputeProgramRecord
+	ExactComputeRecord(const ShaderParams& params, const ShaderComputeInputInfo& input,
+	                   uint32_t                                             push_data_cursor,
+	                   const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
 		ComputeProgramRecord record;
 		record.shader_hash = params.hash;
 		record.code =
@@ -955,10 +964,8 @@ struct PipelineCache::ProgramCache {
 		record.user_data_count  = params.user_data_count;
 		record.input            = ComputeProgramRecord::StaticInput(input);
 		record.push_data_cursor = push_data_cursor;
-		record.specialization   = std::move(specialization);
-		if (manifest->Add(record) && build_later) {
-			build_later(std::make_shared<const ComputeProgramRecord>(std::move(record)));
-		}
+		record.specialization   = specialization;
+		return record;
 	}
 
 	// Adds a compiled graphics stage permutation to the title's pipeline manifest and returns
@@ -1244,8 +1251,9 @@ struct PipelineCache::ProgramCache {
 		// (a created shader, or one imported from the game's files): when that code-only module
 		// serves this dispatch, it is the one taken, and the pipeline needs no compile. It reads
 		// the formats of its buffers at run time; the module for the formats themselves is left
-		// to the next session.
-		std::optional<ShaderRecompiler::IR::ResourceSpecialization> exact;
+		// to the next session. Not when an imported pipeline list names the dispatch's own
+		// module: the precompile has built that pipeline, or is about to.
+		std::optional<ComputeProgramRecord> exact;
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			if (!recorded && manifest != nullptr && !entry->second.call_source && code_only_built &&
 			    code_only_built(params.hash)) {
@@ -1256,9 +1264,15 @@ struct PipelineCache::ProgramCache {
 				           ShaderRecompiler::IR::SpecializationServes(
 				               entry->second.resource_plan, *code_only, specialization, true,
 				               &entry->second.resources)) {
-					exact          = std::move(specialization);
-					specialization = std::move(*code_only);
-					code_only_taken++;
+					auto record =
+					    ExactComputeRecord(params, input_info, push_data_cursor, specialization);
+					if (list_predicts && list_predicts(record.Key())) {
+						code_only_listed++;
+					} else {
+						exact          = std::move(record);
+						specialization = std::move(*code_only);
+						code_only_taken++;
+					}
 				} else {
 					code_only_other++;
 				}
@@ -1273,8 +1287,7 @@ struct PipelineCache::ProgramCache {
 				added.handle.record_key =
 				    RecordComputeProgram(params, input_info, push_data_cursor, added);
 				if (exact.has_value()) {
-					RecordExactComputeProgram(params, input_info, push_data_cursor,
-					                          std::move(*exact));
+					RecordExactComputeProgram(std::move(*exact));
 				}
 			}
 		} else {
@@ -1439,6 +1452,8 @@ struct PipelineCache::ProgramCache {
 	uint64_t code_only_same  = 0;
 	uint64_t code_only_taken = 0;
 	uint64_t code_only_other = 0;
+	// ... or it serves the dispatch, but a pipeline list names the dispatch's own module.
+	uint64_t code_only_listed = 0;
 	// Compute permutations recorded this session, and those a record or the list predicted.
 	uint64_t compute_recorded  = 0;
 	uint64_t compute_predicted = 0;
@@ -2288,7 +2303,8 @@ void PipelineCache::SetCreatedCode(std::unique_ptr<ShaderCodeStore> store) {
 		{
 			std::lock_guard lock(m_list_mutex);
 			if (m_list_open && m_list_resolver != nullptr) {
-				QueueResolved(m_list_resolver->OnCode(shader.code));
+				// A list names a shader by its program.
+				QueueResolved(m_list_resolver->OnCode(ShaderProgramWords(shader.code)));
 			}
 		}
 		// A census of the created shaders, at most every 10 s.
@@ -2574,17 +2590,33 @@ void PipelineCache::ImportPipelineList() {
 			return code;
 		return nullptr;
 	};
+	// A created compute shader's record holds its whole binary, while a recorded program (and a
+	// list entry made from one) names the program: binaries are also found by their program,
+	// whose words are copied out when a list entry asks for them.
 	std::unordered_map<ShaderCodeId, ShaderCode, ShaderCodeIdHash> compute_code;
+	std::unordered_map<ShaderCodeId, ShaderCode, ShaderCodeIdHash> compute_binaries;
 	for (const auto* manifest: {m_manifest.get(), m_created.get()}) {
 		if (manifest == nullptr) continue;
 		for (const auto& record: manifest->Records()) {
 			compute_code.try_emplace(ShaderCodeId::Of(*record->code), record->code);
+			if (const auto program = ShaderProgramWords(*record->code);
+			    program.size() != record->code->size()) {
+				compute_binaries.try_emplace(ShaderCodeId::Of(program), record->code);
+			}
 		}
 	}
 	auto   resolved   = m_list_resolver->Resolve([&](const ShaderCodeId& id) -> ShaderCode {
 		if (auto code = local(id)) return code;
-		const auto found = compute_code.find(id);
-		return found != compute_code.end() ? found->second : nullptr;
+		if (const auto found = compute_code.find(id); found != compute_code.end()) {
+			return found->second;
+		}
+		const auto binary = compute_binaries.find(id);
+		if (binary == compute_binaries.end()) return nullptr;
+		const auto program = ShaderProgramWords(*binary->second);
+		auto       code =
+		    std::make_shared<const std::vector<uint32_t>>(program.begin(), program.end());
+		compute_code.try_emplace(id, code);
+		return code;
 	});
 	size_t from_dumps = 0;
 	size_t dumps_read = 0;
@@ -2868,12 +2900,15 @@ void PipelineCache::LogCoverage() {
 		                 m_graphics_from_cache, m_graphics_compiled, m_graphics_predicted,
 		                 m_graphics_recorded);
 	}
-	if (programs.code_only_same + programs.code_only_taken + programs.code_only_other != 0) {
+	if (programs.code_only_same + programs.code_only_taken + programs.code_only_other +
+	        programs.code_only_listed !=
+	    0) {
 		PipelineCacheLog("Compute programs this session: of the first uses of shaders built "
 		                 "from their code alone, {} were that module, {} took it (it serves "
-		                 "them), {} needed their own",
+		                 "them), {} took their own from the pipeline list instead, {} needed "
+		                 "their own",
 		                 programs.code_only_same, programs.code_only_taken,
-		                 programs.code_only_other);
+		                 programs.code_only_listed, programs.code_only_other);
 	}
 	if (const auto warm = m_warm_pipelines.GetCounts(); warm.kept != 0) {
 		PipelineCacheLog("Pipelines the precompile kept ready: {} taken at their first use of {} "
