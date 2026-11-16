@@ -489,10 +489,12 @@ private:
 	// takes none; a build left to the background only its start), and the ones a frame shows.
 	struct CreateTimes {
 		static constexpr uint64_t SlowNs = 5'000'000;
+		uint64_t count   = 0;
 		uint64_t ns      = 0;
 		uint64_t longest = 0;
 		uint64_t slow    = 0;
 		void Add(uint64_t elapsed) {
+			count++;
 			ns      += elapsed;
 			longest  = std::max(longest, elapsed);
 			slow    += elapsed >= SlowNs ? 1u : 0u;
@@ -500,6 +502,9 @@ private:
 	};
 	CreateTimes m_graphics_create;
 	CreateTimes m_compute_create;
+	// The graphics ones by what kept their draws from being left out meanwhile
+	// (PendingDrawBlocker; None: left out, the build went to the background).
+	std::array<CreateTimes, 7> m_graphics_create_by_blocker;
 
 	void InitializeDriverCache();
 	void CheckpointDriverCache();

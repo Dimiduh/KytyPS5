@@ -16,7 +16,9 @@ enum class PendingDrawBlocker : uint8_t {
 	Disabled,
 	// Dispatches always wait: a skipped dispatch is never replayed, and its writes are lost.
 	Compute,
-	// A stage stores to or atomically updates guest memory, GDS or a storage image.
+	// A stage stores to or atomically updates guest memory, GDS or a storage image. (The
+	// renderer does not count a pixel shader's stores to its own bound buffers and storage
+	// images: renderDraw.cpp, skip_pixel_writes.)
 	WritesMemory,
 	// A guest query counts the draw's samples.
 	QueryActive,

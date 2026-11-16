@@ -41,8 +41,11 @@ graphics stages and 85 graphics pipelines.
    wait for a new graphics shader"): the translation of a stage nothing has translated and the
    build of its pipeline both happen on helper threads, and the draws that need them are left
    out until they are there: an object appears a few frames late instead of the game stopping.
-   Draws that must not be left out (they clear depth, render to a target the CPU reads, or
-   their shaders store to memory) wait as before.
+   Draws that must not be left out wait as before: they clear depth, render to a target the
+   CPU reads, or a vertex shader of theirs stores to memory. A pixel shader that fills a buffer
+   or marks bits in a storage image does not keep its draw in the frame (a fifth of Saros's
+   pipelines have one, and each new one used to stop the game for 0.1 to 0.9 s); what it would
+   have written is missing for those frames, like the draw's picture.
 
 Run the pass once after installing, after an emulator update that changes shaders, and after a
 graphics driver update:
@@ -97,6 +100,8 @@ Programs prepared ahead: 11164 of 11199 recorded or built from their code transl
 Stage programs translated off the GPU thread while their draws were left out: 222 programs, 250 modules (0 done on the GPU thread after all)
 ```
 
-"compiled" is what cost time during play. A line `Vulkan pipeline cache: N builds missed
+"compiled" is what cost time during play, and two more lines say how much of it the game
+waited for: `Pipelines created at their first use this session held the GPU thread for ...`, and
+for graphics the same by the rule that kept the draws in the frame. A line `Vulkan pipeline cache: N builds missed
 pipelines the cache was given before` means the driver dropped entries (the section above): run
 the pass again.

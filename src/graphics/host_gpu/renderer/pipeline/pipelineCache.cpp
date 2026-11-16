@@ -3967,6 +3967,22 @@ bool PipelineCache::Save() {
 		                 ms(m_compute_create.ns), ms(m_graphics_create.ns), m_compute_create.slow,
 		                 m_graphics_create.slow, ms(m_compute_create.longest),
 		                 ms(m_graphics_create.longest));
+		static constexpr std::array<const char*, 7> Rules = {
+		    "left out (background build)", "option off", "compute", "a stage writes memory",
+		    "a query counts the draw", "a linear target", "a depth or stencil clear"};
+		std::string by_rule;
+		for (size_t rule = 0; rule < m_graphics_create_by_blocker.size(); rule++) {
+			const auto& times = m_graphics_create_by_blocker[rule];
+			if (times.count == 0) continue;
+			by_rule += fmt::format("{}{}: {} pipelines, {:.0f} ms, longest {:.0f} ms",
+			                       by_rule.empty() ? "" : "; ", Rules[rule], times.count,
+			                       ms(times.ns), ms(times.longest));
+		}
+		if (!by_rule.empty()) {
+			PipelineCacheLog("Graphics pipelines created at their first use, by what kept their "
+			                 "draws in the frame: {}",
+			                 by_rule);
+		}
 	}
 	LogStaleDriverCache();
 	LogCoverage();
@@ -4680,10 +4696,14 @@ PipelineCache::Pipeline* PipelineCache::FindGraphicsPipeline(const CommandBuffer
 		                              nullptr, m_driver_history, &m_warm_pipelines);
 	}();
 	(from_driver_cache ? m_graphics_from_cache : m_graphics_compiled)++;
-	m_graphics_create.Add(static_cast<uint64_t>(
+	const auto create_ns = static_cast<uint64_t>(
 	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
 	                                                         create_start)
-	        .count()));
+	        .count());
+	m_graphics_create.Add(create_ns);
+	if (const auto rule = static_cast<size_t>(blocker); rule < m_graphics_create_by_blocker.size()) {
+		m_graphics_create_by_blocker[rule].Add(create_ns);
+	}
 	SupersedePrecompile(record_key);
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 

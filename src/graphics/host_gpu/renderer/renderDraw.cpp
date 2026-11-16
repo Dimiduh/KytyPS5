@@ -5,6 +5,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/liveControl.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -1098,24 +1099,43 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	return true;
 }
 
-static bool StageWritesMemory(const ShaderStageRuntime& stage) {
-	const auto& program = *stage.program;
-	const auto& info    = program.info;
-	return program.has_address_writes || info.uses_gds ||
-	       std::ranges::any_of(
+// 1: with --skip-pending-draws, a draw whose pixel shader stores to the buffers and storage
+// images bound to it is left out like any other while its pipeline builds: what it would have
+// written is missing for those frames, as its picture is. 0: such a draw waits for its pipeline
+// (Saros: a fifth of the pipelines of a scene have such a pixel shader, marking bits in a
+// storage image or filling a per-frame buffer, and each new one stopped the game for 0.1 to
+// 0.9 s).
+static Common::LiveControl::Switch g_skip_pixel_writes("skip_pixel_writes", 1);
+
+// Writes that are not to a resource bound to the stage: raw addresses, GDS.
+static bool StageWritesRawMemory(const ShaderStageRuntime& stage) {
+	return stage.program->has_address_writes || stage.program->info.uses_gds;
+}
+
+static bool StageWritesResources(const ShaderStageRuntime& stage) {
+	const auto& info = stage.program->info;
+	return std::ranges::any_of(
 	           info.buffers, [](const auto& buffer) { return buffer.written || buffer.atomic; }) ||
 	       std::ranges::any_of(info.images,
 	                           [](const auto& image) { return image.written || image.atomic; });
+}
+
+static bool StageWritesMemory(const ShaderStageRuntime& stage) {
+	return StageWritesRawMemory(stage) || StageWritesResources(stage);
 }
 
 // What decides whether the draw may be skipped while its pipeline is built (PendingDrawBlocker).
 static PendingDrawDescription DescribePendingDraw(const DrawRenderState&                 state,
                                                   std::span<const ShaderVertexInputInfo> stages) {
 	PendingDrawDescription draw {.skip_enabled = true};
+	// (A pixel shader's own buffers and storage images: see g_skip_pixel_writes.)
+	const auto& pixel = state.ps_input_info.stage;
 	draw.writes_memory =
 	    std::ranges::any_of(stages,
 	                        [](const auto& stage) { return StageWritesMemory(stage.stage); }) ||
-	    (state.ps_active && StageWritesMemory(state.ps_input_info.stage));
+	    (state.ps_active &&
+	     (StageWritesRawMemory(pixel) ||
+	      (StageWritesResources(pixel) && !g_skip_pixel_writes.On())));
 	// Guest occlusion queries do not count host samples yet: ZPASS_DONE publishes synthetic
 	// always-visible results, which a skipped draw cannot change.
 	draw.query_active = false;
