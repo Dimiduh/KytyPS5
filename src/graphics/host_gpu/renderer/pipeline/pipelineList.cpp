@@ -116,6 +116,13 @@ bool PipelineList::Write(const std::filesystem::path& path, const PipelineListCo
 	return ManifestFormat::WriteEntryFile(path, ListMagic, FormatVersion, payloads);
 }
 
+std::filesystem::path PipelineList::FileFor(const std::filesystem::path& given,
+                                            const std::string&           title_id) {
+	std::error_code error;
+	return std::filesystem::is_directory(given, error) ? given / (title_id + ".pipelinelist")
+	                                                   : given;
+}
+
 PipelineListContents PipelineList::Read(const std::filesystem::path& path,
                                         const std::string& title_id, ReadStats* stats) {
 	PipelineListContents contents;

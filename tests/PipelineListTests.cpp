@@ -511,6 +511,11 @@ void TestListRoundTrip() {
   Check(read.pipelines[1].Key() == Pipeline(fixture.vs, &fixture.ps2, 2).Key(),
         "pipelines read back");
 
+  // A folder of lists stands for the title's list in it; a file for itself.
+  Check(PipelineList::FileFor(path, "PPSA00001") == path &&
+            PipelineList::FileFor(path.parent_path(), "PPSA00001") ==
+                path.parent_path() / "PPSA00001.pipelinelist",
+        "a list folder names the title's list");
   const auto other = PipelineList::Read(path, "PPSA00002", &stats);
   Check(stats.valid && !stats.title_matches && other.compute.empty() &&
             other.pipelines.empty(),

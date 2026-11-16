@@ -28,7 +28,9 @@
 #   .\run-windows.ps1 -PipelineList <file>   also compile the shaders and pipelines of a shared pipeline list (what
 #                                            another data folder or player recorded, without shader code; the code
 #                                            comes from what this game has created or imported): with -Precompile
-#                                            in that pass, otherwise in the background beside the game
+#                                            in that pass, otherwise in the background beside the game. A folder
+#                                            stands for its <title id>.pipelinelist. Default: the pipeline-lists
+#                                            folder next to this script, if there is one; none: no list
 #   .\run-windows.ps1 -ExportPipelineList <file>   write what this data folder has recorded as such a list, then exit
 #   .\run-windows.ps1 -Log file              the emulator's own log into the logs folder (console: into the run log,
 #                                            which -Follow shows, slow; off: none)
@@ -192,8 +194,15 @@ if ($Precompile) { Add-Flag '--precompile-only' }
 # content and carries none: an entry is built once the emulator has its shaders' code, from what the game created in
 # any session or from shader binaries imported with --import-shaders. -ExportPipelineList writes this data folder's
 # recordings as such a list and exits (--export-pipeline-list).
-if ($PipelineList) {
+# Without -PipelineList, the lists that ship next to this script (pipeline-lists\<title id>.pipelinelist) are offered:
+# the emulator takes the list of the game it runs, when the folder has one. -PipelineList none: no list at all.
+if ($PipelineList -eq 'none') {
+	$at = $options.IndexOf('--import-pipeline-list')
+	if ($at -ge 0) { $options.RemoveRange($at, 2) }
+} elseif ($PipelineList) {
 	Set-Option '--import-pipeline-list' ($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($PipelineList))
+} elseif ($options.IndexOf('--import-pipeline-list') -lt 0 -and (Test-Path -LiteralPath "$PSScriptRoot\pipeline-lists" -PathType Container)) {
+	Set-Option '--import-pipeline-list' "$PSScriptRoot\pipeline-lists"
 }
 if ($ExportPipelineList) {
 	Set-Option '--export-pipeline-list' ($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ExportPipelineList))

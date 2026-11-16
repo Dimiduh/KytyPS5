@@ -192,7 +192,8 @@ static void PrintUsage() {
 	::printf(
 	    "  --import-pipeline-list <file>        Precompile the pipelines of a shared list whose\n"
 	    "                                       shaders this game has (with --precompile-only, or\n"
-	    "                                       beside the game unless --no-precompile-pipelines).\n");
+	    "                                       beside the game unless --no-precompile-pipelines).\n"
+	    "                                       A folder: its <title id>.pipelinelist, if any.\n");
 	::printf(
 	    "  --import-shaders <file>              With --precompile-only: also build the compute\n"
 	    "                                       shaders of this file, which holds shader binaries\n"

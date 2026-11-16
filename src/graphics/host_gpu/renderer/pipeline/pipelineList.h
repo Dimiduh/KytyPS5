@@ -55,6 +55,11 @@ public:
 	// Reads a list. Entries of another title are not returned (title_matches is false).
 	static PipelineListContents Read(const std::filesystem::path& path, const std::string& title_id,
 	                                 ReadStats* stats = nullptr);
+	// The list file that `given` names for a title: `given` itself, or, when it is a folder, the
+	// title's list in it (<title id>.pipelinelist). A folder of lists can ship next to the
+	// emulator: each game takes its own.
+	static std::filesystem::path FileFor(const std::filesystem::path& given,
+	                                     const std::string&           title_id);
 	// The contents of a title's manifests.
 	static PipelineListContents FromManifests(const std::string&      title_id,
 	                                          const ProgramManifest*  programs,

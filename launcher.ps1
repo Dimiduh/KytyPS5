@@ -28,7 +28,7 @@ $logNames = 'Off', 'File (in the logs folder)', 'Console (slow)'
 
 $settings = [ordered]@{ game = ''; data = ''; resolution = '1920x1080'; fullscreen = $false; stretch = $false; language = 1
 	gpu = -1; gpu_name = ''; present_mode = 'Mailbox'; hdr = $false; perf_overlay = $false; sound = $true
-	skip_notice_screen = $false; redzone = $false; precompile_pipelines = $true; log = 'off'; extra_args = ''; environment = '' }
+	skip_notice_screen = $false; redzone = $false; precompile_pipelines = $true; pipeline_lists = $true; log = 'off'; extra_args = ''; environment = '' }
 if (Test-Path -LiteralPath $settingsPath) {
 	# (A file that cannot be read leaves the defaults.)
 	try {
@@ -198,6 +198,9 @@ function Get-RunArguments {
 	# Background shader preparation beside the game: on or off, as chosen (the emulator's --precompile-pipelines or
 	# --no-precompile-pipelines).
 	$arguments += @('-PrecompilePipelines', $(if ($settings.precompile_pipelines) { 'on' } else { 'off' }))
+	# The shared pipeline lists next to the launcher (pipeline-lists\<title id>.pipelinelist) are run-windows.ps1's
+	# default; off: none.
+	if (!$settings.pipeline_lists) { $arguments += @('-PipelineList', 'none') }
 	if ($settings.fullscreen) { $arguments += '-Fullscreen' }
 	# (Without it the game's picture keeps its aspect ratio, between black bars in a window of another shape.)
 	if ($settings.stretch) { $arguments += '-Stretch' }
@@ -375,6 +378,12 @@ $tips.SetToolTip($precompilePipelines, "On: the shaders and pipelines earlier se
 	"start of the game, so that fewer are compiled the moment they are first drawn (a stutter).`n" +
 	"Off: they are compiled when first needed. 'Precompile shaders' below builds them all before playing, either way.")
 Add-Row '' @($precompilePipelines)
+$pipelineLists = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Also prepare the shaders of the shared pipeline list for the game, if one comes with the emulator'; AutoSize = $true; Checked = [bool]$settings.pipeline_lists }
+$tips.SetToolTip($pipelineLists, "A pipeline list (pipeline-lists\<title id>.pipelinelist) holds what other sessions of the game needed, without`n" +
+	"any shader code. On: its shaders and pipelines are built too, in the background and by 'Precompile shaders', as`n" +
+	"soon as the emulator has their code (from the game, as it creates its shaders). Off: only what this data folder`n" +
+	"recorded itself.")
+Add-Row '' @($pipelineLists)
 $log = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 320 }
 $log.Items.AddRange($logNames)
 $log.SelectedIndex = [Math]::Max(0, [Array]::IndexOf($logModes, [string]$settings.log))
@@ -451,6 +460,7 @@ function Read-Form {
 	$settings.skip_notice_screen   = $skipNotice.Checked
 	$settings.redzone              = $redzone.Checked
 	$settings.precompile_pipelines = $precompilePipelines.Checked
+	$settings.pipeline_lists       = $pipelineLists.Checked
 	$settings.log                  = $logModes[[Math]::Max(0, $log.SelectedIndex)]
 	$settings.extra_args           = $extraArgs.Text.Trim()
 	$settings.environment          = $switches.Text.Trim()

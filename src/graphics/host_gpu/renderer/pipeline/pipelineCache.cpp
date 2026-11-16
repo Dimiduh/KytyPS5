@@ -2552,7 +2552,14 @@ void PipelineCache::EnqueuePrecompile(
 
 void PipelineCache::QueueResolved(PipelineListResolver::Resolved resolved) {
 	for (size_t i = 0; i < resolved.compute.size(); i++) {
-		m_list_keys.insert(resolved.compute[i]->Key());
+		const auto key = resolved.compute[i]->Key();
+		m_list_keys.insert(key);
+		// A code-only build that an earlier session of this build finished is in the driver
+		// cache (see QueuePrecompile).
+		if (resolved.compute_code_only[i] && m_finished_created != nullptr &&
+		    m_finished_created->Contains(key)) {
+			continue;
+		}
 		EnqueuePrecompile(std::move(resolved.compute[i]), resolved.compute_code_only[i],
 		                  resolved.compute_position[i]);
 	}
@@ -2567,8 +2574,16 @@ void PipelineCache::QueueResolved(PipelineListResolver::Resolved resolved) {
 }
 
 void PipelineCache::ImportPipelineList() {
-	const auto path = Config::ImportPipelineListPath();
-	if (path.empty()) {
+	const auto given = Config::ImportPipelineListPath();
+	if (given.empty()) {
+		return;
+	}
+	// A folder of lists has one per title, or none for this one.
+	const auto      path = PipelineList::FileFor(given, m_title_id);
+	std::error_code missing;
+	if (path != given && !std::filesystem::exists(path, missing)) {
+		PipelineCacheLog("Pipeline list: {} has no list of {}", Common::PathToString(given),
+		                 m_title_id);
 		return;
 	}
 	PipelineList::ReadStats stats;
