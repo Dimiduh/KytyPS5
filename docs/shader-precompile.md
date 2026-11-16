@@ -57,9 +57,13 @@ later one only what changed.
 
 ## What is still compiled during play
 
-- Compute shaders that pick their textures from a table the GPU selects from: the table's size is
-  built into the module, so the first use compiles, and so does a use with a larger table.
-  Integer textures read through a filtering sampler, and bindless texture heaps.
+- A compute shader that picks its textures from a table the GPU selects from, the first time any
+  session meets it: its code does not say what the table holds. That one compile builds the
+  module for the largest table the emulator lists (32 entries) and, in the background, the one
+  for larger tables, and the precompile pass does the same for every such shader that is
+  recorded; a table that grows with the scene needs nothing more. (Saros has eleven of these,
+  all recorded in the first area; before, each compiled again at 4, 8, 16 and 32 entries.)
+- A compute shader that reads an integer texture through a filtering sampler, the first time.
 - Graphics pipelines no session and no list has recorded and no shader pair has guessed (4):
   half or more of those of a new part of the game. They are built in the background (5). Only
   recordings are complete: a place that has been shown once, here or on the PC a pipeline list

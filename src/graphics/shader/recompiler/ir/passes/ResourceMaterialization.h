@@ -159,6 +159,25 @@ bool AdaptToSpecialization(const ResourcePlan& program, const ResourceSpecializa
 // prior candidate slots plus the ones the draw has beyond them, the deeper key searches - and
 // moves the draw into it. A shader whose tables change with the scene thereby compiles modules
 // whose layouts only grow. Leaves both unchanged when the layouts do not combine.
+// The candidate layout of `layout` at the key limit of its GPU-selected image tables. A table
+// whose keys the host enumerates has at most as many keys as a table may have before it is
+// resolved at run time instead, so its layouts stop growing there: every slot layout a mapped
+// root has, once per key, and the key search of that many keys. A module compiled for it serves
+// every draw whose tables hold candidates of those layouts (AdaptToSpecialization), so a table
+// that grows with the scene takes one module instead of one per doubling (WidenSpecialization).
+// Nullopt when `layout` has no such table or is at the limit already.
+[[nodiscard]] std::optional<ResourceSpecialization>
+WidestCandidateLayout(const ResourceSpecialization& layout);
+// The layout the same program has once those tables hold more keys than the limit and are
+// resolved at run time instead (bindless roots without candidate slots), for the programs it can
+// be told for: searched image tables only, each with a plan-fixed header. A guess the precompile
+// builds ahead; a draw uses the module only when its own layout is this one. Nullopt otherwise.
+[[nodiscard]] std::optional<ResourceSpecialization>
+BindlessTableLayout(const ResourceSpecialization& layout);
+// Moves the draw's candidates into that layout, when the draw has such tables; false, with the
+// draw as it was, when it has none or does not fit.
+bool WidenToKeyLimit(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                     ResourceSpecialization& current);
 void WidenSpecialization(const ResourcePlan& program, const ResourceSpecialization& prior,
                          ResourceSnapshot& snapshot, ResourceSpecialization& current);
 

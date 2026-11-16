@@ -68,6 +68,11 @@ Common::LiveControl::Switch g_warm_pipelines("warm_pipelines", 1);
 // are translated in the background from the boot and kept for their first use
 // (ProgramCache::StartPreparation); 0: such a shader is translated at its first use.
 Common::LiveControl::Switch g_prepare_created("prepare_created", 1);
+// 1: a program whose GPU-selected image tables the host enumerates gets the candidate layout of
+// the tables' key limit at once (IR::WidestCandidateLayout): one module however the tables grow,
+// and for a recorded program the precompile builds it ahead; 0: a layout grows by doubling, a
+// module each time (IR::WidenSpecialization).
+Common::LiveControl::Switch g_widest_table_layouts("widest_table_layouts", 1);
 // 1: with --skip-pending-draws, a graphics stage program that nothing has translated yet is
 // translated on a helper thread and the draws that need it are left out until it is there
 // (ProgramCache::Get); 0: it is translated on the GPU thread at its first draw, as without the
@@ -1224,8 +1229,20 @@ struct PipelineCache::ProgramCache {
 		record.spirv_hash       = permutation.spirv_hash;
 		const auto key          = record.Key();
 		compute_recorded++;
-		if (!manifest->Add(record) || (list_predicts && list_predicts(key))) {
+		const bool added = manifest->Add(record);
+		if (!added || (list_predicts && list_predicts(key))) {
 			compute_predicted++;
+		}
+		// A program with enumerated image tables: the layout the tables take beyond their key
+		// limit (IR::BindlessTableLayout) is recorded with it and its pipeline built in the
+		// background now, for the dispatch that first finds a table that large.
+		if (added && g_widest_table_layouts.On()) {
+			if (auto layout = ShaderRecompiler::IR::BindlessTableLayout(record.specialization)) {
+				auto other           = record;
+				other.specialization = std::move(*layout);
+				other.spirv_hash     = 0;
+				RecordExactComputeProgram(std::move(other));
+			}
 		}
 		return key;
 	}
@@ -1573,6 +1590,14 @@ struct PipelineCache::ProgramCache {
 			ShaderRecompiler::IR::WidenSpecialization(entry->second.resource_plan, *prior,
 			                                          entry->second.resources,
 			                                          entry->second.specialization);
+		}
+		// And the module about to be compiled is the last one such tables need: their layouts
+		// stop growing at the key limit, so it takes that layout now instead of the next
+		// doubling (a table that streams in took a module at 1, 4, 8, 16 and 32 candidates).
+		if (!recorded && g_widest_table_layouts.On()) {
+			(void)ShaderRecompiler::IR::WidenToKeyLimit(entry->second.resource_plan,
+			                                            entry->second.resources,
+			                                            entry->second.specialization);
 		}
 		if ((recorded || entry->second.specialization.images.size() != images_before) &&
 		    !defer_module) {
@@ -3460,6 +3485,48 @@ void PipelineCache::QueuePrecompile(uint32_t thread_count) {
 	auto&           progress = m_precompile_progress;
 	std::lock_guard lock(m_list_mutex);
 	progress.BeginQueueing();
+	// A recorded program whose image tables the host enumerated gets a record of the layout at
+	// the tables' key limit too (IR::WidestCandidateLayout), built and prepared with the rest:
+	// its module serves the larger tables of a place no session has shown, where the recorded
+	// layouts are outgrown and a module would be compiled at the dispatch.
+	if (g_widest_table_layouts.On()) {
+		const auto                   recorded = m_manifest->Records();
+		std::unordered_set<uint64_t> known;
+		for (const auto& record: recorded) {
+			known.insert(record->Key());
+		}
+		// And of the layout the tables take beyond that limit, where it can be told
+		// (IR::BindlessTableLayout).
+		uint64_t   added = 0, present = 0, resolved_added = 0, resolved_present = 0;
+		const auto add   = [&](const ComputeProgramRecord&                                    like,
+		                       std::optional<ShaderRecompiler::IR::ResourceSpecialization> layout,
+		                       uint64_t& added_count, uint64_t& present_count) {
+			if (!layout.has_value()) {
+				return;
+			}
+			auto other           = like;
+			other.specialization = std::move(*layout);
+			other.spirv_hash     = 0;
+			if (!known.insert(other.Key()).second) {
+				present_count++;
+			} else if (m_manifest->Add(other)) {
+				added_count++;
+			}
+		};
+		for (const auto& record: recorded) {
+			add(*record, ShaderRecompiler::IR::WidestCandidateLayout(record->specialization), added,
+			    present);
+			add(*record, ShaderRecompiler::IR::BindlessTableLayout(record->specialization),
+			    resolved_added, resolved_present);
+		}
+		if (added + present + resolved_added + resolved_present != 0) {
+			PipelineCacheLog(
+			    "Precompile: of the recorded programs with image tables, {} got the layout of "
+			    "the tables' key limit ({} records have theirs recorded) and {} the layout of "
+			    "larger tables ({} have theirs)",
+			    added, present, resolved_added, resolved_present);
+		}
+	}
 	// Recorded programs and pipelines first, in the order they were first needed: each
 	// manifest keeps first-seen order, and the two are interleaved by position.
 	const auto programs = m_manifest->Records();

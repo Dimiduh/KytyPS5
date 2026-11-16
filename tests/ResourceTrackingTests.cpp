@@ -8587,6 +8587,128 @@ void TestImageCandidateLayoutAdaptation() {
   }
 }
 
+// A table whose keys the host searches for gets the candidate layout of its
+// key limit: every slot layout of the root 32 times and a search of 32 keys.
+// Heaps, tables resolved at run time and bounded maps keep their layouts.
+void TestWidestCandidateLayout() {
+  using Class = Libs::Graphics::Prospero::TextureNumericClass;
+  using Image = ResourceSpecialization::Image;
+  const auto root = [](uint32_t index, uint32_t search, Class numeric) {
+    return Image{.numeric_class = numeric,
+                 .indirect_root = index,
+                 .indirect_mapping_offset = 40u + index,
+                 .indirect_search_iterations = search,
+                 .indirect_mapping_header = true};
+  };
+  const auto slot = [](uint32_t of, Class numeric) {
+    return Image{.numeric_class = numeric, .indirect_root = of};
+  };
+  ResourceSpecialization layout;
+  layout.buffers.resize(2);
+  layout.samplers.resize(1);
+  // Own images: a direct one, two searched roots, a bounded root, a heap and
+  // a table resolved at run time.
+  layout.images = {Image{.numeric_class = Class::Float},
+                   root(1, 3, Class::Float),
+                   root(2, 3, Class::Uint),
+                   root(3, 0, Class::Float),
+                   root(4, 0, Class::Float),
+                   root(5, 0, Class::Float)};
+  layout.images[4].heap = true;
+  layout.images[5].bindless = true;
+  const size_t direct = layout.images.size();
+  // Slots: three float and one uint for root 1, three uint for root 2, two
+  // for the bounded root, two heap kinds.
+  for (int i = 0; i < 3; i++) layout.images.push_back(slot(1, Class::Float));
+  layout.images.push_back(slot(1, Class::Uint));
+  for (int i = 0; i < 3; i++) layout.images.push_back(slot(2, Class::Uint));
+  for (int i = 0; i < 2; i++) layout.images.push_back(slot(3, Class::Float));
+  auto kind = slot(4, Class::Float);
+  kind.heap = true;
+  layout.images.push_back(kind);
+  kind.cube = true;
+  layout.images.push_back(kind);
+
+  const auto widest = WidestCandidateLayout(layout);
+  Check(widest.has_value(), "a layout with searched tables has no widest layout");
+  if (!widest.has_value()) return;
+  const auto count = [&](uint32_t of, Class numeric) {
+    return std::ranges::count_if(widest->images.begin() + direct, widest->images.end(),
+                                 [&](const Image &image) {
+                                   return image.indirect_root == of &&
+                                          image.numeric_class == numeric;
+                                 });
+  };
+  Check(widest->buffers == layout.buffers && widest->samplers == layout.samplers &&
+            std::equal(layout.images.begin(), layout.images.begin() + direct,
+                       widest->images.begin(), [](Image a, const Image &b) {
+                         a.indirect_search_iterations = b.indirect_search_iterations;
+                         return a == b;
+                       }),
+        "the widest layout changed more than the search depth of the roots");
+  Check(widest->images[1].indirect_search_iterations == 6u &&
+            widest->images[2].indirect_search_iterations == 6u &&
+            widest->images[3].indirect_search_iterations == 0u,
+        "the searched roots do not search 32 keys, or a bounded root does");
+  Check(count(1, Class::Float) == 32 && count(1, Class::Uint) == 32 &&
+            count(2, Class::Uint) == 32 && count(3, Class::Float) == 2 &&
+            count(4, Class::Float) == 2 &&
+            widest->images.size() == direct + 32u * 3u + 2u + 2u,
+        "the slots are not 32 per layout of a searched root and as they were "
+        "for the others");
+  // Slots of one layout are one run, the roots in order.
+  Check(std::ranges::is_sorted(widest->images.begin() + direct, widest->images.end(), {},
+                               [](const Image &image) {
+                                 return std::pair(image.indirect_root,
+                                                  static_cast<uint32_t>(image.numeric_class));
+                               }),
+        "the slots of a layout are not contiguous");
+  Check(!WidestCandidateLayout(*widest).has_value(),
+        "a layout at the key limit can still be widened");
+  ResourceSpecialization plain;
+  plain.images.resize(3);
+  Check(!WidestCandidateLayout(plain).has_value() &&
+            !WidestCandidateLayout({}).has_value(),
+        "a layout without candidate slots was widened");
+
+  // Beyond the limit such tables are resolved at run time: bindless roots
+  // without slots, whose two words each precede the empty map and the headers.
+  using Dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension;
+  ResourceSpecialization tables;
+  tables.buffers.resize(1);
+  tables.images = {Image{.numeric_class = Class::Float}, root(1, 4, Class::Uint),
+                   root(2, 4, Class::Float), root(3, 4, Class::Float)};
+  for (uint32_t index = 1; index < 4; index++) {
+    tables.images[index].dimension = Dimension::Dim2D;
+    for (int i = 0; i < 7; i++) tables.images.push_back(slot(index, Class::Float));
+  }
+  const auto resolved = BindlessTableLayout(tables);
+  Check(resolved.has_value() && resolved->images.size() == 4u &&
+            resolved->images[0] == tables.images[0] && resolved->buffers == tables.buffers,
+        "the layout of larger tables is missing or changed the other resources");
+  if (resolved.has_value()) {
+    // Headers at 41..43: the empty map at 40, the bindless words from 34.
+    for (uint32_t index = 1; index < 4; index++) {
+      const auto &image = resolved->images[index];
+      Check(image.bindless && image.indirect_root == index &&
+                image.indirect_mapping_offset == 34u + 2u * (index - 1u) &&
+                !image.indirect_mapping_header && image.indirect_search_iterations == 0u &&
+                image.numeric_class == Class::Float && image.dimension == Dimension::Dim2D,
+            "a root of the layout of larger tables is not the bindless root a draw has");
+    }
+  }
+  auto with_buffer_table = tables;
+  with_buffer_table.buffers[0].indirect_root = 0u;
+  auto with_heap = tables;
+  with_heap.images[2].heap = true;
+  auto apart = tables;
+  apart.images[3].indirect_mapping_offset += 1u;
+  Check(!BindlessTableLayout(with_buffer_table).has_value() &&
+            !BindlessTableLayout(with_heap).has_value() &&
+            !BindlessTableLayout(apart).has_value() && !BindlessTableLayout(plain).has_value(),
+        "a layout was told for tables whose words cannot be placed");
+}
+
 // A key search bounded by the run-time key count finds every key with more
 // iterations than it needs; a bounded map is another access form.
 void TestKeySearchDepthServes() {
@@ -11019,6 +11141,7 @@ int main() {
         TestImageTableClassGroupingStability);
     Run("image candidate layout adaptation",
         TestImageCandidateLayoutAdaptation);
+    Run("widest candidate layout", TestWidestCandidateLayout);
     Run("key search depth serves", TestKeySearchDepthServes);
     Run("structured buffer stride specialization",
         TestStructuredBufferStrideSpecialization);

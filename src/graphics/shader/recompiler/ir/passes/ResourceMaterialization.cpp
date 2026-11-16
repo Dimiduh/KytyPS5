@@ -2896,6 +2896,118 @@ void WidenSpecialization(const ResourcePlan& program, const ResourceSpecializati
 	}
 }
 
+std::optional<ResourceSpecialization> WidestCandidateLayout(const ResourceSpecialization& layout) {
+	const auto& images = layout.images;
+	// Candidate slots follow the program's own images, each naming its root among those.
+	size_t direct = images.size();
+	for (size_t index = 0; index < images.size(); ++index) {
+		const auto root = images[index].indirect_root;
+		if (root != ImageResource::NoIndirectImage && root != index) {
+			direct = index;
+			break;
+		}
+	}
+	if (direct == images.size()) return std::nullopt;
+	auto widest = layout;
+	widest.images.resize(direct);
+	bool grown = false;
+	for (uint32_t root = 0; root < direct; ++root) {
+		std::vector<SpecImage> slots;
+		for (size_t index = direct; index < images.size(); ++index) {
+			if (images[index].indirect_root == root) slots.push_back(images[index]);
+		}
+		// A root whose keys the host searches for in a map it enumerated (not an image heap, whose
+		// slots are kinds, and not a table resolved at run time, which has none).
+		const auto& mapped = images[root];
+		if (!slots.empty() && mapped.indirect_root == root && !mapped.bindless && !mapped.heap &&
+		    mapped.indirect_search_iterations != 0u) {
+			// Every slot layout the root has, once per key: runs stay contiguous (UnionLayout).
+			std::vector<SpecImage> runs;
+			for (const auto& slot: slots) {
+				if (std::ranges::find(runs, slot) != runs.end()) continue;
+				const auto have = static_cast<size_t>(std::ranges::count(slots, slot));
+				runs.insert(runs.end(), std::max(have, BindlessTableKeys), slot);
+				grown |= have < BindlessTableKeys;
+			}
+			slots = std::move(runs);
+			const auto search = static_cast<uint32_t>(std::bit_width(BindlessTableKeys));
+			if (mapped.indirect_search_iterations < search) {
+				widest.images[root].indirect_search_iterations = search;
+				grown                                          = true;
+			}
+		}
+		widest.images.insert(widest.images.end(), slots.begin(), slots.end());
+	}
+	if (!grown) return std::nullopt;
+	return widest;
+}
+
+std::optional<ResourceSpecialization> BindlessTableLayout(const ResourceSpecialization& layout) {
+	const auto& images = layout.images;
+	size_t      direct = images.size();
+	for (size_t index = 0; index < images.size(); ++index) {
+		const auto root = images[index].indirect_root;
+		if (root != ImageResource::NoIndirectImage && root != index) {
+			direct = index;
+			break;
+		}
+	}
+	// Only a program whose GPU-selected resources are searched image tables with plan-fixed
+	// headers: the words of the flattened SRT are then [each table's two bindless words][the
+	// empty map][a header per table], which places the bindless words from the headers.
+	if (std::ranges::any_of(layout.buffers, [](const auto& buffer) {
+		    return buffer.indirect_root != BufferResource::NoIndirectBuffer;
+	    }) ||
+	    std::ranges::any_of(layout.samplers, [](const auto& sampler) {
+		    return sampler.indirect_root != SamplerResource::NoIndirectSampler;
+	    })) {
+		return std::nullopt;
+	}
+	std::vector<uint32_t> roots;
+	for (uint32_t index = 0; index < direct; ++index) {
+		const auto& image = images[index];
+		if (image.indirect_root == ImageResource::NoIndirectImage) continue;
+		if (image.indirect_root != index || image.bindless || image.heap || image.cube ||
+		    image.indirect_search_iterations == 0u || !image.indirect_mapping_header) {
+			return std::nullopt;
+		}
+		roots.push_back(index);
+	}
+	const auto count = static_cast<uint32_t>(roots.size());
+	if (count == 0u) return std::nullopt;
+	const auto first = images[roots[0]].indirect_mapping_offset;
+	for (uint32_t ordinal = 0; ordinal < count; ++ordinal) {
+		if (images[roots[ordinal]].indirect_mapping_offset != first + ordinal) return std::nullopt;
+	}
+	if (first < 1u + 2u * count) return std::nullopt;
+	auto resolved = layout;
+	resolved.images.resize(direct);
+	for (uint32_t ordinal = 0; ordinal < count; ++ordinal) {
+		// As BuildResourceSpecialization reads the null T# such a root has: the class comes
+		// from the instruction, the dimension is the one its candidates had.
+		resolved.images[roots[ordinal]] = SpecImage {
+		    .numeric_class           = Prospero::TextureNumericClass::Float,
+		    .dimension               = images[roots[ordinal]].dimension,
+		    .indirect_root           = roots[ordinal],
+		    .indirect_mapping_offset = first - 1u - 2u * count + 2u * ordinal,
+		    .bindless                = true,
+		};
+	}
+	return resolved;
+}
+
+bool WidenToKeyLimit(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                     ResourceSpecialization& current) {
+	auto widest = WidestCandidateLayout(current);
+	if (!widest.has_value()) return false;
+	auto adapted = snapshot;
+	auto result  = current;
+	if (!AdaptToSpecialization(program, *widest, adapted, result)) return false;
+	snapshot = std::move(adapted);
+	current  = std::move(result);
+	return true;
+}
+
 ResourcePlan ExtractResourcePlan(const Program& program, SrtWalkerLoads loads,
                                  SrtWalkerCompilation compilation) {
 	ResourcePlan plan;
