@@ -472,6 +472,10 @@ private:
 	using ShaderFactsList = std::vector<std::shared_ptr<const ShaderHeaderFacts>>;
 	std::mutex                                    m_shader_facts_mutex;
 	std::unordered_map<uint64_t, ShaderFactsList> m_shader_facts;
+	// The record keys of the recorded programs whose pipelines the session's background builds
+	// have finished (ProgramCache::built_now). Guarded by its mutex.
+	std::mutex                   m_built_keys_mutex;
+	std::unordered_set<uint64_t> m_built_keys;
 	// Graphics pipelines created this session: from the driver cache or compiled, and whether a
 	// record (local or imported) predicted them.
 	uint64_t m_graphics_from_cache = 0;
@@ -481,6 +485,21 @@ private:
 	// Live compute pipelines the driver cache provided or compiled.
 	uint64_t m_compute_from_cache = 0;
 	uint64_t m_compute_compiled   = 0;
+	// The time the GPU thread spent in those creations (a pipeline the precompile kept ready
+	// takes none; a build left to the background only its start), and the ones a frame shows.
+	struct CreateTimes {
+		static constexpr uint64_t SlowNs = 5'000'000;
+		uint64_t ns      = 0;
+		uint64_t longest = 0;
+		uint64_t slow    = 0;
+		void Add(uint64_t elapsed) {
+			ns      += elapsed;
+			longest  = std::max(longest, elapsed);
+			slow    += elapsed >= SlowNs ? 1u : 0u;
+		}
+	};
+	CreateTimes m_graphics_create;
+	CreateTimes m_compute_create;
 
 	void InitializeDriverCache();
 	void CheckpointDriverCache();

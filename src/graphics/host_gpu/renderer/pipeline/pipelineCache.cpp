@@ -68,6 +68,13 @@ Common::LiveControl::Switch g_warm_pipelines("warm_pipelines", 1);
 // are translated in the background from the boot and kept for their first use
 // (ProgramCache::StartPreparation); 0: such a shader is translated at its first use.
 Common::LiveControl::Switch g_prepare_created("prepare_created", 1);
+// 1: a compute dispatch that a module reading its formats at run time serves (a shader's
+// code-only module, which the precompile built for every shader of the game) gets the module of
+// its own formats translated and its pipeline built in the background, and later dispatches
+// take that one (ProgramCache::OwnModuleFor): the run-time formats cost GPU time in every
+// dispatch (measured: 41 ms instead of 17 ms of GPU work a frame where every compute shader ran
+// on its code-only module). 0: the dispatch keeps the code-only module for the session.
+Common::LiveControl::Switch g_upgrade_code_only("upgrade_code_only", 1);
 // 1: a program whose GPU-selected image tables the host enumerates gets the candidate layout of
 // the tables' key limit at once (IR::WidestCandidateLayout): one module however the tables grow,
 // and for a recorded program the precompile builds it ahead; 0: a layout grows by doubling, a
@@ -469,6 +476,9 @@ struct PipelineCache::ProgramCache {
 			ShaderRecompiler::IR::ResourceSpecialization specialization;
 			uint32_t                                     push_data_cursor = 0;
 			std::shared_ptr<DeferredTranslation>         job;
+			// A compute program's own module (OwnModuleFor): the key of its record, whose
+			// pipeline the precompile builds meanwhile.
+			uint64_t record_key = 0;
 		};
 		std::vector<PendingModule> pending_modules;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
@@ -969,6 +979,8 @@ struct PipelineCache::ProgramCache {
 		std::mutex                        mutex;
 		std::condition_variable           wake;
 		std::deque<std::function<void()>> jobs;
+		// Translations nothing waits for (OwnModuleFor), taken when `jobs` is empty.
+		std::deque<std::function<void()>> later;
 		std::vector<std::thread>          threads;
 		bool                              stop = false;
 	};
@@ -982,10 +994,13 @@ struct PipelineCache::ProgramCache {
 				auto&            state = *deferral;
 				std::unique_lock lock(state.mutex);
 				for (;;) {
-					state.wake.wait(lock, [&] { return state.stop || !state.jobs.empty(); });
+					state.wake.wait(lock, [&] {
+						return state.stop || !state.jobs.empty() || !state.later.empty();
+					});
 					if (state.stop) return;
-					auto job = std::move(state.jobs.front());
-					state.jobs.pop_front();
+					auto& queue = !state.jobs.empty() ? state.jobs : state.later;
+					auto  job   = std::move(queue.front());
+					queue.pop_front();
 					lock.unlock();
 					job();
 					lock.lock();
@@ -1052,6 +1067,78 @@ struct PipelineCache::ProgramCache {
 		}
 		deferral->wake.notify_one();
 		return job;
+	}
+
+	// The module of a compute record, translated by a helper when it has nothing else to do.
+	std::shared_ptr<DeferredTranslation> DeferLater(std::shared_ptr<const ComputeProgramRecord> record) {
+		StartDeferral();
+		auto job = std::make_shared<DeferredTranslation>();
+		{
+			std::lock_guard lock(deferral->mutex);
+			deferral->later.push_back([this, job, record = std::move(record)] {
+				auto       prepared = std::make_unique<PreparedProgram>();
+				const bool done =
+				    PrepareRecord(*record, *prepared) && prepared->permutations.size() == 1;
+				if (done) job->program = std::move(prepared);
+				job->state.store(done ? DeferredTranslation::Done : DeferredTranslation::Failed,
+				                 std::memory_order_release);
+			});
+		}
+		deferral->wake.notify_one();
+		return job;
+	}
+
+	// A compute dispatch that `served` serves without being the module of the dispatch's own
+	// formats (it reads them at run time: a shader's code-only module): the program's own
+	// module, once a helper has translated it and the precompile has built its pipeline, both
+	// started here at the first such dispatch. Null until then, and for a dispatch whose own
+	// module `served` is. The record is the one RecordExactComputeProgram keeps for the next
+	// session; this session gets its module too, because the run-time formats cost GPU time in
+	// every dispatch.
+	static constexpr size_t MaxOwnModules = 8;
+	template <typename Entry>
+	Permutation* OwnModuleFor(Entry& cached, const Permutation& served, const ShaderParams& params,
+	                          const ShaderComputeInputInfo& input_info, uint32_t push_data_cursor) {
+		if (!g_upgrade_code_only.On() || manifest == nullptr || cached.call_source ||
+		    !build_later || !built_now || served.specialization == cached.specialization ||
+		    ShaderRecompiler::IR::SpecializationServes(cached.resource_plan, served.specialization,
+		                                               cached.specialization, false,
+		                                               &cached.resources)) {
+			return nullptr;
+		}
+		auto&      pending = cached.pending_modules;
+		const auto found   = std::ranges::find_if(pending, [&](const auto& module) {
+			return module.push_data_cursor == push_data_cursor &&
+			       module.specialization == cached.specialization;
+		});
+		if (found == pending.end()) {
+			if (pending.size() >= MaxOwnModules) return nullptr;
+			auto record = std::make_shared<ComputeProgramRecord>(
+			    ExactComputeRecord(params, input_info, push_data_cursor, cached.specialization));
+			const auto key = record->Key();
+			(void)manifest->Add(*record);
+			build_later(record);
+			pending.push_back(
+			    {cached.specialization, push_data_cursor, DeferLater(std::move(record)), key});
+			own_modules_started++;
+			return nullptr;
+		}
+		if (found->job == nullptr) return nullptr;
+		const auto state = found->job->state.load(std::memory_order_acquire);
+		if (state == DeferredTranslation::Running) return nullptr;
+		if (state == DeferredTranslation::Failed) {
+			// Stays listed, so that it is not started again.
+			found->job = nullptr;
+			return nullptr;
+		}
+		if (!built_now(found->record_key)) return nullptr;
+		auto  prepared  = std::move(found->job->program);
+		auto& installed = cached.permutations.emplace_back(std::move(prepared->permutations[0]));
+		installed.handle.id         = ++next_shader_id;
+		installed.handle.record_key = found->record_key;
+		pending.erase(found);
+		own_modules_taken++;
+		return &installed;
 	}
 
 	// Where a deferred translation stands; one that has been running for too long counts as
@@ -1442,6 +1529,10 @@ struct PipelineCache::ProgramCache {
 								RecordExactComputeProgram(std::move(record));
 							}
 						}
+					}
+					if (auto* own =
+					        OwnModuleFor(cached, *permutation, params, input_info, push_data_cursor)) {
+						permutation = own;
 					}
 				}
 				return bind(*permutation);
@@ -1885,6 +1976,9 @@ struct PipelineCache::ProgramCache {
 	// The created compute shaders whose code-only pipelines the precompile has built.
 	std::function<std::vector<std::shared_ptr<const ComputeProgramRecord>>()> code_only_records;
 	std::function<void(std::shared_ptr<const ComputeProgramRecord>)>     build_later;
+	// Whether the session's precompile has built the pipeline of a recorded program, by record
+	// key; may be empty.
+	std::function<bool(uint64_t)> built_now;
 	// First uses of shaders whose code-only module the precompile built: the dispatch's own
 	// module is that one, that one serves the dispatch (and was taken), or neither.
 	uint64_t code_only_same  = 0;
@@ -1934,6 +2028,9 @@ struct PipelineCache::ProgramCache {
 	std::unordered_map<uint64_t, bool> code_may_write;
 	uint64_t                           deferred_plans   = 0;
 	uint64_t                           deferred_modules = 0;
+	// Own modules of dispatches a code-only module served (OwnModuleFor).
+	uint64_t own_modules_started = 0;
+	uint64_t own_modules_taken   = 0;
 	uint64_t                           deferred_failed  = 0;
 	// Compiles the lookahead plans' walkers. Last, so its thread stops before the entries holding
 	// its jobs are destroyed.
@@ -2784,6 +2881,10 @@ void PipelineCache::InitializeDriverCache() {
 		}
 		return built;
 	};
+	m_program_cache->built_now = [this](uint64_t key) {
+		std::lock_guard lock(m_built_keys_mutex);
+		return m_built_keys.contains(key);
+	};
 	m_program_cache->build_later = [this](std::shared_ptr<const ComputeProgramRecord> record) {
 		std::lock_guard lock(m_list_mutex);
 		if (m_precompile_queue == nullptr || m_precompile_only) {
@@ -3029,6 +3130,12 @@ void PipelineCache::EnqueuePrecompileJob(uint64_t key, std::string label, Precom
 		}
 		if (kept.pipeline != nullptr) {
 			m_warm_pipelines.Keep(kept);
+		}
+		// (ProgramCache::built_now: a dispatch waits for this before it takes the module.)
+		if (!m_precompile_only && order < PrecompileCreatedOrder &&
+		    (outcome == PrecompileOutcome::Compiled || outcome == PrecompileOutcome::Cached)) {
+			std::lock_guard lock(m_built_keys_mutex);
+			m_built_keys.insert(key);
 		}
 		// A created shader's code-only build that ended is not queued by later sessions.
 		if (order >= PrecompileCreatedOrder && outcome != PrecompileOutcome::TimedOut &&
@@ -3745,6 +3852,11 @@ void PipelineCache::LogCoverage() {
 		                 programs.code_only_same, programs.code_only_taken,
 		                 programs.code_only_listed, programs.code_only_other);
 	}
+	if (programs.own_modules_started != 0) {
+		PipelineCacheLog("Compute programs this session: {} dispatches served by a code-only "
+		                 "module got their own module built in the background; {} took it",
+		                 programs.own_modules_started, programs.own_modules_taken);
+	}
 	if (const auto warm = m_warm_pipelines.GetCounts(); warm.kept != 0) {
 		PipelineCacheLog("Pipelines the precompile kept ready: {} taken at their first use of {} "
 		                 "kept",
@@ -3848,6 +3960,13 @@ bool PipelineCache::Save() {
 	if (m_compute_from_cache + m_compute_compiled != 0) {
 		PipelineCacheLog("Compute pipelines this session: {} from the driver cache, {} compiled",
 		                 m_compute_from_cache, m_compute_compiled);
+		const auto ms = [](uint64_t ns) { return static_cast<double>(ns) / 1'000'000.0; };
+		PipelineCacheLog("Pipelines created at their first use this session held the GPU thread "
+		                 "for {:.0f} ms (compute) and {:.0f} ms (graphics); {} and {} of them for "
+		                 "5 ms or more, the longest {:.0f} ms and {:.0f} ms",
+		                 ms(m_compute_create.ns), ms(m_graphics_create.ns), m_compute_create.slow,
+		                 m_graphics_create.slow, ms(m_compute_create.longest),
+		                 ms(m_graphics_create.longest));
 	}
 	LogStaleDriverCache();
 	LogCoverage();
@@ -4551,6 +4670,7 @@ PipelineCache::Pipeline* PipelineCache::FindGraphicsPipeline(const CommandBuffer
 	auto       cached     = std::make_unique<Pipeline>();
 	bool       from_driver_cache = false;
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
+	const auto create_start = std::chrono::steady_clock::now();
 	auto job = [&] {
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
@@ -4560,6 +4680,10 @@ PipelineCache::Pipeline* PipelineCache::FindGraphicsPipeline(const CommandBuffer
 		                              nullptr, m_driver_history, &m_warm_pipelines);
 	}();
 	(from_driver_cache ? m_graphics_from_cache : m_graphics_compiled)++;
+	m_graphics_create.Add(static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+	                                                         create_start)
+	        .count()));
 	SupersedePrecompile(record_key);
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
@@ -4618,9 +4742,10 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 	const bool optimized_hangs   = compute_program.record_key != 0 &&
 	                               m_precompile_attempts != nullptr &&
 	                               m_precompile_attempts->TimedOut(compute_program.record_key);
-	auto cached            = std::make_unique<Pipeline>();
-	bool from_driver_cache = false;
-	auto job               = [&] {
+	auto       cached            = std::make_unique<Pipeline>();
+	bool       from_driver_cache = false;
+	const auto create_start      = std::chrono::steady_clock::now();
+	auto       job               = [&] {
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
@@ -4633,6 +4758,10 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 		                              &m_warm_pipelines);
 	}();
 	(from_driver_cache ? m_compute_from_cache : m_compute_compiled)++;
+	m_compute_create.Add(static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+	                                                         create_start)
+	        .count()));
 	SupersedePrecompile(compute_program.record_key);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
