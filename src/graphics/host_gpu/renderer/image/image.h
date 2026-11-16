@@ -45,6 +45,19 @@ struct ImageBinding {
 	bool             shader_write  = false;
 };
 
+// While one is alive on a thread, the image transitions that thread asks for are those of a
+// guest draw's or dispatch's bindings (RenderExecutor::CommitBindings). A shader write such
+// bindings repeat in the same layout and access gets no barrier (Image::GetBarriers).
+class GuestBindings final {
+public:
+	explicit GuestBindings(bool compute) noexcept;
+	~GuestBindings();
+	KYTY_CLASS_NO_COPY(GuestBindings);
+
+private:
+	uint8_t m_outer;
+};
+
 class Image final {
 public:
 	// `memory_class` is the residency class of the backing; depth images are always targets.

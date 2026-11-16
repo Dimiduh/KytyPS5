@@ -223,6 +223,8 @@ struct VulkanImageState {
 	vk::PipelineStageFlags2 pl_stage    = vk::PipelineStageFlagBits2::eAllCommands;
 	vk::AccessFlags2        access_mask = vk::AccessFlagBits2::eNone;
 	vk::ImageLayout         layout      = vk::ImageLayout::eUndefined;
+	// Set by the bindings of a guest draw or dispatch (Image.h: GuestBindings).
+	bool guest = false;
 };
 
 struct VulkanImage {

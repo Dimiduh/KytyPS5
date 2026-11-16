@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 
 #include "common/assert.h"
+#include "common/liveControl.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
@@ -19,6 +20,36 @@
 #include <xxhash.h>
 
 namespace Libs::Graphics {
+
+// For `measure`: image transitions that recorded barriers (each ends the render pass and orders
+// the pending dispatches), and barriers that only repeat a shader write in the same layout and
+// access (one per subresource).
+Common::LiveControl::Counter g_image_barriers("image_barriers");
+Common::LiveControl::Counter g_image_repeat_barriers("image_repeat_barriers");
+
+// 1: guest draws that repeat a shader write of an image in the same layout and access get no
+// barrier between them. On the console nothing orders the storage writes of consecutive draws
+// either; the guest's own flushes do (CommandBuffer::GuestFlush: a barrier over all commands).
+// The barrier per binding ended the render pass each time: in Saros about 210 a frame (pixel
+// shaders that update a storage image), 29.9-30.4 -> 31.0-31.2 fps at one spot. A repeated write
+// after any other access (a dispatch, an upload, a copy, the emulator's own passes) keeps its
+// barrier.
+// 2: guest dispatches too (the DS fork does this for Demon's Souls). NOT for Saros: its
+// dispatches depend on each other through storage images without a flush the tracker sees,
+// and the barrier per binding, which also orders every pending dispatch, is what keeps them
+// in order (940 a frame; without it the lighting turns to noise).
+// 0: a barrier before every repeated write.
+Common::LiveControl::Switch g_guest_image_writes("guest_image_writes", 1);
+
+// 0: none; 1: a draw's; 2: a dispatch's.
+thread_local uint8_t t_guest_bindings = 0;
+
+GuestBindings::GuestBindings(bool compute) noexcept
+    : m_outer(std::exchange(t_guest_bindings, static_cast<uint8_t>(compute ? 2 : 1))) {}
+
+GuestBindings::~GuestBindings() {
+	t_guest_bindings = m_outer;
+}
 
 namespace {
 
@@ -157,6 +188,8 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 	                                        vk::AccessFlagBits2::eShaderWrite |
 	                                        vk::AccessFlagBits2::eMemoryWrite;
 
+	const bool guest = t_guest_bindings != 0 && g_guest_image_writes.Get() >= t_guest_bindings;
+
 	Barriers barriers;
 	if (partial || has_subresource_states) {
 		const ImageSubresourceRange requested =
@@ -187,7 +220,12 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 				auto& subresource_state = subresource_states[index];
 
 				const bool repeated_write =
-				    static_cast<bool>(subresource_state.access_mask & write_access);
+				    static_cast<bool>(subresource_state.access_mask & write_access) &&
+				    !(guest && subresource_state.guest);
+				if (subresource_state.layout == destination_layout &&
+				    subresource_state.access_mask == destination_access && repeated_write) {
+					g_image_repeat_barriers.Add();
+				}
 				if (subresource_state.layout != destination_layout ||
 				    subresource_state.access_mask != destination_access || repeated_write) {
 					vk::ImageMemoryBarrier2 barrier {};
@@ -206,7 +244,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 					barrier.subresourceRange.baseArrayLayer = layer;
 					barrier.subresourceRange.layerCount     = 1;
 					barriers.push_back(barrier);
-					subresource_state = {destination_stage, destination_access, destination_layout};
+					subresource_state = {destination_stage, destination_access, destination_layout, guest};
 				}
 			}
 		}
@@ -214,7 +252,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		if (!partial) {
 			subresource_states.clear();
 		}
-		state = {destination_stage, destination_access, destination_layout};
+		state = {destination_stage, destination_access, destination_layout, guest};
 		if (partial && !(destination_access & write_access)) {
 			m_settled = SettledTransition {backing.image,
 			                               destination_layout,
@@ -227,10 +265,14 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		return barriers;
 	} else {
 		m_settled.reset();
-		const bool repeated_write = static_cast<bool>(state.access_mask & write_access);
+		const bool repeated_write =
+		    static_cast<bool>(state.access_mask & write_access) && !(guest && state.guest);
 		if (state.layout == destination_layout && state.access_mask == destination_access &&
 		    !repeated_write) {
 			return {};
+		}
+		if (state.layout == destination_layout && state.access_mask == destination_access) {
+			g_image_repeat_barriers.Add();
 		}
 
 		vk::ImageMemoryBarrier2 barrier {};
@@ -258,7 +300,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 	    })) {
 		HeapChanged();
 	}
-	state = {destination_stage, destination_access, destination_layout};
+	state = {destination_stage, destination_access, destination_layout, guest};
 	return barriers;
 }
 
@@ -280,6 +322,7 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	if (barriers.empty()) {
 		return;
 	}
+	g_image_barriers.Add();
 	m_scheduler.EndRendering();
 	m_scheduler.OrderDispatches();
 	vk::DependencyInfo dependency {};

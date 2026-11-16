@@ -2,6 +2,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/gpuTiming.h"
+#include "common/liveControl.h"
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -17,6 +18,11 @@
 #include <bit>
 #include <cstring>
 namespace Libs::Graphics {
+
+// For `measure`: render pass instances begun (a draw whose targets or state differ from the
+// open instance's, or the first draw after anything that ended it: a barrier, an upload, a
+// dispatch).
+static Common::LiveControl::Counter g_render_passes("render_passes");
 
 CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
     : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()) {
@@ -358,6 +364,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	}
 	const bool ordered = m_rendering && m_render_passes == m_indirect_reads_since;
 	EndRendering();
+	g_render_passes.Add();
 
 	std::array<vk::RenderingAttachmentInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
 	for (uint32_t i = 0; i < state.num_color_attachments; i++) {

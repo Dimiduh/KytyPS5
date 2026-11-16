@@ -1550,6 +1550,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
 	KYTY_PROFILER_FUNCTION();
+	// Every image transition below is one of the bindings of the guest draw or dispatch that
+	// follows.
+	const GuestBindings guest_bindings(pipeline_bind_point == vk::PipelineBindPoint::eCompute);
 	// Binding commands access no memory. Image transitions order pending dispatches first.
 	auto                           vk_buffer              = buffer.StateHandle();
 	size_t                         image_descriptor_count = 0;
