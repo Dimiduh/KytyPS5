@@ -3717,8 +3717,8 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	// (ProgramCache::Deferral): what PendingDrawSkipBlocker asks of a draw whose pipeline is
 	// being built, as far as the registers say it; that no stage stores anywhere is asked of
 	// each program (MayDeferStage). A draw that clears depth or stencil or renders to a linear
-	// target is not.
-	bool may_defer = m_skip_pending_draws && !tess_active;
+	// target is not, and none is without a skip window.
+	bool may_defer = m_skip_pending_draws && m_skip_window > m_skip_window.zero() && !tess_active;
 	if (may_defer) {
 		const auto& rc = context.GetRenderControl();
 		may_defer      = !rc.depth_clear_enable && !rc.stencil_clear_enable;

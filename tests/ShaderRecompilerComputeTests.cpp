@@ -26692,8 +26692,24 @@ public:
                 PipelineCacheTestAccess::SetSkipPendingDraws(
                     pipelines, true, std::chrono::hours(1)),
                 "the pipeline cache has no background compile queue");
-        Require(name, "pending draw skipped",
+        // A program nothing has translated goes to a helper thread first, its
+        // plans and then the module of the draw's resources, and the draw is
+        // left out meanwhile like one whose pipeline is still building.
+        Require(name, "pending draw while its program is translated",
                 untouched(draw_pixel(1)) &&
+                    PipelineCacheTestAccess::PendingBuilds(pipelines) == 0,
+                "a draw whose pixel program had no translation yet was not "
+                "left out while a helper thread translated it");
+        auto pending = draw_pixel(1);
+        for (int tries = 0;
+             tries < 5000 && untouched(pending) &&
+             PipelineCacheTestAccess::PendingBuilds(pipelines) == 0;
+             tries++) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          pending = draw_pixel(1);
+        }
+        Require(name, "pending draw skipped",
+                untouched(pending) &&
                     PipelineCacheTestAccess::PendingBuilds(pipelines) == 1,
                 "a draw whose pipeline was still building changed its target");
         PipelineCacheTestAccess::WaitForBackgroundBuilds(pipelines);
