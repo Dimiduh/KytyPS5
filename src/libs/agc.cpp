@@ -648,10 +648,26 @@ int KYTY_SYSV_ABI AgcCreateShader(Shader** dst, void* header, const volatile voi
 
 	const auto hash = ShaderMapUserData(base, map);
 
-	ShaderNoteCreatedCode({.binary_type = static_cast<uint8_t>(h->type),
-	                       .hash        = hash,
-	                       .code        = std::span(reinterpret_cast<const uint32_t*>(base),
-	                                                map.code_size_bytes / sizeof(uint32_t))});
+	ShaderCreatedCode noted {.binary_type = static_cast<uint8_t>(h->type),
+	                         .hash        = hash,
+	                         .code        = std::span(reinterpret_cast<const uint32_t*>(base),
+	                                                  map.code_size_bytes / sizeof(uint32_t))};
+	if (h->cx_registers != nullptr) {
+		noted.cx_registers = std::span(h->cx_registers, h->num_cx_registers);
+	}
+	if (h->sh_registers != nullptr) {
+		noted.sh_registers = std::span(h->sh_registers, h->num_sh_registers);
+	}
+	if (h->input_semantics != nullptr) {
+		noted.input_semantics = std::span(h->input_semantics, h->num_input_semantics);
+	}
+	if (h->output_semantics != nullptr) {
+		noted.output_semantics = std::span(h->output_semantics, h->num_output_semantics);
+	}
+	if (h->specials != nullptr) {
+		noted.shader_stages_en = h->specials->vgt_shader_stages_en.value;
+	}
+	ShaderNoteCreatedCode(noted);
 	if (map.type == Prospero::ShaderBinaryType::kCs && h->sh_registers != nullptr &&
 	    h->specials != nullptr) {
 		ShaderCreatedCompute created;
@@ -4141,6 +4157,22 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWaitUntilSafeForRendering(CommandBuffer* buf,
 }
 
 } // namespace Gen5
+
+void ShaderInterpolantSettings(std::span<const ShaderSemantic> vertex_outputs,
+                               std::span<const ShaderSemantic> pixel_inputs,
+                               std::span<uint32_t, 32>         settings) {
+	Shader vertex {};
+	Shader pixel {};
+	vertex.output_semantics     = const_cast<ShaderSemantic*>(vertex_outputs.data());
+	vertex.num_output_semantics = static_cast<uint16_t>(vertex_outputs.size());
+	pixel.input_semantics       = const_cast<ShaderSemantic*>(pixel_inputs.data());
+	pixel.num_input_semantics   = static_cast<uint32_t>(pixel_inputs.size());
+	std::array<ShaderRegister, 32> registers {};
+	(void)Gen5::AgcCreateInterpolantMapping(registers.data(), &vertex, &pixel);
+	for (size_t i = 0; i < registers.size(); i++) {
+		settings[i] = registers[i].value;
+	}
+}
 
 namespace Gen5Driver {
 

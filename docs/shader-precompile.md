@@ -32,7 +32,12 @@ graphics stages and 85 graphics pipelines.
    texture channel orders, level counts), so one module serves whatever the game binds. The same
    modules are translated again in the background at every start (about 45 s on 8 threads,
    `--prepare-threads`), and a first use takes one without translating anything.
-4. **New graphics shaders off the GPU thread** (`--skip-pending-draws`, the launcher's "Never
+4. **Graphics pipelines of shader pairs** (`shader-pairs/<title>.pairs`, see
+   `shader-pairs/README.md`): vertex and pixel shaders of the game's files that are likely drawn
+   together, each pair built into the pipeline of a recorded one of the same kind. This is a
+   guess, because the game's files do not say which shaders are drawn together or how: it
+   provides a third to a half of the pipelines of a part of the game no session has seen.
+5. **New graphics shaders off the GPU thread** (`--skip-pending-draws`, the launcher's "Never
    wait for a new graphics shader"): the translation of a stage nothing has translated and the
    build of its pipeline both happen on helper threads, and the draws that need them are left
    out until they are there: an object appears a few frames late instead of the game stopping.
@@ -46,16 +51,19 @@ graphics driver update:
 .\run-windows.ps1 -Precompile -Game <game>
 ```
 
-A first pass compiles everything (about 14,000 pipelines for Saros, 25 to 30 minutes on the PC
-above, a 1 GB cache); a later one only what changed.
+A first pass compiles everything (for Saros about 14,000 compute pipelines and 23,000 graphics
+pipelines of shader pairs, 50 to 60 minutes on the PC above, a cache of a little over 2 GB); a
+later one only what changed.
 
 ## What is still compiled during play
 
 - Compute shaders that pick their textures from a table the GPU selects from: the table's size is
   built into the module, so the first use compiles, and so does a use with a larger table.
   Integer textures read through a filtering sampler, and bindless texture heaps.
-- Graphics pipelines no session and no list has recorded. They are built in the background (4);
-  nothing prepares them before play.
+- Graphics pipelines no session and no list has recorded and no shader pair has guessed (4):
+  half or more of those of a new part of the game. They are built in the background (5). Only
+  recordings are complete: a place that has been shown once, here or on the PC a pipeline list
+  comes from, is ready the next time.
 
 ## NVIDIA's shader disk cache
 

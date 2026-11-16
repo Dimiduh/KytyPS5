@@ -68,6 +68,11 @@ struct GraphicsStageRecord {
 	ShaderRecompiler::IR::ResourceSpecialization specialization;
 	// Hash of the SPIR-V the recording build emitted; not part of the key.
 	uint64_t spirv_hash = 0;
+	// Not stored and not part of the key: the module is the one of the specialization the
+	// translated code gives by itself (ShaderRecompiler::IR::CodeOnlySpecialization) instead of
+	// `specialization`: a stage the precompile makes for a shader no session has drawn with
+	// (PipelineCache::QueueShaderPairs), whose first draw takes that module when it serves.
+	bool code_only = false;
 
 	// Sets the code and the ids that name it.
 	void                                       SetCode(ShaderCode front, ShaderCode back);

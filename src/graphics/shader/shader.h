@@ -11,6 +11,7 @@
 #include <cstring>
 #include <filesystem>
 #include <functional>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -393,7 +394,46 @@ struct ShaderCreatedCode {
 	uint8_t                   binary_type = 0;
 	uint64_t                  hash        = 0;
 	std::span<const uint32_t> code;
+	// From the shader's header, for ShaderHeaderFacts.
+	std::span<const ShaderRegister> cx_registers;
+	std::span<const ShaderRegister> sh_registers;
+	std::span<const ShaderSemantic> input_semantics;
+	std::span<const ShaderSemantic> output_semantics;
+	// VGT_SHADER_STAGES_EN of the header's special registers, when it has them.
+	std::optional<uint32_t> shader_stages_en;
 };
+// What a graphics shader's header says about the way it is drawn: the context registers the game
+// sets with it, the registers of its program, and its semantics (a vertex shader's outputs and a
+// pixel shader's inputs are the interface between the two).
+struct ShaderHeaderFacts {
+	std::vector<ShaderRegister> cx_registers;
+	std::vector<ShaderRegister> sh_registers;
+	std::vector<ShaderSemantic> input_semantics;
+	std::vector<ShaderSemantic> output_semantics;
+	std::optional<uint32_t>     shader_stages_en;
+};
+// Puts into `info`, the static input of a plain vertex stage (ShaderType::Vertex) recorded with
+// another vertex shader, what a draw of the vertex-side shader `vertex` has from the shader's
+// own registers instead (PA_CL_VS_OUT_CNTL, the wave size). The vertex buffers `info` describes
+// belong to the mesh and stay. False for a shader that does not run as a plain vertex stage (a
+// merged or NGG workgroup shader).
+[[nodiscard]] bool ShaderDeriveVertexInput(const ShaderHeaderFacts& vertex,
+                                           ShaderVertexInputInfo&   info);
+// Puts into `info`, the static input of a draw of another pixel shader in the same pass, what a
+// draw of the pixel shader `pixel` with the vertex-side shader `vertex` has instead: everything
+// that comes from the pixel shader's own registers (its inputs, its LDS, its wave size) and the
+// interpolator settings the game computes from the two shaders' semantics. The rest of `info`
+// (targets, blending, primitive mode) belongs to the pass and stays. False, with `info` as it
+// was, for a header whose registers no draw could have (more inputs than there are
+// interpolators, inputs that are enabled without an address).
+[[nodiscard]] bool ShaderDerivePixelInput(const ShaderHeaderFacts& pixel,
+                                          const ShaderHeaderFacts& vertex,
+                                          ShaderPixelInputInfo&    info);
+// The SPI_PS_INPUT_CNTL values sceAgcCreateInterpolantMapping gives for a vertex-side shader's
+// output semantics and a pixel shader's input semantics (src/libs/agc.cpp); at most 32 inputs.
+void ShaderInterpolantSettings(std::span<const ShaderSemantic> vertex_outputs,
+                               std::span<const ShaderSemantic> pixel_inputs,
+                               std::span<uint32_t, 32>         settings);
 // Receives every created shader on the creating guest thread, like the compute sink.
 void     ShaderSetCreatedCodeSink(std::function<void(const ShaderCreatedCode&)> sink);
 void     ShaderNoteCreatedCode(const ShaderCreatedCode& shader);

@@ -273,6 +273,10 @@ std::filesystem::path ImportShadersPath() {
 	return g_config->import_shaders;
 }
 
+std::filesystem::path ShaderPairsPath() {
+	return g_config->shader_pairs;
+}
+
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }

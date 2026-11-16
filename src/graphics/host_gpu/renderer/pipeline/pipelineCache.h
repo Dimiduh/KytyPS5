@@ -457,6 +457,21 @@ private:
 	struct PrecompiledStage;
 	std::mutex                                                      m_stage_memo_mutex;
 	std::unordered_map<uint64_t, std::shared_ptr<PrecompiledStage>> m_stage_memo;
+	// Shader pairs (QueueShaderPairs). The graphics pipelines queued for the precompile, by
+	// record key: the patterns a pair names; and the shaders of the pairs, whose first draws
+	// take their code-only modules. Guarded by m_list_mutex.
+	struct PipelinePattern {
+		std::shared_ptr<const GraphicsPipelineRecord>           record;
+		std::vector<std::shared_ptr<const GraphicsStageRecord>> stages;
+	};
+	std::unordered_map<uint64_t, PipelinePattern> m_pipeline_patterns;
+	std::unordered_set<uint64_t>                  m_pair_shaders;
+	// The headers of the created graphics shaders, by program hash (ShaderHeaderFacts): what a
+	// pair's pixel stage takes from its own shader. One program can ship with several headers
+	// (the same code drawn in several passes); each is kept. Guarded by its mutex.
+	using ShaderFactsList = std::vector<std::shared_ptr<const ShaderHeaderFacts>>;
+	std::mutex                                    m_shader_facts_mutex;
+	std::unordered_map<uint64_t, ShaderFactsList> m_shader_facts;
 	// Graphics pipelines created this session: from the driver cache or compiled, and whether a
 	// record (local or imported) predicted them.
 	uint64_t m_graphics_from_cache = 0;
@@ -514,6 +529,20 @@ private:
 	void        ImportPipelineList();
 	void        SetCreatedCode(std::unique_ptr<ShaderCodeStore> store);
 	void        ReleasePrecompiledStages();
+	// The translation of a stage for the precompile, made once (null when it cannot be made).
+	std::shared_ptr<PrecompiledStage> PrecompiledStageOf(const GraphicsStageRecord& stage);
+	// Queues the pipelines of the shader pairs in the file --shader-pairs names; returns how
+	// many it queued and adds those earlier sessions finished to `finished_before`.
+	uint64_t          QueueShaderPairs(uint64_t& finished_before);
+	// One shader of a pair: its code and the user data count its own header gives.
+	struct PairShader {
+		ShaderCode                               code;
+		uint32_t                                 user_data_count = 0;
+		ShaderFactsList                          facts;
+	};
+	PrecompileOutcome PrecompileShaderPair(const PipelinePattern& pattern, PairShader vertex,
+	                                       PairShader pixel, PipelineBuildMode mode,
+	                                       const std::atomic<bool>* cancel, KeptPipeline* keep);
 	static bool TranslateRecordedStage(GraphicContext& graphics, const GraphicsStageRecord& record,
 	                                   PrecompiledStage& out);
 	PrecompileOutcome

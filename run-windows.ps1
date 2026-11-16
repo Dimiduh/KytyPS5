@@ -42,6 +42,12 @@
 #                                            stands for its <title id>.pipelinelist. Default: the pipeline-lists
 #                                            folder next to this script, if there is one; none: no list
 #   .\run-windows.ps1 -ExportPipelineList <file>   write what this data folder has recorded as such a list, then exit
+#   .\run-windows.ps1 -ShaderPairs <file>    a list of the vertex and pixel shaders of the game's files that are
+#                                            drawn together (no shader code; shader-pairs\README.md): -Precompile
+#                                            builds their graphics pipelines before any session has drawn with
+#                                            them, and a session takes those. A folder stands for its
+#                                            <title id>.pairs. Default: the shader-pairs folder next to this
+#                                            script, if there is one; none: no list
 #   .\run-windows.ps1 -FrameGen 1            DLSS frame generation: the number of generated frames per rendered
 #                                            one (1 = 2x, up to 5 = 6x; NVIDIA RTX 40 or newer, 2 and up RTX 50;
 #                                            the GPU's maximum is taken when more is asked for). Needs NVIDIA's
@@ -86,6 +92,7 @@ param(
 	[ValidateSet('', 'on', 'off')][string]$SkipPendingDraws = '',
 	[string]$PipelineList = '',
 	[string]$ExportPipelineList = '',
+	[string]$ShaderPairs = '',
 	[ValidateRange(-1, 5)][int]$FrameGen = -1,
 	[string]$StreamlineDir = '',
 	[ValidateSet('', 'off', 'file', 'console')][string]$Log = '',
@@ -246,6 +253,18 @@ if ($PipelineList -eq 'none') {
 }
 if ($ExportPipelineList) {
 	Set-Option '--export-pipeline-list' ($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ExportPipelineList))
+}
+# -ShaderPairs: which vertex and pixel shaders of the game's files are drawn together (--shader-pairs), each pair
+# with a recorded pipeline of the same kind. The precompile pass builds the pipelines of those pairs, so that a
+# material no session has shown is ready too; a session needs the list to take them. Without -ShaderPairs, the lists
+# next to this script (shader-pairs\<title id>.pairs) are offered. -ShaderPairs none: no list at all.
+if ($ShaderPairs -eq 'none') {
+	$at = $options.IndexOf('--shader-pairs')
+	if ($at -ge 0) { $options.RemoveRange($at, 2) }
+} elseif ($ShaderPairs) {
+	Set-Option '--shader-pairs' ($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ShaderPairs))
+} elseif ($options.IndexOf('--shader-pairs') -lt 0 -and (Test-Path -LiteralPath "$PSScriptRoot\shader-pairs" -PathType Container)) {
+	Set-Option '--shader-pairs' "$PSScriptRoot\shader-pairs"
 }
 # -Log: the emulator's own log (--printf-direction). What the pipeline cache and the precompile report reaches the
 # run log (the emulator's console output, logs\<time>.out.log) in every mode.

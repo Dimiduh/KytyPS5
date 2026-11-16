@@ -601,9 +601,13 @@ struct PipelineCache::ProgramCache {
 	// False when the record no longer translates to its specialization.
 	// `code_only`: a created compute shader's record, which has no specialization: the module is
 	// the one the precompile built from its code alone (PrecompileComputeProgram).
+	// `serve_for`: the resources of the draw a stage record with code_only was made for: its
+	// module is the code-only one when that is the record's specialization or serves it there,
+	// and the record's own otherwise.
 	template <typename Record>
 	bool PrepareRecord(const Record& record, PreparedProgram& prepared, bool code_only = false,
-	                   bool plan_only = false) const {
+	                   bool                                          plan_only = false,
+	                   const ShaderRecompiler::IR::ResourceSnapshot* serve_for = nullptr) const {
 		ProgramKey                       key;
 		ShaderComputeInputInfo           compute {};
 		ShaderVertexInputInfo            vertex {};
@@ -664,6 +668,20 @@ struct PipelineCache::ProgramCache {
 				auto from_code = ShaderRecompiler::IR::CodeOnlySpecialization(translated.program);
 				if (!from_code.has_value()) return false;
 				specialization = std::move(*from_code);
+			}
+			if constexpr (!std::is_same_v<Record, ComputeProgramRecord>) {
+				if (record.code_only && !plan_only) {
+					auto from_code = ShaderRecompiler::IR::CodeOnlySpecialization(translated.program);
+					if (from_code.has_value() &&
+					    (*from_code == specialization ||
+					     (serve_for != nullptr &&
+					      ShaderRecompiler::IR::SpecializationServes(
+					          ShaderRecompiler::IR::ExtractResourcePlan(
+					              translated.program, ShaderRecompiler::IR::SrtWalkerLoads::Reader),
+					          *from_code, specialization, true, serve_for)))) {
+						specialization = std::move(*from_code);
+					}
+				}
 			}
 			// `plan_only`: the plans of a program whose draw has no specialization yet.
 			// A recompiler change may give the shader other resources than the record was made
@@ -1009,16 +1027,19 @@ struct PipelineCache::ProgramCache {
 
 	// Hands a stage's translation to the helpers: its plans (`plan_only`), or the module of the
 	// record's specialization.
-	std::shared_ptr<DeferredTranslation> Defer(std::shared_ptr<GraphicsStageRecord> record,
-	                                           bool                                 plan_only) {
+	std::shared_ptr<DeferredTranslation>
+	Defer(std::shared_ptr<GraphicsStageRecord> record, bool plan_only,
+	      std::shared_ptr<const ShaderRecompiler::IR::ResourceSnapshot> resources = nullptr) {
 		StartDeferral();
 		auto job = std::make_shared<DeferredTranslation>();
 		{
 			std::lock_guard lock(deferral->mutex);
-			deferral->jobs.push_back([this, job, record = std::move(record), plan_only] {
+			deferral->jobs.push_back([this, job, record = std::move(record), plan_only,
+			                          resources = std::move(resources)] {
 				auto       prepared = std::make_unique<PreparedProgram>();
-				const bool done     = PrepareRecord(*record, *prepared, false, plan_only) &&
-				                      (plan_only || prepared->permutations.size() == 1);
+				const bool done =
+				    PrepareRecord(*record, *prepared, false, plan_only, resources.get()) &&
+				    (plan_only || prepared->permutations.size() == 1);
 				if (done) job->program = std::move(prepared);
 				job->state.store(done ? DeferredTranslation::Done : DeferredTranslation::Failed,
 				                 std::memory_order_release);
@@ -1607,11 +1628,18 @@ struct PipelineCache::ProgramCache {
 					       module.specialization == specialization;
 				});
 				if (found == pending.end()) {
-					pending.push_back(
-					    {specialization, push_data_cursor,
-					     Defer(StageRecordOf(stage, params, input_info, push_data_cursor,
-					                         specialization),
-					           false)});
+					auto record =
+					    StageRecordOf(stage, params, input_info, push_data_cursor, specialization);
+					// A shader the precompile built pair pipelines for: its code-only module
+					// when that serves this draw (see below), judged with the draw's images.
+					std::shared_ptr<ShaderRecompiler::IR::ResourceSnapshot> resources;
+					if (stage_code_only && stage_code_only(params.hash)) {
+						record->code_only = true;
+						resources = std::make_shared<ShaderRecompiler::IR::ResourceSnapshot>();
+						resources->images = entry->second.resources.images;
+					}
+					pending.push_back({specialization, push_data_cursor,
+					                   Defer(std::move(record), false, std::move(resources))});
 					deferred_modules++;
 					deferred = true;
 					return {};
@@ -1636,6 +1664,21 @@ struct PipelineCache::ProgramCache {
 				}
 				deferred_failed++;
 				translated = ShaderRecompiler::TranslateProgram(params.code, options);
+			}
+			// A shader the precompile built pipelines for from the code of a shader pair no
+			// session had drawn (PipelineCache::QueueShaderPairs): the module that code gives
+			// by itself is taken when it is this draw's or serves it, so that the pipeline the
+			// draw creates is the one the precompile built. Like a compute shader's code-only
+			// module, it reads formats at run time that the draw's own module has compiled in.
+			if (!entry->second.call_source && stage_code_only && stage_code_only(params.hash)) {
+				auto code_only = ShaderRecompiler::IR::CodeOnlySpecialization(translated.program);
+				if (code_only.has_value() &&
+				    (*code_only == specialization ||
+				     ShaderRecompiler::IR::SpecializationServes(
+				         entry->second.resource_plan, *code_only, specialization, true,
+				         &entry->second.resources))) {
+					specialization = std::move(*code_only);
+				}
 			}
 		}
 		entry->second.permutations.push_back(CompilePermutation(
@@ -1811,6 +1854,9 @@ struct PipelineCache::ProgramCache {
 	// precompile built it), by shader hash; and the build of a program record on the precompile
 	// queue. Null without a driver cache file.
 	std::function<bool(uint64_t)>                                        code_only_built;
+	// Whether the precompile built pipelines with the code-only module of a graphics shader, by
+	// shader hash (the shader pairs); may be empty.
+	std::function<bool(uint64_t)> stage_code_only;
 	// The created compute shaders whose code-only pipelines the precompile has built.
 	std::function<std::vector<std::shared_ptr<const ComputeProgramRecord>>()> code_only_records;
 	std::function<void(std::shared_ptr<const ComputeProgramRecord>)>     build_later;
@@ -2035,22 +2081,35 @@ bool PipelineCache::TranslateRecordedStage(GraphicContext&            graphics,
 		options.dump_label = "Precompile VS";
 	}
 	std::optional<ShaderRecompiler::CompileResult> result;
+	// No draw has used the shader of a code-only stage, and it may never be used: its module
+	// stays out of the simplification store, which every session reads whole.
+	std::optional<ShaderRecompiler::Spirv::SimplifiedStoreBypass> unstored;
+	if (record.code_only) {
+		unstored.emplace();
+	}
 	try {
 		const Common::RecoverableFatalScope recoverable;
 		auto source = ShaderRecompiler::PrepareShaderSource(*record.code, options);
 		if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) {
 			return false;
 		}
-		auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
-		if (!ShaderRecompiler::IR::SpecializationApplies(translated.program,
-		                                                 record.specialization)) {
+		auto translated     = ShaderRecompiler::TranslateProgram(source.decoded, options);
+		auto specialization = record.specialization;
+		if (record.code_only) {
+			auto from_code = ShaderRecompiler::IR::CodeOnlySpecialization(translated.program);
+			if (!from_code.has_value()) return false;
+			specialization = std::move(*from_code);
+		}
+		if (!ShaderRecompiler::IR::SpecializationApplies(translated.program, specialization)) {
 			return false;
 		}
-		result = ShaderRecompiler::CompileProgram(std::move(translated), options,
-		                                          record.specialization, record.push_data_cursor);
+		result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization,
+		                                          record.push_data_cursor);
 	} catch (const Common::RecoverableFatal& fatal) {
-		PipelineCacheLog("Precompile: recorded stage {:016x} cannot be translated: {}",
-		                 record.shader_hash, fatal.message);
+		if (!record.code_only) {
+			PipelineCacheLog("Precompile: recorded stage {:016x} cannot be translated: {}",
+			                 record.shader_hash, fatal.message);
+		}
 		return false;
 	}
 	if (!ValidateShaderSpirv(options.dump_label, record.shader_hash, result->spirv,
@@ -2069,6 +2128,130 @@ bool PipelineCache::TranslateRecordedStage(GraphicContext&            graphics,
 	return true;
 }
 
+std::shared_ptr<PipelineCache::PrecompiledStage>
+PipelineCache::PrecompiledStageOf(const GraphicsStageRecord& stage) {
+	std::shared_ptr<PrecompiledStage> memo;
+	{
+		std::lock_guard lock(m_stage_memo_mutex);
+		auto&           entry = m_stage_memo[stage.Key()];
+		if (entry == nullptr) entry = std::make_shared<PrecompiledStage>();
+		memo = entry;
+	}
+	std::lock_guard lock(memo->mutex);
+	if (!memo->done) {
+		memo->done   = true;
+		memo->failed = !TranslateRecordedStage(m_graphics, stage, *memo);
+	}
+	return memo->failed ? nullptr : memo;
+}
+
+// A graphics pipeline for a vertex and pixel shader no session has drawn with, patterned on a
+// pipeline one has. From the pattern: the render state, the vertex input, and of the two stage
+// inputs what belongs to the mesh and the pass (vertex buffers, targets, blending). From the
+// pair: its code, its user data counts, and what a draw's registers hold of the two shaders'
+// own headers (ShaderDeriveVertexInput, ShaderDerivePixelInput), with the stage modules the
+// code gives by itself (GraphicsStageRecord::code_only). The stages are translated as a draw
+// translates them: the pixel stage first, whose shader data moves the push-data cursor the
+// vertex stage starts at. What comes out is the pipeline a first draw of the pair creates when
+// the pair is drawn in the pattern's pass with a mesh like the pattern's; a pair drawn another
+// way has only cost the precompile time. Skipped: a pair whose headers do not fit the pattern
+// (a pixel shader of another pass, a merged vertex shader for a plain pattern or the reverse).
+PrecompileOutcome PipelineCache::PrecompileShaderPair(const PipelinePattern& pattern,
+                                                      PairShader vertex_shader, PairShader pixel_shader,
+                                                      PipelineBuildMode        mode,
+                                                      const std::atomic<bool>* cancel,
+                                                      KeptPipeline*            keep) {
+	const auto stage_of = [](const GraphicsStageRecord& like, const PairShader& shader,
+	                         uint32_t cursor) {
+		auto stage = std::make_shared<GraphicsStageRecord>(like);
+		stage->SetCode(shader.code, nullptr);
+		stage->shader_hash      = stage->code_id.hash;
+		stage->user_data_count  = shader.user_data_count;
+		stage->specialization   = {};
+		stage->spirv_hash       = 0;
+		stage->push_data_cursor = cursor;
+		stage->code_only        = true;
+		return stage;
+	};
+	const auto& like_vertex = *pattern.stages.front();
+	const bool  has_pixel   = pattern.record->pixel_stage != 0;
+	const auto  start = (has_pixel ? pattern.stages.back() : pattern.stages.front())->push_data_cursor;
+	// What the vertex stage's input has from its own shader (the pattern's vertex shader need
+	// only take the same vertex inputs). A merged shader, which runs as a mesh stage, keeps the
+	// pattern's input whole: the pairs file names one only with a pattern whose shader has the
+	// same registers.
+	const auto vertex_input = [&](const ShaderHeaderFacts& facts, ShaderVertexInputInfo& info) {
+		if (like_vertex.stage == ShaderType::Vertex) {
+			return ShaderDeriveVertexInput(facts, info);
+		}
+		return like_vertex.stage == ShaderType::Mesh && facts.shader_stages_en.has_value() &&
+		       (*facts.shader_stages_en & 0x20u) != 0;
+	};
+	const auto build = [&](const ShaderHeaderFacts&             vertex_facts,
+	                       std::shared_ptr<GraphicsStageRecord> pixel) {
+		auto cursor = start;
+		if (pixel != nullptr) {
+			const auto made = PrecompiledStageOf(*pixel);
+			if (made == nullptr) {
+				return PrecompileOutcome::Skipped;
+			}
+			made->program->bindings.AdvancePushData(cursor);
+		}
+		std::vector<std::shared_ptr<const GraphicsStageRecord>> stages;
+		const auto vertex = stage_of(like_vertex, vertex_shader, cursor);
+		if (!vertex_input(vertex_facts, vertex->vertex)) {
+			return PrecompileOutcome::Skipped;
+		}
+		stages.push_back(vertex);
+		if (pixel != nullptr) {
+			stages.push_back(pixel);
+		}
+		auto record               = *pattern.record;
+		record.vertex_stages      = {vertex->Key(), 0, 0};
+		record.vertex_stage_count = 1;
+		record.pixel_stage        = pixel != nullptr ? pixel->Key() : 0;
+		return PrecompileGraphicsPipeline(record, stages, mode, cancel, keep);
+	};
+	// A program that ships with several headers gets a pipeline for each that fits the pattern
+	// and gives other stage inputs. The pixel stage's input has from its own shader, and from
+	// the vertex shader it is drawn with, what the pattern's pixel shader need not share: that
+	// one need only be of the same pass.
+	static const ShaderFactsList NoPixel {nullptr};
+	auto                         outcome = PrecompileOutcome::Skipped;
+	std::unordered_set<uint64_t> built;
+	for (const auto& pixel_facts: has_pixel ? pixel_shader.facts : NoPixel) {
+		for (const auto& vertex_facts: vertex_shader.facts) {
+			auto probe = like_vertex.vertex;
+			if (!vertex_input(*vertex_facts, probe)) {
+				continue;
+			}
+			std::shared_ptr<GraphicsStageRecord> pixel;
+			if (has_pixel) {
+				pixel = stage_of(*pattern.stages.back(), pixel_shader, start);
+				if (!ShaderDerivePixelInput(*pixel_facts, *vertex_facts, pixel->pixel)) {
+					continue;
+				}
+			}
+			const auto variant = (pixel != nullptr ? pixel->Key() : 0) ^
+			                     (uint64_t {probe.pa_cl_vs_out_cntl} << 32u) ^
+			                     (uint64_t {probe.wave_size} << 20u);
+			if (!built.insert(variant).second) {
+				continue;
+			}
+			// The outcome of the pair is that of its pipelines: compiled when any was.
+			const auto one = build(*vertex_facts, std::move(pixel));
+			if (one == PrecompileOutcome::TimedOut) {
+				return one;
+			}
+			if (one == PrecompileOutcome::Compiled ||
+			    (one == PrecompileOutcome::Cached && outcome == PrecompileOutcome::Skipped)) {
+				outcome = one;
+			}
+		}
+	}
+	return outcome;
+}
+
 PrecompileOutcome PipelineCache::PrecompileGraphicsPipeline(
     const GraphicsPipelineRecord&                               record,
     std::span<const std::shared_ptr<const GraphicsStageRecord>> stages, PipelineBuildMode mode,
@@ -2081,19 +2264,8 @@ PrecompileOutcome PipelineCache::PrecompileGraphicsPipeline(
 		if (cancelled()) {
 			return PrecompileOutcome::TimedOut;
 		}
-		std::shared_ptr<PrecompiledStage> memo;
-		{
-			std::lock_guard lock(m_stage_memo_mutex);
-			auto&           entry = m_stage_memo[stage->Key()];
-			if (entry == nullptr) entry = std::make_shared<PrecompiledStage>();
-			memo = entry;
-		}
-		std::lock_guard lock(memo->mutex);
-		if (!memo->done) {
-			memo->done   = true;
-			memo->failed = !TranslateRecordedStage(m_graphics, *stage, *memo);
-		}
-		if (memo->failed) {
+		auto memo = PrecompiledStageOf(*stage);
+		if (memo == nullptr) {
 			return PrecompileOutcome::Skipped;
 		}
 		translated.push_back(std::move(memo));
@@ -2559,6 +2731,10 @@ void PipelineCache::InitializeDriverCache() {
 	m_finished_created = std::make_unique<FinishedBuilds>(
 	    directory / (title_id + ".v1.finished"), signature + ":" + KYTY_GIT_VERSION,
 	    !initial_data.empty());
+	m_program_cache->stage_code_only = [this](uint64_t shader_hash) {
+		std::lock_guard lock(m_list_mutex);
+		return m_pair_shaders.contains(shader_hash);
+	};
 	m_program_cache->code_only_built = [this](uint64_t shader_hash) {
 		std::lock_guard lock(m_list_mutex);
 		if (m_created_keys.empty() && m_created != nullptr) {
@@ -2691,6 +2867,35 @@ void PipelineCache::SetCreatedCode(std::unique_ptr<ShaderCodeStore> store) {
 	ShaderSetCreatedCodeSink([this](const ShaderCreatedCode& shader) {
 		static constexpr std::array<const char*, 9> Names = {"CS",  "PS",  "GS",  "HS", "GSF",
 		                                                     "HSF", "GSB", "HSB", "FS"};
+		// A graphics shader's header, for the pairs (PrecompileShaderPair).
+		if (static_cast<Prospero::ShaderBinaryType>(shader.binary_type) !=
+		        Prospero::ShaderBinaryType::kCs &&
+		    (!shader.cx_registers.empty() || !shader.input_semantics.empty() ||
+		     !shader.output_semantics.empty())) {
+			auto facts = std::make_shared<ShaderHeaderFacts>();
+			facts->cx_registers.assign(shader.cx_registers.begin(), shader.cx_registers.end());
+			facts->sh_registers.assign(shader.sh_registers.begin(), shader.sh_registers.end());
+			facts->input_semantics.assign(shader.input_semantics.begin(),
+			                              shader.input_semantics.end());
+			facts->output_semantics.assign(shader.output_semantics.begin(),
+			                               shader.output_semantics.end());
+			facts->shader_stages_en = shader.shader_stages_en;
+			const auto same = [](const auto& a, const auto& b) {
+				return a.size() == b.size() &&
+				       (a.empty() || std::memcmp(a.data(), b.data(), a.size() * sizeof(a[0])) == 0);
+			};
+			std::lock_guard lock(m_shader_facts_mutex);
+			auto&           known = m_shader_facts[shader.hash];
+			if (std::ranges::none_of(known, [&](const auto& other) {
+				    return same(other->cx_registers, facts->cx_registers) &&
+				           same(other->sh_registers, facts->sh_registers) &&
+				           same(other->input_semantics, facts->input_semantics) &&
+				           same(other->output_semantics, facts->output_semantics) &&
+				           other->shader_stages_en == facts->shader_stages_en;
+			    })) {
+				known.push_back(std::move(facts));
+			}
+		}
 		if (!m_created_code->Add(shader.binary_type, shader.code)) {
 			return;
 		}
@@ -2931,6 +3136,7 @@ void PipelineCache::EnqueuePrecompile(
     std::shared_ptr<const GraphicsPipelineRecord>           record,
     std::vector<std::shared_ptr<const GraphicsStageRecord>> stages, uint64_t position) {
 	const auto key = record->Key();
+	m_pipeline_patterns.try_emplace(key, PipelinePattern {record, stages});
 	auto       label =
 	    fmt::format("pipeline {:016x} (VS {:016x} PS {:016x})", key, stages.front()->shader_hash,
 	                record->pixel_stage != 0 ? stages.back()->shader_hash : 0);
@@ -3093,6 +3299,157 @@ void PipelineCache::ImportPipelineList() {
 	QueueResolved(std::move(resolved));
 }
 
+// --shader-pairs <file>: "KytyShaderPairs2", then a line per pair: the record key of the
+// pipeline it is patterned on (a recorded or listed one, with one vertex-side stage and no
+// merged program), the vertex shader's program hash, words and user data count, and the pixel
+// shader's (0 0 0 for a pattern without a pixel stage), hashes in hex. The shaders' code comes
+// from the created shader store (the shaders of the game's files, with --import-shaders).
+uint64_t PipelineCache::QueueShaderPairs(uint64_t& finished_before) {
+	auto path = Config::ShaderPairsPath();
+	if (path.empty() || m_created_code == nullptr) {
+		return 0;
+	}
+	// A folder of lists has one per title, or none for this one.
+	std::error_code error;
+	if (std::filesystem::is_directory(path, error)) {
+		path /= m_title_id + ".pairs";
+		if (!std::filesystem::exists(path, error)) {
+			return 0;
+		}
+	}
+	const auto    given = Common::PathToString(path);
+	std::ifstream in(path);
+	std::string   line;
+	if (!in || !std::getline(in, line) || line.rfind("KytyShaderPairs2", 0) != 0) {
+		PipelineCacheLog("Shader pairs: {} is not a shader pairs file; ignored", given);
+		return 0;
+	}
+	const auto facts_of = [this](uint64_t hash) -> ShaderFactsList {
+		std::lock_guard lock(m_shader_facts_mutex);
+		const auto      found = m_shader_facts.find(hash);
+		return found != m_shader_facts.end() ? found->second : ShaderFactsList {};
+	};
+	// A check of the derivation on what is known to be right: a recorded pipeline's own stage
+	// inputs have to follow from its own two shaders' headers.
+	{
+		uint64_t checked = 0, reproduced = 0, vertex_checked = 0, vertex_reproduced = 0;
+		for (const auto& [key, pattern]: m_pipeline_patterns) {
+			(void)key;
+			if (pattern.record->vertex_stage_count != 1u) {
+				continue;
+			}
+			if (const auto& recorded = *pattern.stages.front();
+			    recorded.stage == ShaderType::Vertex && recorded.back_code == nullptr) {
+				if (const auto facts = facts_of(recorded.shader_hash); !facts.empty()) {
+					vertex_checked++;
+					vertex_reproduced += std::ranges::any_of(facts, [&](const auto& vertex) {
+						auto derived = recorded;
+						return ShaderDeriveVertexInput(*vertex, derived.vertex) &&
+						       derived.Key() == recorded.Key();
+					}) ? 1 : 0;
+				}
+			}
+			if (pattern.record->pixel_stage == 0) {
+				continue;
+			}
+			const auto& recorded     = *pattern.stages.back();
+			const auto  pixel_facts  = facts_of(recorded.shader_hash);
+			const auto  vertex_facts = facts_of(pattern.stages.front()->shader_hash);
+			if (pixel_facts.empty() || vertex_facts.empty()) {
+				continue;
+			}
+			checked++;
+			bool same = false;
+			for (const auto& pixel: pixel_facts) {
+				for (const auto& vertex: vertex_facts) {
+					auto derived = recorded;
+					same = same || (ShaderDerivePixelInput(*pixel, *vertex, derived.pixel) &&
+					                derived.Key() == recorded.Key());
+				}
+			}
+			reproduced += same ? 1 : 0;
+		}
+		if (checked != 0 || vertex_checked != 0) {
+			PipelineCacheLog("Shader pairs: the pixel input of {} of {} recorded pipelines and the "
+			                 "vertex input of {} of {} follow from their shaders' headers",
+			                 reproduced, checked, vertex_reproduced, vertex_checked);
+		}
+	}
+	uint64_t queued = 0, unknown_pattern = 0, unknown_code = 0, unknown_header = 0, position = 0;
+	while (std::getline(in, line)) {
+		uint64_t pattern_key = 0, vertex_hash = 0, pixel_hash = 0;
+		uint32_t vertex_words = 0, pixel_words = 0, vertex_user_data = 0, pixel_user_data = 0;
+		if (std::sscanf(line.c_str(),
+		                "%" SCNx64 " %" SCNx64 " %" SCNu32 " %" SCNu32 " %" SCNx64 " %" SCNu32
+		                " %" SCNu32,
+		                &pattern_key, &vertex_hash, &vertex_words, &vertex_user_data, &pixel_hash,
+		                &pixel_words, &pixel_user_data) != 7) {
+			continue;
+		}
+		const auto found = m_pipeline_patterns.find(pattern_key);
+		if (found == m_pipeline_patterns.end() || found->second.record->vertex_stage_count != 1u ||
+		    (found->second.record->pixel_stage != 0) != (pixel_words != 0) ||
+		    std::ranges::any_of(found->second.stages,
+		                        [](const auto& stage) { return stage->back_code != nullptr; })) {
+			unknown_pattern++;
+			continue;
+		}
+		auto vertex_code = m_created_code->Find({.hash = vertex_hash, .words = vertex_words});
+		auto pixel_code  = pixel_words != 0
+		                       ? m_created_code->Find({.hash = pixel_hash, .words = pixel_words})
+		                       : nullptr;
+		if (vertex_code == nullptr || (pixel_words != 0 && pixel_code == nullptr)) {
+			unknown_code++;
+			continue;
+		}
+		const auto listed = [&] {
+			m_pair_shaders.insert(vertex_hash);
+			if (pixel_words != 0) {
+				m_pair_shaders.insert(pixel_hash);
+			}
+		};
+		const std::array<uint64_t, 4> identity {
+		    pattern_key, vertex_hash, pixel_hash,
+		    uint64_t {vertex_user_data} | (uint64_t {pixel_user_data} << 32u)};
+		const auto key = XXH3_64bits_withSeed(identity.data(), sizeof(identity), 0x70616972ull);
+		if (m_finished_created != nullptr && m_finished_created->Contains(key)) {
+			finished_before++;
+			listed();
+			continue;
+		}
+		// The stages take inputs from the two shaders' headers, which are known for the shaders
+		// this session has seen created or imported (the precompile pass imports the game's).
+		auto vertex_facts = facts_of(vertex_hash);
+		auto pixel_facts  = pixel_words != 0 ? facts_of(pixel_hash) : ShaderFactsList {};
+		if (vertex_facts.empty() || (pixel_words != 0 && pixel_facts.empty())) {
+			unknown_header++;
+			continue;
+		}
+		auto label = fmt::format("pair VS {:016x} PS {:016x} like {:016x}", vertex_hash, pixel_hash,
+		                         pattern_key);
+		if (EnqueuePrecompileJob(
+		        key, std::move(label),
+		        [this, pattern = found->second,
+		         vertex = PairShader {std::move(vertex_code), vertex_user_data,
+		                              std::move(vertex_facts)},
+		         pixel  = PairShader {std::move(pixel_code), pixel_user_data,
+		                              std::move(pixel_facts)}](
+		            PipelineBuildMode mode, const std::atomic<bool>& cancel, KeptPipeline* keep) {
+			        return PrecompileShaderPair(pattern, vertex, pixel, mode, &cancel, keep);
+		        },
+		        2 * PrecompileCreatedOrder + position++)) {
+			queued++;
+			listed();
+		}
+	}
+	PipelineCacheLog("Shader pairs: {} queued, {} built by earlier sessions, {} name a pipeline "
+	                 "that is not recorded or listed, {} a shader that is not in the created "
+	                 "shader store, {} left for a session that has the shaders' headers (the "
+	                 "precompile pass with --import-shaders) ({})",
+	                 queued, finished_before, unknown_pattern, unknown_code, unknown_header, given);
+	return queued;
+}
+
 void PipelineCache::QueuePrecompile(uint32_t thread_count) {
 	EXIT_IF(thread_count == 0);
 	if (m_precompile_queue == nullptr) {
@@ -3147,16 +3504,18 @@ void PipelineCache::QueuePrecompile(uint32_t thread_count) {
 			EnqueuePrecompile(created[i], true, FirstSeenPosition(i, created.size()));
 		}
 	}
-	const auto queued = progress.Get().queued;
+	const auto created_queued = progress.Get().queued - recorded - listed;
+	uint64_t   pairs_before   = 0;
+	const auto pairs_queued   = QueueShaderPairs(pairs_before);
 	PipelineCacheLog(
 	    "Precompile: {} recorded compute programs, {} recorded graphics pipelines, {} from the "
-	    "pipeline list and {} created compute shaders queued on {} threads ({} quarantined "
-	    "builds skipped or rebuilt unoptimized, {} retried once; {} created compute shaders "
-	    "were built by earlier sessions)",
-	    recorded_compute, recorded - recorded_compute, listed, queued - recorded - listed,
+	    "pipeline list, {} created compute shaders and {} shader pairs queued on {} threads ({} "
+	    "quarantined builds skipped or rebuilt unoptimized, {} retried once; {} created compute "
+	    "shaders and {} shader pairs were built by earlier sessions)",
+	    recorded_compute, recorded - recorded_compute, listed, created_queued, pairs_queued,
 	    thread_count, m_precompile_attempts != nullptr ? m_precompile_attempts->FailedCount() : 0,
 	    m_precompile_attempts != nullptr ? m_precompile_attempts->RetriedCount() : 0,
-	    finished_before);
+	    finished_before, pairs_before);
 	// Entries of the list whose shaders the guest has not created stay queueable while it runs.
 	m_list_open = !m_precompile_only && m_list_resolver != nullptr && m_list_resolver->Pending();
 	if (!m_list_open && progress.EndQueueing()) {

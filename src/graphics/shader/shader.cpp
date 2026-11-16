@@ -140,7 +140,30 @@ ShaderSeedImport ShaderImportSeeds(const std::filesystem::path& path) {
 		}
 		// As sceAgcCreateShader notes a shader the guest creates (src/libs/agc.cpp).
 		const auto hash = XXH3_64bits(code.data(), ShaderProgramSize(code.data(), sizes[1]));
-		ShaderNoteCreatedCode({.binary_type = h->type, .hash = hash, .code = std::span(code)});
+		ShaderCreatedCode noted {.binary_type = h->type, .hash = hash, .code = std::span(code)};
+		if (const auto* list = SeedPointer<ShaderRegister>(
+		        bytes, sizes[0], &h->cx_registers, h->num_cx_registers * sizeof(ShaderRegister))) {
+			noted.cx_registers = std::span(list, h->num_cx_registers);
+		}
+		if (const auto* list = SeedPointer<ShaderRegister>(
+		        bytes, sizes[0], &h->sh_registers, h->num_sh_registers * sizeof(ShaderRegister))) {
+			noted.sh_registers = std::span(list, h->num_sh_registers);
+		}
+		if (const auto* list = SeedPointer<ShaderSemantic>(
+		        bytes, sizes[0], &h->input_semantics,
+		        h->num_input_semantics * sizeof(ShaderSemantic))) {
+			noted.input_semantics = std::span(list, h->num_input_semantics);
+		}
+		if (const auto* list = SeedPointer<ShaderSemantic>(
+		        bytes, sizes[0], &h->output_semantics,
+		        h->num_output_semantics * sizeof(ShaderSemantic))) {
+			noted.output_semantics = std::span(list, h->num_output_semantics);
+		}
+		if (const auto* special = SeedPointer<ShaderSpecialRegs>(bytes, sizes[0], &h->specials,
+		                                                         sizeof(ShaderSpecialRegs))) {
+			noted.shader_stages_en = special->vgt_shader_stages_en.value;
+		}
+		ShaderNoteCreatedCode(noted);
 		result.shaders++;
 		if (static_cast<Prospero::ShaderBinaryType>(h->type) != Prospero::ShaderBinaryType::kCs) {
 			continue;
@@ -496,6 +519,117 @@ static void ShaderGetStaticInputInfoPS(
 		                                       ? target_export_mapping[slot]
 		                                       : Prospero::ColorComponentMapping {};
 	}
+}
+
+bool ShaderDeriveVertexInput(const ShaderHeaderFacts& vertex, ShaderVertexInputInfo& info) {
+	// As PrepareProgram tells a plain vertex stage from a mesh stage.
+	if (!vertex.shader_stages_en.has_value() || (*vertex.shader_stages_en & 0x20u) != 0) {
+		return false;
+	}
+	for (const auto& reg: vertex.sh_registers) {
+		if (reg.offset == Pm4::SPI_SHADER_PGM_RSRC2_GS &&
+		    KYTY_PM4_GET(reg.value, SPI_SHADER_PGM_RSRC2_GS, LDS_SIZE) != 0) {
+			return false;
+		}
+	}
+	for (const auto& reg: vertex.cx_registers) {
+		if (reg.offset == Pm4::PA_CL_VS_OUT_CNTL) {
+			info.pa_cl_vs_out_cntl = reg.value;
+		}
+	}
+	info.wave_size       = (*vertex.shader_stages_en & 0x00400000u) != 0 ? 32u : 64u;
+	info.lds_size_dwords = 0;
+	return true;
+}
+
+bool ShaderDerivePixelInput(const ShaderHeaderFacts& pixel, const ShaderHeaderFacts& vertex,
+                            ShaderPixelInputInfo& info) {
+	// The registers a draw would hold: the ones the game sets from the pixel shader's header.
+	HW::ShaderRegisters sh {};
+	HW::PixelShaderInfo regs {};
+	for (const auto& reg: pixel.cx_registers) {
+		switch (reg.offset) {
+			case Pm4::SPI_PS_INPUT_ENA: sh.ps_input_ena = reg.value; break;
+			case Pm4::SPI_PS_INPUT_ADDR: sh.ps_input_addr = reg.value; break;
+			case Pm4::SPI_PS_IN_CONTROL: sh.ps_in_control = reg.value; break;
+			case Pm4::SPI_BARYC_CNTL: sh.baryc_cntl = reg.value; break;
+			// The registers that say which pass the shader is drawn in: `info` is the input
+			// of a draw in one pass, and a header of another pass does not belong to it.
+			case Pm4::CB_SHADER_MASK:
+				if (reg.value != info.target_shader_mask) return false;
+				break;
+			case Pm4::SPI_SHADER_COL_FORMAT:
+				for (uint32_t i = 0; i < 8; i++) {
+					if (((reg.value >> (i * 4u)) & 0xFu) != info.target_output_mode[i]) return false;
+				}
+				break;
+			case Pm4::DB_SHADER_CONTROL: {
+				const bool kill = KYTY_PM4_GET(reg.value, DB_SHADER_CONTROL, KILL_ENABLE) != 0;
+				const bool z    = KYTY_PM4_GET(reg.value, DB_SHADER_CONTROL, Z_EXPORT_ENABLE) != 0;
+				const bool mask = KYTY_PM4_GET(reg.value, DB_SHADER_CONTROL, MASK_EXPORT_ENABLE) != 0;
+				const bool early =
+				    KYTY_PM4_GET(reg.value, DB_SHADER_CONTROL, Z_ORDER) == 1 && !kill && !z && !mask;
+				if (kill != info.ps_pixel_kill_enable || z != info.ps_depth_export_enable ||
+				    mask != info.ps_sample_mask_export_enable || (info.ps_early_z && !early)) {
+					return false;
+				}
+				break;
+			}
+			default: break;
+		}
+	}
+	// A pixel shader is drawn with a vertex shader that writes every input it reads (each
+	// recorded pair does): a header that reads another is not this vertex shader's.
+	for (const auto& input: pixel.input_semantics) {
+		if (std::ranges::none_of(vertex.output_semantics, [&](const ShaderSemantic& output) {
+			    return output.semantic == input.semantic;
+		    })) {
+			return false;
+		}
+	}
+	// What ShaderGetStaticInputInfoPS takes for granted of a draw's registers.
+	if (sh.ps_input_ena != sh.ps_input_addr || (sh.ps_input_ena & ~0xffffu) != 0 ||
+	    (sh.ps_in_control & 0x3fu) > std::size(info.interpolator_settings) ||
+	    pixel.input_semantics.size() > std::size(info.interpolator_settings)) {
+		return false;
+	}
+	for (const auto& reg: pixel.sh_registers) {
+		if (reg.offset == Pm4::SPI_SHADER_PGM_RSRC2_PS) {
+			regs.ps_regs.rsrc2.extra_lds_size =
+			    (reg.value >> Pm4::SPI_SHADER_PGM_RSRC2_PS_EXTRA_LDS_SIZE_SHIFT) &
+			    Pm4::SPI_SHADER_PGM_RSRC2_PS_EXTRA_LDS_SIZE_MASK;
+		}
+	}
+	std::array<uint32_t, 32> settings {};
+	ShaderInterpolantSettings(vertex.output_semantics, pixel.input_semantics, settings);
+	std::ranges::copy(settings, std::begin(sh.ps_interpolator_settings));
+	auto             semantics = pixel.input_semantics;
+	ShaderMappedData data;
+	data.scratch_size_dwords = info.scratch_size_dwords;
+	data.input_semantics     = semantics.data();
+	data.num_input_semantics = static_cast<uint32_t>(semantics.size());
+	const std::array<Prospero::ColorComponentMapping, 8> no_targets {};
+	ShaderPixelInputInfo                                 own {};
+	ShaderGetStaticInputInfoPS(regs, sh, no_targets, data, own);
+	info.lds_size_dwords              = own.lds_size_dwords;
+	info.input_num                    = own.input_num;
+	info.wave_size                    = own.wave_size;
+	info.ps_system_input_base         = own.ps_system_input_base;
+	info.custom_interpolation_mask    = own.custom_interpolation_mask;
+	info.ps_perspective_center_vgpr   = own.ps_perspective_center_vgpr;
+	info.ps_perspective_sample_vgpr   = own.ps_perspective_sample_vgpr;
+	info.ps_perspective_centroid_vgpr = own.ps_perspective_centroid_vgpr;
+	info.ps_pos_x                     = own.ps_pos_x;
+	info.ps_pos_y                     = own.ps_pos_y;
+	info.ps_pos_z                     = own.ps_pos_z;
+	info.ps_pos_w                     = own.ps_pos_w;
+	info.ps_front_face                = own.ps_front_face;
+	info.ps_front_face_all_bits       = own.ps_front_face_all_bits;
+	info.ps_ancillary                 = own.ps_ancillary;
+	info.ps_sample_shading            = own.ps_sample_shading;
+	info.ps_no_perspective            = own.ps_no_perspective;
+	std::ranges::copy(own.interpolator_settings, std::begin(info.interpolator_settings));
+	return true;
 }
 
 static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,

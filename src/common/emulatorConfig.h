@@ -110,6 +110,9 @@ struct ConfigOptions {
 	std::filesystem::path  import_pipeline_list;
 	// --import-shaders: shader binaries taken from the game's files (empty = none).
 	std::filesystem::path  import_shaders;
+	// --shader-pairs: the vertex and pixel shaders of the game's files that are drawn together
+	// (empty = none).
+	std::filesystem::path  shader_pairs;
 	uint32_t               lookahead_threads               = 2;
 	uint32_t               prepare_threads                 = UINT32_MAX; // automatic
 	bool                   tessellation_enabled        = false;
@@ -203,6 +206,7 @@ bool     RebuildPipelineCacheEnabled();
 std::filesystem::path ExportPipelineListPath();
 std::filesystem::path ImportPipelineListPath();
 std::filesystem::path ImportShadersPath();
+std::filesystem::path ShaderPairsPath();
 uint32_t LookaheadThreads();
 uint32_t PrepareThreads();
 bool TessellationEnabled();

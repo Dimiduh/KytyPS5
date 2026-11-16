@@ -205,6 +205,14 @@ static void PrintUsage() {
 	    "                                       taken from the game's files (so before the game\n"
 	    "                                       has created them). A folder: its <title id>.seeds,\n"
 	    "                                       if any.\n");
+	::printf(
+	    "  --shader-pairs <file>                A list of the vertex and pixel shaders of the\n"
+	    "                                       game's files that are drawn together, each with a\n"
+	    "                                       recorded pipeline of the same kind. With\n"
+	    "                                       --precompile-only and --import-shaders their\n"
+	    "                                       pipelines are built before any session has drawn\n"
+	    "                                       with them; a session takes those. A folder: its\n"
+	    "                                       <title id>.pairs, if any.\n");
 	::printf("  --serialize-dispatches               Order every guest compute dispatch after the\n"
 	         "                                       previous one, also where the guest sends no\n"
 	         "                                       flush between them.\n");
@@ -575,6 +583,8 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			options.config.import_pipeline_list = Common::PathFromUtf8(value);
 		} else if (arg == "--import-shaders") {
 			options.config.import_shaders = Common::PathFromUtf8(value);
+		} else if (arg == "--shader-pairs") {
+			options.config.shader_pairs = Common::PathFromUtf8(value);
 		} else if (arg == "--command-buffer-dump-folder") {
 			options.config.command_buffer_dump_folder = Common::PathFromUtf8(value);
 		} else if (arg == "--printf-direction") {
