@@ -32,6 +32,15 @@
 #                                            stands for its <title id>.pipelinelist. Default: the pipeline-lists
 #                                            folder next to this script, if there is one; none: no list
 #   .\run-windows.ps1 -ExportPipelineList <file>   write what this data folder has recorded as such a list, then exit
+#   .\run-windows.ps1 -FrameGen 1            DLSS frame generation: the number of generated frames per rendered
+#                                            one (1 = 2x, up to 5 = 6x; NVIDIA RTX 40 or newer, 2 and up RTX 50;
+#                                            the GPU's maximum is taken when more is asked for). Needs NVIDIA's
+#                                            Streamline runtime (-StreamlineDir) and a build made with its SDK;
+#                                            0: off, whatever the config says
+#   .\run-windows.ps1 -StreamlineDir <dir>   where NVIDIA's Streamline runtime is: the unpacked Streamline SDK (a
+#                                            release zip from github.com/NVIDIA-RTX/Streamline/releases) or its
+#                                            bin\x64. Default: a "streamline" folder next to the emulator, else the
+#                                            SDK beside a local build (_Build\deps\streamline\sdk)
 #   .\run-windows.ps1 -Log file              the emulator's own log into the logs folder (console: into the run log,
 #                                            which -Follow shows, slow; off: none)
 #   .\run-windows.ps1 -Set KEY=VALUE         an environment switch of the emulator (KYTY_*, SDL_*; KEY= removes one);
@@ -65,6 +74,8 @@ param(
 	[switch]$Precompile,
 	[string]$PipelineList = '',
 	[string]$ExportPipelineList = '',
+	[ValidateRange(-1, 5)][int]$FrameGen = -1,
+	[string]$StreamlineDir = '',
 	[ValidateSet('', 'off', 'file', 'console')][string]$Log = '',
 	[string[]]$Set = @(),
 	[string]$ExtraArgs = '',
@@ -223,6 +234,10 @@ foreach ($property in $launch.environment.PSObject.Properties) {
 # -NoSound: SDL opens its dummy audio driver instead of the default playback device (src/libs/audio.cpp), which
 # plays nothing: the game's sound, the trophy sound, and a wired DualSense's haptics, which are sent as audio.
 if ($NoSound) { $environment['SDL_AUDIO_DRIVER'] = 'dummy' }
+# -FrameGen: DLSS frame generation through NVIDIA's Streamline runtime (KYTY_FRAMEGEN: generated frames per rendered
+# one; src/graphics/host_gpu/renderer/upscaler/frameGeneration.h). The emulator loads only NVIDIA-signed files.
+if ($FrameGen -gt 0) { $environment['KYTY_FRAMEGEN'] = [string]$FrameGen } elseif ($FrameGen -eq 0) { $environment.Remove('KYTY_FRAMEGEN') }
+if ($StreamlineDir) { $environment['KYTY_STREAMLINE_DIR'] = $StreamlineDir }
 # -Set KEY=VALUE overrides a switch of the config; KEY= removes it (from what this shell hands down too). Several:
 # -Set A=1,B=2 (a comma starts a new pair only before KEY=, so values such as 1,2,3,6,7 stay whole).
 $removed = @()

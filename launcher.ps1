@@ -28,7 +28,7 @@ $logNames = 'Off', 'File (in the logs folder)', 'Console (slow)'
 
 $settings = [ordered]@{ game = ''; data = ''; resolution = '1920x1080'; fullscreen = $false; stretch = $false; language = 1
 	gpu = -1; gpu_name = ''; present_mode = 'Mailbox'; hdr = $false; perf_overlay = $false; sound = $true
-	skip_notice_screen = $false; redzone = $false; precompile_pipelines = $true; pipeline_lists = $true; log = 'off'; extra_args = ''; environment = '' }
+	skip_notice_screen = $false; redzone = $false; precompile_pipelines = $true; pipeline_lists = $true; framegen = 1; streamline = ''; log = 'off'; extra_args = ''; environment = '' }
 if (Test-Path -LiteralPath $settingsPath) {
 	# (A file that cannot be read leaves the defaults.)
 	try {
@@ -177,6 +177,44 @@ function Test-EnvironmentPair([string]$pair) {
 }
 function Get-EnvironmentPairs { return @(Get-EnvironmentPieces | Where-Object { Test-EnvironmentPair $_ }) }
 # What of the two text boxes is left out, for the window and -DryRun.
+# Frame generation (run-windows.ps1 -FrameGen) needs NVIDIA's Streamline runtime, which does not come with the
+# emulator: the Streamline SDK (a release zip from github.com/NVIDIA-RTX/Streamline/releases) chosen with
+# "Streamline..." (settings: streamline), else KYTY_STREAMLINE_DIR, else a "streamline" folder next to the emulator,
+# else the SDK beside a local build (_Build\deps\streamline\sdk). The emulator loads only NVIDIA's own
+# sl.interposer.dll. The setting is the multiplier: 1 off, 2 to 6.
+$streamlineSdkUrl = 'https://github.com/NVIDIA-RTX/Streamline/releases'
+$frameGens = 'Off', '2x', '3x', '4x', '5x', '6x'
+# The runtime's folder in $dir (the folder itself or its bin\x64) when its sl.interposer.dll is signed by NVIDIA;
+# $null otherwise.
+function Find-Streamline([string]$dir) {
+	if (!$dir) { return $null }
+	foreach ($folder in @($dir, (Join-Path $dir 'bin\x64'))) {
+		$file = Join-Path $folder 'sl.interposer.dll'
+		if (Test-Path -LiteralPath $file) {
+			$signature = Get-AuthenticodeSignature -LiteralPath $file
+			if ($signature.Status -eq 'Valid' -and $signature.SignerCertificate.Subject -match 'O=NVIDIA Corporation') { return $folder }
+			return $null
+		}
+	}
+	return $null
+}
+function Resolve-Streamline {
+	if ($settings.streamline) { return Find-Streamline $settings.streamline }
+	if ($env:KYTY_STREAMLINE_DIR) { return Find-Streamline $env:KYTY_STREAMLINE_DIR }
+	foreach ($dir in @((Join-Path (Split-Path $exe) 'streamline'), (Join-Path (Split-Path (Split-Path $exe)) 'deps\streamline\sdk'))) {
+		$found = Find-Streamline $dir
+		if ($found) { return $found }
+	}
+	return $null
+}
+$streamline = Resolve-Streamline
+# (DLSS frame generation: an NVIDIA RTX 40 or newer card; with no RTX card at all the row stays off.)
+$rtxGpu = try {
+	[bool](Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'NVIDIA' -and $_.Name -match '\bRTX\b' })
+} catch { $false }
+$frameGenAvailable = [bool]$streamline -and $rtxGpu
+$settings.framegen = [Math]::Min(6, [Math]::Max(1, $(try { [int]$settings.framegen } catch { 1 })))
+
 function Get-Problems {
 	$problems = @()
 	$extra = Get-ExtraProblem
@@ -201,6 +239,13 @@ function Get-RunArguments {
 	# The shared pipeline lists next to the launcher (pipeline-lists\<title id>.pipelinelist) are run-windows.ps1's
 	# default; off: none.
 	if (!$settings.pipeline_lists) { $arguments += @('-PipelineList', 'none') }
+	# Frame generation: the generated frames per rendered one and where NVIDIA's runtime is; 0 turns off what the
+	# launch config may set.
+	if ($frameGenAvailable -and [int]$settings.framegen -ge 2) {
+		$arguments += @('-FrameGen', ([int]$settings.framegen - 1), '-StreamlineDir', (Format-Quoted $streamline))
+	} else {
+		$arguments += @('-FrameGen', 0)
+	}
 	if ($settings.fullscreen) { $arguments += '-Fullscreen' }
 	# (Without it the game's picture keeps its aspect ratio, between black bars in a window of another shape.)
 	if ($settings.stretch) { $arguments += '-Stretch' }
@@ -240,6 +285,7 @@ if ($DryRun) {
 	"settings:   $settingsPath"
 	"emulator:   $exe$(if (!(Test-Path -LiteralPath $exe)) { ' (missing: build it with build-windows.cmd)' })"
 	"data:       $(Get-DataFolder); logs: $(Get-LogFolder)"
+	"framegen:   $(if ($frameGenAvailable) { "NVIDIA's Streamline runtime in $streamline; chosen: $(if ([int]$settings.framegen -ge 2) { "$([int]$settings.framegen)x" } else { 'off' })" } elseif (!$rtxGpu) { 'no NVIDIA RTX graphics card' } else { "no NVIDIA-signed Streamline runtime (settings: '$($settings.streamline)')" })"
 	"gpus:       $(if ($gpuList.Count) { $gpuList -join ', ' } else { 'Vulkan lists none' }); chosen: $(if ($settings.gpu -ge 0) { $settings.gpu } else { 'automatic' })"
 	Get-Problems | ForEach-Object { "note:       $_" }
 	return
@@ -359,6 +405,41 @@ $tips.SetToolTip($present, "Mailbox: no tearing, the newest finished frame is sh
 Add-Row 'Present mode' @($present)
 $hdr = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'HDR (turn on "Use HDR" in Windows display settings first)'; AutoSize = $true; Checked = [bool]$settings.hdr }
 Add-Row '' @($hdr)
+$frameGen = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 90; Enabled = $frameGenAvailable }
+$frameGen.Items.AddRange($frameGens)
+$frameGen.SelectedIndex = if ($frameGenAvailable) { [int]$settings.framegen - 1 } else { 0 }
+$frameGenFolder = New-Object System.Windows.Forms.Button -Property @{ Text = 'Streamline...'; AutoSize = $true }
+$frameGenNote = New-Note ''
+function Update-FrameGenNote {
+	$frameGenNote.Text = if ($frameGenAvailable) { 'DLSS; NVIDIA RTX 40 or newer (3x and up: RTX 50)' }
+		elseif (!$rtxGpu) { 'DLSS: needs an NVIDIA RTX 40 or newer graphics card' }
+		else { 'needs NVIDIA''s Streamline SDK: download it, then choose its folder' }
+}
+Update-FrameGenNote
+$tips.SetToolTip($frameGen, "Frames made between the game's own: shown frames = the game's frames x the multiplier.`n" +
+	"It works in the game's 3D view, where the emulator finds the game's depth and motion vectors (Saros);`n" +
+	"menus, movies and loading screens are shown as they are. A card that makes fewer frames than asked`n" +
+	"for makes as many as it can (RTX 40: 2x).")
+$tips.SetToolTip($frameGenFolder, "The NVIDIA Streamline SDK (a release zip from $streamlineSdkUrl), unpacked: its folder or its bin\x64.`n" +
+	"Only NVIDIA-signed files are loaded; nothing of NVIDIA's comes with the emulator.")
+$frameGenFolder.Add_Click({
+	$dialog = New-Object System.Windows.Forms.FolderBrowserDialog -Property @{
+		Description = "The unpacked NVIDIA Streamline SDK ($streamlineSdkUrl), or its bin\x64 folder" }
+	if ($settings.streamline -and (Test-Path -LiteralPath $settings.streamline)) { $dialog.SelectedPath = $settings.streamline }
+	if ($dialog.ShowDialog($form) -ne 'OK') { return }
+	$found = Find-Streamline $dialog.SelectedPath
+	if (!$found) {
+		[void][System.Windows.Forms.MessageBox]::Show($form, "No sl.interposer.dll signed by NVIDIA in that folder or its bin\x64.`nDownload the Streamline SDK from $streamlineSdkUrl and choose the unpacked folder.", 'Frame generation')
+		return
+	}
+	$settings.streamline = $dialog.SelectedPath
+	$script:streamline = $found
+	# (Without an NVIDIA RTX graphics card the folder is kept, the row stays off.)
+	$script:frameGenAvailable = $rtxGpu
+	$frameGen.Enabled = $rtxGpu
+	Update-FrameGenNote
+})
+Add-Row 'Frame generation' @($frameGen, $frameGenFolder, $frameGenNote)
 $overlay = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Performance panel (frame rate, frame times, CPU and GPU; F2 in the game switches it, Shift+F2 its details)'; AutoSize = $true; Checked = [bool]$settings.perf_overlay }
 Add-Row '' @($overlay)
 $sound = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Sound'; AutoSize = $true; Checked = [bool]$settings.sound }
@@ -461,6 +542,8 @@ function Read-Form {
 	$settings.redzone              = $redzone.Checked
 	$settings.precompile_pipelines = $precompilePipelines.Checked
 	$settings.pipeline_lists       = $pipelineLists.Checked
+	# (An unavailable row keeps the saved choice for when the runtime is there.)
+	if ($frameGenAvailable) { $settings.framegen = [Math]::Max(0, $frameGen.SelectedIndex) + 1 }
 	$settings.log                  = $logModes[[Math]::Max(0, $log.SelectedIndex)]
 	$settings.extra_args           = $extraArgs.Text.Trim()
 	$settings.environment          = $switches.Text.Trim()
