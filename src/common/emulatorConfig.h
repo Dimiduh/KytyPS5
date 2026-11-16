@@ -113,6 +113,7 @@ struct ConfigOptions {
 	// --shader-pairs: the vertex and pixel shaders of the game's files that are drawn together
 	// (empty = none).
 	std::filesystem::path  shader_pairs;
+	std::vector<std::string> unreal_cvars; // "name=number" each (kernel/unrealCvars.h)
 	uint32_t               lookahead_threads               = 2;
 	uint32_t               prepare_threads                 = UINT32_MAX; // automatic
 	bool                   tessellation_enabled        = false;
@@ -207,6 +208,7 @@ std::filesystem::path ExportPipelineListPath();
 std::filesystem::path ImportPipelineListPath();
 std::filesystem::path ImportShadersPath();
 std::filesystem::path ShaderPairsPath();
+const std::vector<std::string>& UnrealCvars();
 uint32_t LookaheadThreads();
 uint32_t PrepareThreads();
 bool TessellationEnabled();

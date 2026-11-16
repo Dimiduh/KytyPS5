@@ -213,6 +213,19 @@ static void PrintUsage() {
 	    "                                       pipelines are built before any session has drawn\n"
 	    "                                       with them; a session takes those. A folder: its\n"
 	    "                                       <title id>.pairs, if any.\n");
+	::printf(
+	    "  --unreal-cvar <name>=<number>        Unreal Engine titles: set a console variable of\n"
+	    "                                       the running game (float and int variables that\n"
+	    "                                       the engine reads as it runs), and keep it set.\n"
+	    "                                       Repeatable. r.SecondaryScreenPercentage.GameViewport\n"
+	    "                                       =50 makes a title's picture at half its output\n"
+	    "                                       size, stretched to the output. <name>=x<factor>:\n"
+	    "                                       the title's own value times the factor.\n"
+	    "  --unreal-render-scale <percent>      Unreal Engine titles: the size the 3D is rendered\n"
+	    "                                       at, in percent of the title's own (its screen\n"
+	    "                                       percentage and dynamic resolution bounds); the\n"
+	    "                                       title's upscaler still makes the output's picture.\n"
+	    "                                       Less GPU time for a softer picture.\n");
 	::printf("  --serialize-dispatches               Order every guest compute dispatch after the\n"
 	         "                                       previous one, also where the guest sends no\n"
 	         "                                       flush between them.\n");
@@ -585,6 +598,21 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			options.config.import_shaders = Common::PathFromUtf8(value);
 		} else if (arg == "--shader-pairs") {
 			options.config.shader_pairs = Common::PathFromUtf8(value);
+		} else if (arg == "--unreal-cvar") {
+			options.config.unreal_cvars.push_back(value);
+		} else if (arg == "--unreal-render-scale") {
+			uint32_t percent = 0;
+			if (!ParseUint32(value, percent) || percent < 10u || percent > 200u) {
+				::printf("invalid render scale (10-200 percent): %s\n", value.c_str());
+				return false;
+			}
+			if (percent != 100u) {
+				for (const char* name: {"r.DynamicRes.MinScreenPercentage", "r.DynamicRes.MaxScreenPercentage",
+				                        "r.ScreenPercentage"}) {
+					options.config.unreal_cvars.push_back(std::string(name) + "=x" +
+					                                      std::to_string(static_cast<double>(percent) / 100.0));
+				}
+			}
 		} else if (arg == "--command-buffer-dump-folder") {
 			options.config.command_buffer_dump_folder = Common::PathFromUtf8(value);
 		} else if (arg == "--printf-direction") {

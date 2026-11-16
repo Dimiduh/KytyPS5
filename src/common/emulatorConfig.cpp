@@ -273,6 +273,10 @@ std::filesystem::path ImportShadersPath() {
 	return g_config->import_shaders;
 }
 
+const std::vector<std::string>& UnrealCvars() {
+	return g_config->unreal_cvars;
+}
+
 std::filesystem::path ShaderPairsPath() {
 	return g_config->shader_pairs;
 }

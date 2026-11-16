@@ -28,7 +28,7 @@ $logNames = 'Off', 'File (in the logs folder)', 'Console (slow)'
 
 $settings = [ordered]@{ game = ''; data = ''; resolution = '1920x1080'; fullscreen = $false; stretch = $false; language = 1
 	gpu = -1; gpu_name = ''; present_mode = 'Mailbox'; hdr = $false; perf_overlay = $false; sound = $true
-	skip_notice_screen = $false; redzone = $false; precompile_pipelines = $true; pipeline_lists = $true; skip_pending_draws = $true; framegen = 1; streamline = ''; log = 'off'; extra_args = ''; environment = '' }
+	skip_notice_screen = $false; redzone = $false; precompile_pipelines = $true; pipeline_lists = $true; skip_pending_draws = $true; framegen = 1; render_scale = 100; streamline = ''; log = 'off'; extra_args = ''; environment = '' }
 if (Test-Path -LiteralPath $settingsPath) {
 	# (A file that cannot be read leaves the defaults.)
 	try {
@@ -214,6 +214,9 @@ $rtxGpu = try {
 } catch { $false }
 $frameGenAvailable = [bool]$streamline -and $rtxGpu
 $settings.framegen = [Math]::Min(6, [Math]::Max(1, $(try { [int]$settings.framegen } catch { 1 })))
+$renderScales = 100, 85, 75, 67, 50
+$settings.render_scale = $(try { [int]$settings.render_scale } catch { 100 })
+if ($renderScales -notcontains $settings.render_scale) { $settings.render_scale = 100 }
 
 function Get-Problems {
 	$problems = @()
@@ -249,6 +252,9 @@ function Get-RunArguments {
 	} else {
 		$arguments += @('-FrameGen', 0)
 	}
+	# The size the game renders its 3D at, in percent of its own (Unreal Engine titles); 100 takes out what the
+	# launch config may set.
+	$arguments += @('-RenderScale', [int]$settings.render_scale)
 	if ($settings.fullscreen) { $arguments += '-Fullscreen' }
 	# (Without it the game's picture keeps its aspect ratio, between black bars in a window of another shape.)
 	if ($settings.stretch) { $arguments += '-Stretch' }
@@ -443,6 +449,13 @@ $frameGenFolder.Add_Click({
 	Update-FrameGenNote
 })
 Add-Row 'Frame generation' @($frameGen, $frameGenFolder, $frameGenNote)
+$renderScale = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 90 }
+$renderScale.Items.AddRange(@($renderScales | ForEach-Object { "$_%" }))
+$renderScale.SelectedIndex = [Array]::IndexOf($renderScales, [int]$settings.render_scale)
+$tips.SetToolTip($renderScale, "The size the game renders its 3D at, in percent of its own (Saros: 1600x900 to 2304x1296).`n" +
+	"The game's upscaler still makes the 4K picture: less work for the graphics card, a softer picture.`n" +
+	"At one spot of Saros (RTX 4090): 31 fps at 100%, 33 at 75%, 36 at 50%.")
+Add-Row '3D resolution' @($renderScale, (New-Note 'Unreal Engine games (Saros): lower is faster and softer'))
 $overlay = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Performance panel (frame rate, frame times, CPU and GPU; F2 in the game switches it, Shift+F2 its details)'; AutoSize = $true; Checked = [bool]$settings.perf_overlay }
 Add-Row '' @($overlay)
 $sound = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Sound'; AutoSize = $true; Checked = [bool]$settings.sound }
@@ -554,6 +567,7 @@ function Read-Form {
 	$settings.skip_pending_draws   = $skipPending.Checked
 	# (An unavailable row keeps the saved choice for when the runtime is there.)
 	if ($frameGenAvailable) { $settings.framegen = [Math]::Max(0, $frameGen.SelectedIndex) + 1 }
+	$settings.render_scale         = $renderScales[[Math]::Max(0, $renderScale.SelectedIndex)]
 	$settings.log                  = $logModes[[Math]::Max(0, $log.SelectedIndex)]
 	$settings.extra_args           = $extraArgs.Text.Trim()
 	$settings.environment          = $switches.Text.Trim()

@@ -53,6 +53,14 @@
 #                                            the GPU's maximum is taken when more is asked for). Needs NVIDIA's
 #                                            Streamline runtime (-StreamlineDir) and a build made with its SDK;
 #                                            0: off, whatever the config says
+#   .\run-windows.ps1 -RenderScale 50        Unreal Engine titles (Saros): the size the 3D is rendered at, in percent
+#                                            of the game's own (Saros: 1600x900 to 2304x1296, picked as it goes); the
+#                                            game's upscaler still makes the 4K picture. Less work for the graphics
+#                                            card, a softer picture: at one spot of Saros 31 fps at 100, 33 at 75, 36 at
+#                                            50 (RTX 4090). 100: as the game is, whatever the config says
+#   .\run-windows.ps1 -UnrealCvar r.X=1,r.Y=x0.5   Unreal Engine titles: console variables of the running game, set
+#                                            and kept set (--unreal-cvar: float and int variables the engine reads as
+#                                            it runs; x0.5: half the game's own value). none: not the config's either
 #   .\run-windows.ps1 -StreamlineDir <dir>   where NVIDIA's Streamline runtime is: the unpacked Streamline SDK (a
 #                                            release zip from github.com/NVIDIA-RTX/Streamline/releases) or its
 #                                            bin\x64. Default: a "streamline" folder next to the emulator, else the
@@ -94,6 +102,8 @@ param(
 	[string]$ExportPipelineList = '',
 	[string]$ShaderPairs = '',
 	[ValidateRange(-1, 5)][int]$FrameGen = -1,
+	[ValidateRange(0, 200)][int]$RenderScale = 0,
+	[string[]]$UnrealCvar = @(),
 	[string]$StreamlineDir = '',
 	[ValidateSet('', 'off', 'file', 'console')][string]$Log = '',
 	[string[]]$Set = @(),
@@ -195,6 +205,25 @@ if ($Height -gt 0) { Set-Option '--screen-height' "$Height" }
 # (Not for the precompile pass: its window shows nothing and would cover the screen, this console with it.)
 if ($Precompile) { [void]$options.Remove('--fullscreen') } elseif ($Fullscreen) { Add-Flag '--fullscreen' }
 if ($Stretch) { Add-Flag '--stretch' }
+# -RenderScale: --unreal-render-scale (kernel/unrealCvars.h), or the config's without it; 100 takes the config's out.
+if ($RenderScale -gt 0) {
+	$at = $options.IndexOf('--unreal-render-scale')
+	if ($at -ge 0) { $options.RemoveRange($at, 2) }
+	if ($RenderScale -lt 10) { throw '-RenderScale takes 10 to 200 (percent)' }
+	if ($RenderScale -ne 100) { Set-Option '--unreal-render-scale' "$RenderScale" }
+}
+# -UnrealCvar: one --unreal-cvar each, after the config's own (the later one of a name wins); none: no config's.
+if ($UnrealCvar.Count -gt 0) {
+	$pairs = @($UnrealCvar | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
+	if ($pairs -contains 'none') {
+		for ($at = $options.IndexOf('--unreal-cvar'); $at -ge 0; $at = $options.IndexOf('--unreal-cvar')) { $options.RemoveRange($at, 2) }
+	}
+	foreach ($pair in $pairs) {
+		if ($pair -eq 'none') { continue }
+		if ($pair -notmatch '^[A-Za-z][A-Za-z0-9_.]*=[x*]?-?[0-9.]+$') { throw "-UnrealCvar takes name=number or name=x<factor>, not '$pair'" }
+		$options.Add('--unreal-cvar'); $options.Add($pair)
+	}
+}
 if ($Hdr) { Add-Flag '--hdr' }
 if ($PresentMode) { Set-Option '--present-mode' $PresentMode }
 if ($Language -ge 0) { Set-Option '--console-language' "$Language" }

@@ -18,6 +18,7 @@
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
+#include "kernel/unrealCvars.h"
 #include "kytyGitVersion.h"
 #include "libs/agc.h"
 #include "libs/audio.h"
@@ -153,6 +154,8 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 		                                                      scanned);
 	        },
 	});
+	// --unreal-cvar: the title's own settings, once it runs.
+	Libs::LibKernel::UnrealCvars::Start(Config::UnrealCvars());
 	Common::LiveControl::Start();
 }
 
