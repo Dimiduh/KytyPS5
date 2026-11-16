@@ -4786,10 +4786,20 @@ public:
       return label == label_value;
     };
     LibKernel::Memory::InstallGpuResources(&resources);
+    // No readback is made for the label beside them: none from the buffer's
+    // mapping, none submitted or waited for as a CPU write. (The bytes may be
+    // published all the same, by their page's own asynchronous download, and
+    // HasGpuDirtyBytes takes what was published.)
+    const auto before_beside = Common::GpuTiming::Sync().Snapshot();
+    const bool label_beside_landed = release_label(label_beside_address);
+    const auto beside =
+        Common::GpuTiming::Sync().Snapshot().Since(before_beside);
+    constexpr auto cpu_write =
+        static_cast<size_t>(Common::GpuTiming::SyncReason::CpuWrite);
     const bool label_beside_stored =
-        release_label(label_beside_address) &&
-        buffer_cache.HasGpuDirtyBytes(label_gpu_address,
-                                      sizeof(label_gpu_value));
+        label_beside_landed && beside.in_place == 0 &&
+        beside.submits[cpu_write] == 0 && beside.served[cpu_write] == 0 &&
+        beside.joined[cpu_write] == 0;
     const bool label_over_stored =
         release_label(label_gpu_address) &&
         !buffer_cache.HasGpuDirtyBytes(label_gpu_address, sizeof(label_value));

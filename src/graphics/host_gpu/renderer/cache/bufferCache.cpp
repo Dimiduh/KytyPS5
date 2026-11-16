@@ -65,6 +65,24 @@ Common::LiveControl::Switch g_readback_narrow("readback_narrow", 1);
 // GPU thread for 2 ms.
 Common::LiveControl::Switch g_inplace_max_kb("inplace_max_kb", 64);
 
+// 1: a readback a guest thread waits for (its read or write faulted on GPU-written pages) is
+// finished by that thread when the GPU thread has nothing to record for it: the bytes are in the
+// buffer's mapping and their last GPU write is submitted (the thread waits for it and copies), or
+// downloads of them are submitted (it waits for those). 0: the GPU thread serves every request
+// whole, which in Saros held it for about 2 ms a frame (some 40 requests a frame, most of them
+// a store of the guest into a page with a few KiB of final GPU-written bytes: 50-170 us of bus
+// reads each; BufferCache::GuestCopy).
+Common::LiveControl::Switch g_guest_copy("guest_copy", 1);
+// The most GPU-written bytes (in KiB) such a copy takes. The requester pays the bus reads, so
+// more than the in-place limit of the GPU thread's own readbacks.
+Common::LiveControl::Switch g_guest_copy_max_kb("guest_copy_max_kb", 256);
+// Readbacks left to their requesters: copies, their bytes, waits for submitted downloads, and
+// the requests asked again because a GPU write came between.
+Common::LiveControl::Counter g_guest_copies("guest_copies");
+Common::LiveControl::Counter g_guest_copy_bytes("guest_copy_bytes");
+Common::LiveControl::Counter g_guest_copy_waits("guest_copy_waits");
+Common::LiveControl::Counter g_guest_copy_again("guest_copy_again");
+
 // 1: a BDA synchronization uploads the guest's stores only into buffers shaders read through
 // the page table (BdaUse); a buffer only bindings use takes them when a binding is obtained, and
 // its stored pages stay unprotected until then. 0: every cached buffer is synchronized. In Saros
@@ -298,6 +316,7 @@ void BufferCache::KeepAccessedBdaBuffers() {
 }
 
 void BufferCache::DeleteBuffer(BufferId id) {
+	WaitGuestCopies(id);
 	if (m_slot_buffers[id].gpu_write_open) {
 		std::erase(m_open_writes, id);
 	}
@@ -547,6 +566,32 @@ void BufferCache::RequestGuestReadback(const GuestReadback& request) {
 		ServeGuestReadbacks({&request, 1});
 		return;
 	}
+	std::shared_ptr<GuestCopy> copy;
+	QueueGuestReadback(request, g_guest_copy.On() ? &copy : nullptr);
+	if (copy == nullptr) {
+		return;
+	}
+	RunGuestCopy(*copy);
+	// What the GPU thread does after a copy of its own, unless a GPU write came between (the
+	// bytes are GPU-dirty still): then the request is asked again, to be served whole.
+	bool again = false;
+	if (request.kind == GuestReadback::Kind::Write) {
+		m_memory_tracker.InvalidateRegion(request.vaddr, request.size, [&] { again = true; });
+		if (!again) {
+			QueueBdaSync(request.vaddr, request.size);
+		}
+	} else {
+		again = m_memory_tracker.IsRegionGpuModified(
+		    request.vaddr, request.kind == GuestReadback::Kind::Around ? 1u : request.size);
+	}
+	if (again) {
+		g_guest_copy_again.Add();
+		QueueGuestReadback(request, nullptr);
+	}
+}
+
+void BufferCache::QueueGuestReadback(const GuestReadback&        request,
+                                     std::shared_ptr<GuestCopy>* handoff) {
 	// Every request is followed by a command that serves all pending ones, so it is served by
 	// its own command at the latest; a later command finds nothing left.
 	std::binary_semaphore done {0};
@@ -554,6 +599,7 @@ void BufferCache::RequestGuestReadback(const GuestReadback& request) {
 		std::lock_guard lock(m_guest_readbacks_mutex);
 		auto&           queued = m_guest_readbacks.emplace_back(request);
 		queued.done            = &done;
+		queued.handoff         = handoff;
 	}
 	m_scheduler.Context().GetGpu().SendCommand([this] {
 		std::vector<GuestReadback> requests;
@@ -574,6 +620,7 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 		uint64_t size   = 0;
 		bool     copied = false;
 		bool     skip   = false;
+		bool     handed = false;
 	};
 	std::vector<Served>                          served(requests.size());
 	std::vector<Common::UniqueFunction<void>>    publications;
@@ -605,7 +652,8 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 		}
 		TouchHotPages(result.base, result.size);
 		DrainPublished();
-		auto& buffer = m_slot_buffers[FindBuffer(result.base, result.size)];
+		const auto buffer_id = FindBuffer(result.base, result.size);
+		auto&      buffer    = m_slot_buffers[buffer_id];
 		if (IsRegionGpuModified(result.base, result.size)) {
 			// GPU-modified ranges come as many small scattered islands, so a readback widens to
 			// a window of its buffer (a fault read: the window around the faulting byte).
@@ -633,6 +681,15 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 			}
 			result.base = start;
 			result.size = end - start;
+		}
+		if (request.handoff != nullptr &&
+		    HandOffGuestCopy(request, buffer, buffer_id, result.base, result.size)) {
+			// The requester does the rest, tracker state included, and starts now: the other
+			// requests of the batch may wait for the GPU.
+			result.skip   = true;
+			result.handed = true;
+			request.done->release();
+			continue;
 		}
 		AwaitSubmittedDownloads(result.base, result.size);
 		if (ReadBackInPlace(buffer, result.base, result.size)) {
@@ -672,7 +729,7 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 				QueueBdaSync(requests[i].vaddr, requests[i].size);
 			}
 		}
-		if (requests[i].done != nullptr) {
+		if (requests[i].done != nullptr && !result.handed) {
 			requests[i].done->release();
 		}
 	}
@@ -720,6 +777,20 @@ void BufferCache::EvictColdHotPages(uint64_t keep) {
 }
 
 void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
+	// A copy a guest thread is making of bytes this write may change stops publishing: this
+	// comes before the write is marked GPU-dirty (SynchronizeBuffer), which waits for the
+	// tracking region's lock, so a page the copy publishes was read before the write existed.
+	if (!m_guest_copies.empty()) {
+		std::erase_if(m_guest_copies, [&](const std::shared_ptr<GuestCopy>& copy) {
+			if (copy->finished.load(std::memory_order_acquire)) {
+				return true;
+			}
+			if (copy->base < vaddr + size && vaddr < copy->base + copy->size) {
+				copy->current.store(false, std::memory_order_release);
+			}
+			return false;
+		});
+	}
 	if (m_hot_pages.empty()) {
 		return;
 	}
@@ -746,10 +817,14 @@ void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::DrainPublished() {
+	if (!m_published_pending.load(std::memory_order_acquire)) {
+		return;
+	}
 	std::vector<Published> published;
 	{
 		std::lock_guard lock(m_published_mutex);
 		published.swap(m_published);
+		m_published_pending.store(false, std::memory_order_release);
 	}
 	// A published tracker page that is still clean holds no GPU write recorded since the
 	// download (recording one marks the page first), so all its dirty intervals were published.
@@ -767,7 +842,123 @@ void BufferCache::DrainPublished() {
 	}
 }
 
-void BufferCache::AwaitSubmittedDownloads(uint64_t vaddr, uint64_t size) {
+bool BufferCache::HandOffGuestCopy(const GuestReadback& request, Buffer& buffer, BufferId id,
+                                   uint64_t base, uint64_t size) {
+	if (!g_guest_copy.On()) {
+		return false;
+	}
+	auto copy  = std::make_shared<GuestCopy>();
+	copy->base = base;
+	copy->size = size;
+	// Downloads of every GPU-dirty byte are submitted and still running: the requester waits
+	// for them. (Finished ones are published by now: the request is served here, without a wait.)
+	if (const auto tick = SubmittedDownloadTick(base, size); tick != 0) {
+		if (m_scheduler.IsFree(tick)) {
+			return false;
+		}
+		copy->wait_tick = tick;
+		g_guest_copy_waits.Add();
+		*request.handoff = std::move(copy);
+		return true;
+	}
+	// The bytes are read from the mapping: whole tracking pages (their GPU-dirty state ends with
+	// the copy), a write that is submitted, and not more bytes than the bus reads are worth.
+	const auto write_tick = buffer.gpu_write_tick;
+	if (((base | size) & (TRACKER_PAGE_SIZE - 1u)) != 0 || !buffer.IsHostReadable() ||
+	    buffer.gpu_write_open || write_tick >= m_scheduler.CurrentTick() ||
+	    !buffer.IsInBounds(base, size)) {
+		return false;
+	}
+	uint64_t dirty = 0;
+	m_gpu_modified_ranges.ForEachInRange(base, size, [&](uint64_t begin, uint64_t end) {
+		copy->intervals.push_back({begin, end - begin});
+		dirty += end - begin;
+	});
+	if (dirty == 0 || dirty > (uint64_t {g_guest_copy_max_kb.Get()} << 10u)) {
+		return false;
+	}
+	copy->buffer         = &buffer;
+	copy->buffer_id      = id;
+	copy->buffer_address = buffer.CpuAddress();
+	copy->wait_tick      = write_tick;
+	ForgetColorMetadataChecks(base, size);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, dirty);
+	Common::GpuTiming::Sync().AddInPlaceReadback();
+	g_guest_copies.Add();
+	g_guest_copy_bytes.Add(dirty);
+	std::erase_if(m_guest_copies, [](const std::shared_ptr<GuestCopy>& other) {
+		return other->finished.load(std::memory_order_acquire);
+	});
+	m_guest_copies.push_back(copy);
+	*request.handoff = std::move(copy);
+	return true;
+}
+
+void BufferCache::RunGuestCopy(GuestCopy& copy) {
+	// As ReadBackInPlace: the write, then the publications of earlier downloads of these bytes.
+	(void)m_scheduler.GetMasterSemaphore().Wait(copy.wait_tick);
+	m_scheduler.WaitPriorityOperations(copy.wait_tick);
+	if (copy.buffer != nullptr) {
+		const auto& intervals = copy.intervals;
+		uint64_t    largest   = 0;
+		for (const auto& interval: intervals) {
+			largest = std::max(largest, interval.size);
+		}
+		thread_local std::vector<uint8_t> scratch;
+		scratch.resize(static_cast<size_t>(largest));
+		std::vector<Published> published;
+		published.reserve(static_cast<size_t>(copy.size / TRACKER_PAGE_SIZE));
+		const auto end  = copy.base + copy.size;
+		size_t     next = 0;
+		// A caching page at a time: the region's lock is held for one page's bus reads.
+		for (auto chunk = copy.base; chunk < end && next < intervals.size();
+		     chunk += CACHING_PAGESIZE) {
+			const auto chunk_end = std::min(chunk + CACHING_PAGESIZE, end);
+			while (next < intervals.size() &&
+			       intervals[next].address + intervals[next].size <= chunk) {
+				++next;
+			}
+			if (next == intervals.size() || intervals[next].address >= chunk_end) {
+				continue;
+			}
+			m_memory_tracker.PublishGpuModified(
+			    chunk, chunk_end - chunk,
+			    [&] { return copy.current.load(std::memory_order_acquire); },
+			    [&](uint64_t address, uint64_t bytes) noexcept {
+				    for (size_t i = next;
+				         i < intervals.size() && intervals[i].address < address + bytes; ++i) {
+					    const auto from = std::max(address, intervals[i].address);
+					    const auto to   = std::min(address + bytes,
+					                               intervals[i].address + intervals[i].size);
+					    if (from < to) {
+						    copy.buffer->ReadMapped(from - copy.buffer_address, to - from,
+						                            scratch.data());
+						    Libs::LibKernel::Memory::WriteBacking(from, scratch.data(), to - from);
+					    }
+				    }
+				    published.push_back({address, bytes});
+			    });
+		}
+		if (!published.empty()) {
+			std::lock_guard lock(m_published_mutex);
+			m_published.insert(m_published.end(), published.begin(), published.end());
+			m_published_pending.store(true, std::memory_order_release);
+		}
+	}
+	copy.finished.store(true, std::memory_order_release);
+	copy.finished.notify_all();
+}
+
+void BufferCache::WaitGuestCopies(BufferId id) {
+	std::erase_if(m_guest_copies, [&](const std::shared_ptr<GuestCopy>& copy) {
+		if (copy->buffer_id == id) {
+			copy->finished.wait(false, std::memory_order_acquire);
+		}
+		return copy->finished.load(std::memory_order_acquire);
+	});
+}
+
+uint64_t BufferCache::SubmittedDownloadTick(uint64_t vaddr, uint64_t size) {
 	uint64_t wait_tick = 0;
 	bool     covered   = true;
 	m_gpu_modified_ranges.ForEachInRange(vaddr, size, [&](uint64_t begin, uint64_t end) {
@@ -784,7 +975,12 @@ void BufferCache::AwaitSubmittedDownloads(uint64_t vaddr, uint64_t size) {
 			}
 		}
 	});
-	if (!covered || wait_tick == 0 || wait_tick >= m_scheduler.CurrentTick()) {
+	return covered && wait_tick < m_scheduler.CurrentTick() ? wait_tick : 0;
+}
+
+void BufferCache::AwaitSubmittedDownloads(uint64_t vaddr, uint64_t size) {
+	const auto wait_tick = SubmittedDownloadTick(vaddr, size);
+	if (wait_tick == 0) {
 		return;
 	}
 	m_scheduler.Wait(wait_tick);
@@ -992,6 +1188,7 @@ void BufferCache::RecordAsyncDownloads() {
 		    if (!published.empty()) {
 			    std::lock_guard lock(m_published_mutex);
 			    m_published.insert(m_published.end(), published.begin(), published.end());
+			    m_published_pending.store(true, std::memory_order_release);
 		    }
 	    },
 	    GuestWrites {written_begin, written_end - written_begin});
@@ -1432,10 +1629,13 @@ void BufferCache::NoteHostWrite(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
+	// What a guest thread's own copy or a finished download published is not dirty any more.
+	DrainPublished();
 	return m_gpu_modified_ranges.Intersects(vaddr, size);
 }
 
 bool BufferCache::HasOnlyGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
+	DrainPublished();
 	return m_gpu_modified_ranges.Contains(vaddr, size);
 }
 
