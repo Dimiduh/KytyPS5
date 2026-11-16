@@ -2381,12 +2381,40 @@ static bool ServesBuffer(const ResourcePlan& program, uint32_t resource,
 	auto layout    = compiled;
 	layout.unbound = current.unbound;
 	if (layout == current) return true;
+	// A V# whose descriptor the shader takes from its own data (no table the GPU selects from).
+	const auto* source = resource < program.info.buffers.size()
+	                         ? Source(program, program.info.buffers[resource].source)
+	                         : nullptr;
+	const bool  plain  = source != nullptr && !source->indirect_descriptor.has_value() &&
+	                    compiled.indirect_root == BufferResource::NoIndirectBuffer &&
+	                    current.indirect_root == BufferResource::NoIndirectBuffer;
+	// A module that reads the stride at run time (a stride field of 1, nothing else) computes
+	// the addresses of a V# without a stride too: the stride word is zero then, and so is every
+	// index times it, which is all a zero stride changes. (Where a zero stride makes every access
+	// miss, zero_stride_oob differs and the layouts stay different.)
+	if (portable && plain && compiled.packed_stride == 1u && current.packed_stride == 0u) {
+		layout.packed_stride = 0u;
+		if (layout == current) return true;
+	}
 	// A module that reads the buffer's format at run time behaves as one compiled for any of
 	// the formats it can read (PortableBufferFormats).
 	if (compiled.descriptor_swizzle == PortableBufferSwizzle) {
+		if (!portable) return false;
+		// Every access of an unbound buffer misses. The module's loads then read what the
+		// format its format word names reads out of bounds, or zero for a word that names none
+		// (FillBufferFormats); the module of the V# itself reads that too unless the V# has a
+		// format outside the list whose swizzle gives a component one.
+		if (current.unbound && plain && compiled.scalar_empty == current.scalar_empty &&
+		    (Format::GetFormatInfo(current.descriptor_format).type ==
+		         Format::ComponentType::Unknown ||
+		     PortableBufferFormatIndex(current.descriptor_format, current.descriptor_swizzle) !=
+		         UINT32_MAX ||
+		     FormattedOutOfBoundsZero(program, resource, current.descriptor_swizzle))) {
+			return true;
+		}
 		layout.descriptor_format  = current.descriptor_format;
 		layout.descriptor_swizzle = current.descriptor_swizzle;
-		return portable && layout == current &&
+		return layout == current &&
 		       PortableBufferFormatIndex(current.descriptor_format, current.descriptor_swizzle) !=
 		           UINT32_MAX;
 	}
@@ -2409,11 +2437,21 @@ static bool ServesImage(const ResourcePlan& program, uint32_t index,
                         const ResourceSpecialization::Image& current, bool portable,
                         const ResourceSnapshot* resources) {
 	if (compiled == current) return true;
-	if (!portable || compiled.shader_swizzle != PortableImageSwizzle ||
+	if (!portable) return false;
+	auto layout = compiled;
+	// A module with a descriptor for every level a T# can have serves the T#s with fewer
+	// (PortableMipCount).
+	if (compiled.mip_count == PortableMipCount && current.mip_count <= PortableMipCount &&
+	    index < program.info.images.size() &&
+	    program.info.images[index].mip_mode == ImageMipMode::Dynamic &&
+	    program.info.images[index].resource_class == ImageResourceClass::Sampled) {
+		layout.mip_count = current.mip_count;
+		if (layout == current) return true;
+	}
+	if (compiled.shader_swizzle != PortableImageSwizzle ||
 	    current.shader_swizzle == PortableImageSwizzle) {
 		return false;
 	}
-	auto layout           = compiled;
 	layout.shader_swizzle = current.shader_swizzle;
 	if (layout == current) return true;
 	if (resources == nullptr || index >= program.info.images.size() ||
@@ -3631,7 +3669,15 @@ std::optional<ResourceSpecialization> CodeOnlySpecialization(const Program& prog
 		    .dimension     = image.dimension == Decoder::ImageDimension::Unknown
 		                         ? Decoder::ImageDimension::Dim2D
 		                         : image.dimension,
+		    // A cube when the instructions say so, as a null T# is (BuildResourceSpecialization).
+		    .cube          = image.cube,
 		});
+		// A sampled image whose gathers select the level takes a descriptor for every level a
+		// T# can have (PortableMipCount).
+		if (portable && image.mip_mode == ImageMipMode::Dynamic &&
+		    image.resource_class == ImageResourceClass::Sampled) {
+			entry.mip_count = PortableMipCount;
+		}
 		// An image only raw loads and stores reach is such a portable image too, and declared
 		// float it also serves integer T#s (RawClassImage).
 		if (portable && (image.resource_class == ImageResourceClass::Storage ||

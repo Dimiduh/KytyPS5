@@ -1204,12 +1204,17 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		binding.mip_views.clear();
 		const auto& resource = program.info.images[i];
 		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
-			EXIT_IF(resource.mip_count == 0u ||
-			        resource.mip_count != binding.desc.view_info.level_count);
+			// A module built from the shader's code alone has a descriptor for every level a
+			// T# can have (IR::PortableMipCount): the ones past the T#'s last level show that
+			// level, which is where the T#'s own module clamps the level to.
+			const auto levels = binding.desc.view_info.level_count;
+			EXIT_IF(resource.mip_count == 0u || levels == 0u || levels > resource.mip_count ||
+			        (levels != resource.mip_count &&
+			         resource.mip_count != ShaderRecompiler::IR::PortableMipCount));
 			binding.mip_views.reserve(resource.mip_count);
 			for (uint32_t mip = 0; mip < resource.mip_count; mip++) {
 				auto desc = binding.desc;
-				desc.view_info.base_level += mip;
+				desc.view_info.base_level += std::min(mip, levels - 1u);
 				desc.view_info.level_count = 1;
 				// The shader selects the mip after applying the guest minimum LOD.
 				desc.view_info.min_lod = 0;

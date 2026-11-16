@@ -1067,7 +1067,7 @@ void StoreFormattedPrepared(ValueEmitContext& ctx, const IR::Inst& inst,
 	// RDNA2 formatted stores transfer the entire format, zero-filling missing VGPRs.
 	const auto count = mem.data_bits == 16u ? mem.component_count : components;
 	const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, info);
-	// A portable buffer is accessed through DWORD elements: the 16-bit components of its formats
+	// A portable buffer's format that is accessed through DWORD elements: its 16-bit components
 	// (16_16 and 16_16_16_16) are stored two to a DWORD, which they fill, instead of each merged
 	// into its DWORD by a compare-exchange loop.
 	const bool pairs = ctx.state.portable_format != UINT32_MAX && !info.packed_bitfield &&
@@ -1683,6 +1683,21 @@ uint32_t LoadIndirectFormattedD16X(ValueEmitContext& ctx, const IndirectBufferAc
 	});
 }
 
+// The access of a buffer that takes its format at run time, for the format being emitted
+// (state.portable_format): the DWORD view the buffer access prepared, or the byte or short view
+// of the same binding for a format of bytes or shorts, which is how the module of the format
+// itself accesses the buffer (IR::PortableBufferFormat::element_bits).
+MemoryResourceAccess PortableFormatAccess(EmitterState& state, const IR::MemoryInfo& mem,
+                                          const MemoryResourceAccess& dwords) {
+	const auto bits = IR::PortableBufferFormats[state.portable_format].element_bits;
+	if (bits == 32u || dwords.object_pointer == 0u) return dwords;
+	auto access = PrepareStorageBufferResourceAccess(
+	    state, mem, state.storage_buffers[bits == 8u ? 0 : 1],
+	    dwords.non_uniform ? dwords.descriptor_index : 0u);
+	access.element_bits = bits;
+	return access;
+}
+
 uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
 	const auto mem = ctx.Memory(inst);
@@ -1719,7 +1734,7 @@ uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compon
 					    value = EmitValueOrDefaultIfCondition(state, named, type, value, [&]() {
 						    state.portable_format = format;
 						    const auto decoded    = LoadFormattedPrepared(
-						        ctx, inst, selected, resource,
+						        ctx, inst, selected, PortableFormatAccess(state, selected, resource),
 						        Format::GetFormatInfo(IR::PortableBufferFormats[format].format),
 						        components);
 						    state.portable_format = UINT32_MAX;
@@ -1757,7 +1772,7 @@ void StoreBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t component
 					EmitIfCondition(state, named, [&]() {
 						state.portable_format = format;
 						StoreFormattedPrepared(
-						    ctx, inst, selected, resource,
+						    ctx, inst, selected, PortableFormatAccess(state, selected, resource),
 						    Format::GetFormatInfo(IR::PortableBufferFormats[format].format),
 						    composite, components);
 						state.portable_format = UINT32_MAX;

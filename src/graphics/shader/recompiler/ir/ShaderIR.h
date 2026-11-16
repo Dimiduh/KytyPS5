@@ -134,15 +134,21 @@ struct ExportInfo {
 // the one the binding's shader-data format word names. Such a module needs nothing from the V#
 // descriptor, so it can be built before any dispatch has bound one, from the shader's code alone
 // (CodeOnlySpecialization), and it serves every dispatch whose buffers have one of these formats
-// with the swizzle its component count gives (SpecializationServes). The formats are the ones the
-// formatted buffers of Saros' compute shaders have in about 97% of the cases, read or written;
-// all are accessed through DWORD elements with records of whole DWORDs (16-bit integer formats
-// are not: their buffers need not end on a DWORD). Buffers with atomics are not portable.
+// with the swizzle listed with it (SpecializationServes). The formats are the ones the formatted
+// buffers of Saros' compute shaders have most often, read or written: the first seven in about 97%
+// of the buffers, and 16_UINT (index buffers), which alone kept more shaders from their prebuilt
+// module than every other format outside the list together. The list is short on purpose: every
+// formatted access holds the decoding of each entry, and with 26 entries the driver took minutes
+// over the shaders with many such accesses. Each format is accessed through elements of
+// `element_bits`: the first seven through the DWORD view of the binding (their records are whole
+// DWORDs), 16_UINT through the view of shorts, as the module of the format itself does, since a
+// buffer of shorts need not end on a DWORD. Buffers with atomics are not portable.
 struct PortableBufferFormat {
 	Prospero::BufferFormat format;
 	uint32_t               swizzle;
+	uint32_t               element_bits = 32;
 };
-inline constexpr std::array<PortableBufferFormat, 7> PortableBufferFormats {{
+inline constexpr std::array<PortableBufferFormat, 8> PortableBufferFormats {{
     {Prospero::BufferFormat::k32UInt, DstSel(4, 0, 0, 1)},
     {Prospero::BufferFormat::k32_32_32_32Float, DstSel(4, 5, 6, 7)},
     {Prospero::BufferFormat::k16_16_16_16Float, DstSel(4, 5, 6, 7)},
@@ -150,6 +156,7 @@ inline constexpr std::array<PortableBufferFormat, 7> PortableBufferFormats {{
     {Prospero::BufferFormat::k32Float, DstSel(4, 0, 0, 1)},
     {Prospero::BufferFormat::k16_16Float, DstSel(4, 5, 0, 1)},
     {Prospero::BufferFormat::k32SInt, DstSel(4, 0, 0, 1)},
+    {Prospero::BufferFormat::k16UInt, DstSel(4, 0, 0, 1), 16},
 }};
 // The descriptor_swizzle of a portable buffer (its descriptor_format is kInvalid): no V# has it.
 inline constexpr uint32_t PortableBufferSwizzle = UINT32_MAX;
@@ -197,6 +204,13 @@ struct BufferResource {
 };
 
 enum class ImageMipMode { None, Dynamic };
+// The mip_count of a sampled image whose gathers select the level (ImageMipMode::Dynamic), in a
+// module built from the shader's code alone (CodeOnlySpecialization): such an image has one
+// descriptor per level, and a T# has at most this many (its level fields are 4 bits). The
+// renderer shows the last level of a T# with fewer in the descriptors past it, which is what the
+// level clamp of that T#'s own module selects there, so the module serves every level count
+// (SpecializationServes). Saros' occlusion pyramids change theirs with the dynamic resolution.
+inline constexpr uint32_t PortableMipCount = 16;
 
 constexpr uint32_t ShaderImageIdentitySwizzle = 0x00000facu;
 // The shader_swizzle of a storage image whose stores take the T#'s DST_SEL at run time instead

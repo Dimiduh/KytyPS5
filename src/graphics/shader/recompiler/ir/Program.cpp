@@ -219,7 +219,9 @@ Value ResolveActiveU32(Value value, Value active) {
 
 uint32_t StorageBufferElementBits(const Program& program, const MemoryInfo& memory) {
 	if (!memory.formatted) return memory.data_bits;
-	// Every portable format is accessed through DWORD elements.
+	// A buffer that takes its format at run time is declared through its DWORD view; the
+	// formats of bytes and shorts it selects from use the views of those (the emitter's
+	// PortableFormatAccess, PortableBufferFormat::element_bits).
 	if (!memory.typed && program.info.buffers[memory.resource].portable_format) return 32u;
 	const auto format = memory.typed
 	                        ? Format::DecodeTBufferFormat(memory.data_format, memory.number_format)

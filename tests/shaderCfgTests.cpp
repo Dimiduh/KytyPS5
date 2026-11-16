@@ -4123,15 +4123,49 @@ void TestPortableBufferFormats() {
             !IR::SpecializationServes(plan, *code_only, real, false) &&
             !IR::SpecializationServes(plan, real, *code_only),
         "the run-time format module did not serve the formats it selects from");
-  // Not a format outside its list, and not another access form (a zero stride).
+  // Not a format outside its list, and not a zero stride that makes every
+  // access miss (bounds mode 0), which the V#'s own module folds away.
   const auto [other, other_snapshot] =
-      materialize(user_data(word3(Format::k8UNorm, DstSel(4, 0, 0, 1)),
+      materialize(user_data(word3(Format::k8SNorm, DstSel(4, 0, 0, 1)),
                             real_words[7]));
   const auto zero_stride =
       materialize(user_data(real_words[3], real_words[7], 0u)).first;
   Check(!IR::SpecializationServes(plan, *code_only, other) &&
             !IR::SpecializationServes(plan, *code_only, zero_stride),
         "the run-time format module served a V# it cannot decode");
+  // 16_UINT is in the list, read through the view of shorts.
+  for (const auto &[format, swizzle, stride] :
+       {std::tuple{Format::k16UInt, DstSel(4, 0, 0, 1), 2u}}) {
+    const auto narrow =
+        materialize(user_data(word3(format, swizzle), real_words[7], stride))
+            .first;
+    Check(narrow.buffers[0].descriptor_format == format &&
+              IR::PortableBufferFormats[IR::PortableBufferFormatIndex(
+                                            format, swizzle)]
+                      .element_bits ==
+                  ShaderRecompiler::Format::GetFormatInfo(format)
+                      .component_bits[0] &&
+              IR::SpecializationServes(plan, *code_only, narrow),
+          "the run-time format module did not serve a buffer of shorts");
+  }
+  // A zero stride that leaves the accesses in bounds (raw bounds, mode 3) only
+  // drops the index from the address, which a zero stride word does too.
+  const auto raw_zero_stride =
+      materialize(user_data(real_words[3] | (3u << 28u), real_words[7], 0u))
+          .first;
+  Check(raw_zero_stride.buffers[0].packed_stride == 0u &&
+            !raw_zero_stride.buffers[0].zero_stride_oob &&
+            IR::SpecializationServes(plan, *code_only, raw_zero_stride) &&
+            !IR::SpecializationServes(plan, *code_only, raw_zero_stride,
+                                      false),
+        "the run-time stride module did not serve a V# without a stride");
+  // A null V# is the unbound buffer: every access misses, whatever the layout.
+  auto null_words = real_words;
+  null_words[0] = null_words[1] = null_words[2] = null_words[3] = 0u;
+  const auto unbound = materialize(null_words).first;
+  Check(unbound.buffers[0].unbound && unbound.buffers[0] != code_only->buffers[0] &&
+            IR::SpecializationServes(plan, *code_only, unbound),
+        "the run-time format module did not serve an unbound buffer");
 
   // The module reads one format byte per buffer binding from the shader data;
   // the renderer fills it from the V#s.

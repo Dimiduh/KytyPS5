@@ -645,6 +645,15 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 					const auto bits = StorageBufferElementBits(program, selected);
 					info.buffer_u8 |= bits == 8u;
 					info.buffer_u16 |= bits == 16u;
+					// A buffer that takes its format at run time is accessed through the
+					// elements of every format it selects from.
+					if (selected.formatted && !selected.typed &&
+					    info.buffers[resource].portable_format) {
+						for (const auto& format: PortableBufferFormats) {
+							info.buffer_u8 |= format.element_bits == 8u;
+							info.buffer_u16 |= format.element_bits == 16u;
+						}
+					}
 				};
 				collect_element(memory.resource);
 				for (const auto child: info.buffers[memory.resource].indirect_resources)
