@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <span>
+#include <vector>
 #include <utility>
 
 namespace Libs::Graphics {
@@ -162,6 +163,22 @@ inline constexpr uint64_t ClampReportLimit = 256;
 [[nodiscard]] uint64_t    ClampedRangeReports();
 // The mapped size from vaddr, at most size; 0 when vaddr itself is unmapped.
 [[nodiscard]] uint64_t MappedRangeSize(uint64_t vaddr, uint64_t size);
+// The guest mapping that holds `vaddr`, or the first one after it: [*start, *end). False when
+// there is none. (For host tools: the live channel's `mem`.)
+[[nodiscard]] bool     NextMappedRange(uint64_t vaddr, uint64_t* start, uint64_t* end);
+// The addresses in [from, to) of the guest's mappings where `pattern` stands, at multiples of
+// `align`, at most `limit` of them, ascending. Read through the backing store, backed pages
+// only (a sparse heap is mostly not backed), in runs, so a match may cross pages; what the GPU
+// wrote and nobody read back is not seen. `scanned_bytes`: how much was looked at. Any thread.
+[[nodiscard]] std::vector<uint64_t> FindInBacking(std::span<const uint8_t> pattern, uint64_t align,
+                                                  size_t limit, uint64_t from = 0,
+                                                  uint64_t  to            = UINT64_MAX,
+                                                  uint64_t* scanned_bytes = nullptr);
+// A store of the host into the guest's memory as the guest's CPU would make it: the renderer's
+// caches stop watching the bytes first (the next GPU use takes them from memory), then the
+// bytes go in through the backing store, whatever the pages' protection. False when the range
+// is not backed. Any thread but the GPU thread's deferred operations.
+bool StoreGuestBytes(uint64_t vaddr, const void* data, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;

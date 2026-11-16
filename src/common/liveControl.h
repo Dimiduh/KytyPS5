@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 // A measurement channel for one boot and many same-process experiments. With KYTY_LIVE_FILE set
 // to a command file, a side thread reads the file every 100 ms and runs its commands once per new
@@ -77,6 +78,14 @@ struct HostHooks {
 	// Shader translations and pipeline builds the emulator runs ahead of their first use and
 	// has not finished (for `wait`).
 	uint64_t (*pending_builds)()                                = nullptr;
+	// Guest memory for `mem`: the mapping at or after an address, and reads and writes of mapped
+	// bytes through the backing store (page protection is neither needed nor changed).
+	bool (*guest_next_mapping)(uint64_t address, uint64_t* start, uint64_t* end) = nullptr;
+	bool (*guest_read)(uint64_t address, void* data, uint64_t size)             = nullptr;
+	bool (*guest_write)(uint64_t address, const void* data, uint64_t size)      = nullptr;
+	std::vector<uint64_t> (*guest_find)(const uint8_t* pattern, size_t size, uint64_t align,
+	                                    size_t limit, uint64_t from, uint64_t to,
+	                                    uint64_t* scanned) = nullptr;
 };
 void SetHostHooks(const HostHooks& hooks) noexcept;
 

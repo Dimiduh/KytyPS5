@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <magic_enum.hpp>
 #include <map>
 #include <memory>
@@ -2718,6 +2719,118 @@ bool TestGuestFreeRangeBounds() {
 	       !GuestFreeRangeContains(0x10000, 0x20000, 0x40000, 0x4000);
 }
 #endif
+
+bool NextMappedRange(uint64_t vaddr, uint64_t* start, uint64_t* end) {
+	VirtualRanges::Range candidate {};
+	std::shared_lock     state(g_memory_state_mutex);
+	if (g_virtual_ranges == nullptr || !g_virtual_ranges->Query(vaddr, 1, &candidate)) {
+		return false;
+	}
+	*start = candidate.start;
+	*end   = candidate.start + candidate.size;
+	return true;
+}
+
+std::vector<uint64_t> FindInBacking(std::span<const uint8_t> pattern, uint64_t align, size_t limit,
+                                    uint64_t from, uint64_t to, uint64_t* scanned_bytes) {
+	uint64_t scanned = 0;
+	if (pattern.empty() || align == 0) {
+		return {};
+	}
+	constexpr uint64_t    Chunk = 4u << 20u;
+	constexpr uint64_t    Page  = 0x4000;
+	std::vector<uint64_t> found;
+	std::vector<uint8_t>  buffer(2 * Chunk + pattern.size());
+	const std::boyer_moore_horspool_searcher searcher(pattern.begin(), pattern.end());
+	uint64_t   value = 0;
+	const bool word  = align == sizeof(value) && pattern.size() == sizeof(value);
+	if (word) {
+		std::memcpy(&value, pattern.data(), sizeof(value));
+	}
+	// One run of backed bytes at `base`.
+	const auto search = [&](uint64_t base, const uint8_t* first, uint64_t size) {
+		if (word) {
+			for (uint64_t i = (align - base % align) % align;
+			     i + sizeof(value) <= size && found.size() < limit; i += align) {
+				uint64_t here = 0;
+				std::memcpy(&here, first + i, sizeof(here));
+				if (here == value) {
+					found.push_back(base + i);
+				}
+			}
+			return;
+		}
+		const auto* last = first + size;
+		for (const auto* hit = std::search(first, last, searcher); hit != last && found.size() < limit;
+		     hit             = std::search(hit + 1, last, searcher)) {
+			const auto address = base + static_cast<uint64_t>(hit - first);
+			if (address % align == 0) {
+				found.push_back(address);
+			}
+		}
+	};
+	for (uint64_t at = from; found.size() < limit;) {
+		uint64_t start = 0;
+		uint64_t end   = 0;
+		if (!NextMappedRange(at, &start, &end) || start >= to || end <= at) {
+			break;
+		}
+		start = std::max(start, at);
+		end   = std::min(end, to);
+		// The run of backed bytes read so far. A run that goes on keeps the pattern's length
+		// less one of its end: a match across the cut is found, none is found twice.
+		uint64_t   run_base = 0;
+		uint64_t   run_size = 0;
+		const auto flush    = [&](bool goes_on) {
+			if (run_size >= pattern.size()) {
+				search(run_base, buffer.data(), run_size);
+			}
+			const auto keep = goes_on ? std::min<uint64_t>(run_size, pattern.size() - 1) : 0;
+			if (keep != 0) {
+				std::memmove(buffer.data(), buffer.data() + run_size - keep, static_cast<size_t>(keep));
+			}
+			run_base += run_size - keep;
+			run_size = keep;
+		};
+		for (uint64_t pos = start; pos < end && found.size() < limit;) {
+			if (run_size == 0) {
+				run_base = pos;
+			}
+			// A whole chunk where all of it is backed, else a page.
+			uint64_t step = std::min<uint64_t>(Chunk, end - pos);
+			if (!TryReadBacking(pos, buffer.data() + run_size, step)) {
+				step = std::min(end, (pos / Page + 1) * Page) - pos;
+				if (!TryReadBacking(pos, buffer.data() + run_size, step)) {
+					flush(false);
+					pos += step;
+					continue;
+				}
+			}
+			scanned += step;
+			run_size += step;
+			pos += step;
+			if (run_size >= Chunk) {
+				flush(true);
+			}
+		}
+		flush(false);
+		at = end;
+	}
+	if (scanned_bytes != nullptr) {
+		*scanned_bytes = scanned;
+	}
+	return found;
+}
+
+bool StoreGuestBytes(uint64_t vaddr, const void* data, uint64_t size) {
+	if (size == 0 || g_guest_address_space == nullptr || !g_guest_address_space->IsBacked(vaddr, size)) {
+		return false;
+	}
+	if (g_gpu_resources != nullptr) {
+		(void)g_gpu_resources->InvalidateMemory(vaddr, size);
+	}
+	return TryWriteBacking(vaddr, data, size);
+}
 
 int KYTY_SYSV_ABI KernelVirtualQuery(const void* addr, int flags, VirtualQueryInfo* info,
                                      uint64_t info_size) {

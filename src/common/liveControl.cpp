@@ -12,7 +12,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include <fstream>
+#include <functional>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -604,6 +606,140 @@ std::vector<std::string> Words(const std::string& line) {
 	return words;
 }
 
+// Guest bytes [address, address + size) into `data`; pages that are not backed read as zeros.
+// False when none of it is backed.
+bool ReadGuest(uint64_t address, uint8_t* data, uint64_t size) {
+	if (g_hooks.guest_read(address, data, size)) {
+		return true;
+	}
+	constexpr uint64_t Page = 0x4000;
+	bool               any  = false;
+	for (uint64_t at = address; at < address + size;) {
+		const auto next = std::min(address + size, (at / Page + 1) * Page);
+		if (g_hooks.guest_read(at, data + (at - address), next - at)) {
+			any = true;
+		} else {
+			std::memset(data + (at - address), 0, static_cast<size_t>(next - at));
+		}
+		at = next;
+	}
+	return any;
+}
+
+// The addresses in [from, to) of the guest's mappings where `pattern` stands, at multiples of
+// `align`, at most `limit` of them; `scanned` gets the bytes looked at.
+std::vector<uint64_t> FindGuest(const std::vector<uint8_t>& pattern, uint64_t align, size_t limit,
+                                uint64_t from, uint64_t to, uint64_t& scanned) {
+	return g_hooks.guest_find(pattern.data(), pattern.size(), align, limit, from, to, &scanned);
+}
+
+std::vector<uint8_t> HexBytes(const std::string& text) {
+	std::vector<uint8_t> bytes;
+	for (size_t i = 0; i + 1 < text.size(); i += 2) {
+		bytes.push_back(static_cast<uint8_t>(std::strtoul(text.substr(i, 2).c_str(), nullptr, 16)));
+	}
+	return bytes;
+}
+
+// mem maps                                   the guest's mappings: how many, their bytes
+// mem find <hex bytes> [max] [from] [to]     where the bytes stand
+// mem find16 <text> [max] [from] [to]        the text as a zero-terminated UTF-16 string
+// mem findq <hex value> [max] [from] [to]    the value as an aligned 64-bit word (a pointer)
+// mem read <hex address> <count>             up to 1024 bytes, as hex
+// mem write <hex address> <hex bytes>        through the backing store
+// mem dump <hex address> <hex size> <file>   the range into a file (unbacked pages as zeros)
+// Addresses and values are hexadecimal. Reads and writes go through the backing store: they see
+// what the guest's CPU stored, not what the GPU has written and nobody read back.
+void Mem(uint64_t id, const std::vector<std::string>& words) {
+	if (g_hooks.guest_read == nullptr || g_hooks.guest_next_mapping == nullptr ||
+	    g_hooks.guest_write == nullptr || g_hooks.guest_find == nullptr || words.size() < 2) {
+		Answer(Format("LIVE error id=%" PRIu64 " mem: not available", id));
+		return;
+	}
+	const auto hex = [&](size_t index, uint64_t fallback) {
+		return words.size() > index ? std::strtoull(words[index].c_str(), nullptr, 16) : fallback;
+	};
+	const auto& what = words[1];
+	if (what == "maps") {
+		uint64_t count = 0;
+		uint64_t bytes = 0;
+		uint64_t start = 0;
+		uint64_t end   = 0;
+		for (uint64_t at = 0; g_hooks.guest_next_mapping(at, &start, &end) && end > at; at = end) {
+			count++;
+			bytes += end - start;
+		}
+		Answer(Format("LIVE mem id=%" PRIu64 " maps: %" PRIu64 " mappings, %" PRIu64 " MiB", id, count,
+		              bytes >> 20u));
+	} else if ((what == "find" || what == "find16" || what == "findq") && words.size() >= 3) {
+		std::vector<uint8_t> pattern;
+		uint64_t             align = 1;
+		if (what == "find") {
+			pattern = HexBytes(words[2]);
+		} else if (what == "find16") {
+			for (const char c: words[2]) {
+				pattern.push_back(static_cast<uint8_t>(c));
+				pattern.push_back(0);
+			}
+			pattern.push_back(0);
+			pattern.push_back(0);
+			align = 2;
+		} else {
+			const auto value = hex(2, 0);
+			pattern.resize(sizeof(value));
+			std::memcpy(pattern.data(), &value, sizeof(value));
+			align = 8;
+		}
+		if (pattern.empty()) {
+			Answer(Format("LIVE error id=%" PRIu64 " mem: nothing to find", id));
+			return;
+		}
+		const auto limit   = static_cast<size_t>(std::clamp<uint64_t>(
+            words.size() > 3 ? std::strtoull(words[3].c_str(), nullptr, 10) : 16u, 1u, 4096u));
+		uint64_t   scanned = 0;
+		const auto begin   = std::chrono::steady_clock::now();
+		const auto found   = FindGuest(pattern, align, limit, hex(4, 0), hex(5, UINT64_MAX), scanned);
+		std::string line   = Format(
+            "LIVE mem id=%" PRIu64 " %s: %zu found in %" PRIu64 " MiB, %.1f s:", id, what.c_str(),
+            found.size(), scanned >> 20u,
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+		for (const auto address: found) {
+			line += Format(" %" PRIx64, address);
+		}
+		Answer(line);
+	} else if (what == "read" && words.size() >= 4) {
+		const auto address = hex(2, 0);
+		const auto count   = std::clamp<uint64_t>(std::strtoull(words[3].c_str(), nullptr, 10), 1, 1024);
+		std::vector<uint8_t> bytes(static_cast<size_t>(count));
+		if (!ReadGuest(address, bytes.data(), count)) {
+			Answer(Format("LIVE error id=%" PRIu64 " mem: %" PRIx64 " is not mapped", id, address));
+			return;
+		}
+		std::string line = Format("LIVE mem id=%" PRIu64 " read %" PRIx64 ":", id, address);
+		for (size_t i = 0; i < bytes.size(); i++) {
+			line += Format(i % 8 == 0 ? " %02x" : "%02x", bytes[i]);
+		}
+		Answer(line);
+	} else if (what == "dump" && words.size() >= 5) {
+		const auto address = hex(2, 0);
+		const auto size    = std::min<uint64_t>(hex(3, 0), uint64_t {1} << 30u);
+		std::vector<uint8_t> bytes(static_cast<size_t>(size));
+		const bool           any = size != 0 && ReadGuest(address, bytes.data(), size);
+		std::ofstream        file(words[4], std::ios::binary | std::ios::trunc);
+		file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+		Answer(Format("LIVE mem id=%" PRIu64 " dump %" PRIx64 ": %zu bytes to %s%s", id, address, bytes.size(),
+		              words[4].c_str(), any ? "" : " (nothing of it is mapped)"));
+	} else if (what == "write" && words.size() >= 4) {
+		const auto address = hex(2, 0);
+		const auto bytes   = HexBytes(words[3]);
+		const bool done    = !bytes.empty() && g_hooks.guest_write(address, bytes.data(), bytes.size());
+		Answer(Format("LIVE mem id=%" PRIu64 " write %" PRIx64 ": %zu bytes %s", id, address, bytes.size(),
+		              done ? "written" : "NOT written (not mapped)"));
+	} else {
+		Answer(Format("LIVE error id=%" PRIu64 " mem: maps | find | find16 | findq | read | write | dump", id));
+	}
+}
+
 void Execute(uint64_t id, const std::string& line) {
 	const auto words = Words(line);
 	if (words.empty() || words[0].starts_with('#')) {
@@ -636,6 +772,8 @@ void Execute(uint64_t id, const std::string& line) {
 			list += Format(" %s=%u", entry->Name(), entry->Get());
 		}
 		Answer(list);
+	} else if (command == "mem") {
+		Mem(id, words);
 	} else if (command == "pad" && words.size() >= 2) {
 		Pad(id, words[1], static_cast<int>(number(2, 120.0)));
 	} else if (command == "stick" && words.size() == 6 && g_hooks.pad_sticks != nullptr) {

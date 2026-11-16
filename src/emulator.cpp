@@ -134,6 +134,24 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 	        },
 	    .quit           = [] { Libs::Graphics::WindowRequestClose(); },
 	    .pending_builds = [] { return Libs::Graphics::WindowPendingBackgroundBuilds(); },
+	    .guest_next_mapping =
+	        [](uint64_t address, uint64_t* start, uint64_t* end) {
+		        return Libs::LibKernel::Memory::NextMappedRange(address, start, end);
+	        },
+	    .guest_read =
+	        [](uint64_t address, void* data, uint64_t size) {
+		        return Libs::LibKernel::Memory::TryReadBacking(address, data, size);
+	        },
+	    .guest_write =
+	        [](uint64_t address, const void* data, uint64_t size) {
+		        return Libs::LibKernel::Memory::StoreGuestBytes(address, data, size);
+	        },
+	    .guest_find =
+	        [](const uint8_t* pattern, size_t size, uint64_t align, size_t limit, uint64_t from,
+	           uint64_t to, uint64_t* scanned) {
+		        return Libs::LibKernel::Memory::FindInBacking({pattern, size}, align, limit, from, to,
+		                                                      scanned);
+	        },
 	});
 	Common::LiveControl::Start();
 }
