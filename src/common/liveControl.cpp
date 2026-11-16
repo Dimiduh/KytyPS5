@@ -322,29 +322,21 @@ struct Sample {
 // or guest code, is taken as a leaf: its return address is the word at rsp). The walk stays
 // inside the thread's stack. The unwind tables are read under the system's own shared lock,
 // which a thread holds exclusively only while a module or a function table is added or removed.
-bool SampleThread(const NamedThread& thread, Sample& sample) noexcept {
-	// NOLINTNEXTLINE(performance-no-int-to-ptr)
-	auto* handle = reinterpret_cast<HANDLE>(thread.handle);
-	if (SuspendThread(handle) == static_cast<DWORD>(-1)) {
-		return false;
-	}
-	CONTEXT context {};
-	context.ContextFlags = CONTEXT_FULL;
-	const bool ok        = GetThreadContext(handle, &context) != 0;
-	if (ok) {
-		sample.count        = 0;
-		const auto on_stack = [&](uint64_t address) {
-			return address >= thread.stack_low && address + 8 <= thread.stack_high &&
-			       (address & 7u) == 0;
-		};
+// The walk of SampleThread, apart so that a fault in it is caught: a thread can be stopped at an
+// instant its function's unwind data does not describe (a frame register that is not set up
+// yet), and the system's unwinder then reads through whatever the registers hold. The frames
+// found until then stand. (Such a fault ended the emulator: it reaches no handler of ours.)
+void WalkSuspendedThread(CONTEXT& context, uint64_t stack_low, uint64_t stack_high,
+                         Sample& sample) noexcept {
+	__try {
 		while (context.Rip != 0 && sample.count < SAMPLE_FRAMES) {
 			sample.frames[sample.count++] = context.Rip;
-			if (!on_stack(context.Rsp)) {
+			if (context.Rsp < stack_low || context.Rsp + 8 > stack_high || (context.Rsp & 7u) != 0) {
 				break;
 			}
 			DWORD64 image_base = 0;
-			if (auto* function = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
-			    function != nullptr) {
+			auto*   function   = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
+			if (function != nullptr) {
 				void*   handler_data = nullptr;
 				DWORD64 establisher  = 0;
 				RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context,
@@ -355,6 +347,22 @@ bool SampleThread(const NamedThread& thread, Sample& sample) noexcept {
 				context.Rsp += 8;
 			}
 		}
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+	}
+}
+
+bool SampleThread(const NamedThread& thread, Sample& sample) noexcept {
+	// NOLINTNEXTLINE(performance-no-int-to-ptr)
+	auto* handle = reinterpret_cast<HANDLE>(thread.handle);
+	if (SuspendThread(handle) == static_cast<DWORD>(-1)) {
+		return false;
+	}
+	CONTEXT context {};
+	context.ContextFlags = CONTEXT_FULL;
+	const bool ok        = GetThreadContext(handle, &context) != 0;
+	if (ok) {
+		sample.count = 0;
+		WalkSuspendedThread(context, thread.stack_low, thread.stack_high, sample);
 	}
 	ResumeThread(handle);
 	return ok;
@@ -450,6 +458,51 @@ void Profile(uint64_t id, double seconds, const std::string& thread_name, size_t
 	static Symbols                            symbols;
 	std::unordered_map<std::string, uint64_t> self;
 	std::unordered_map<std::string, uint64_t> inclusive;
+	// "under:<text>": what runs inside the outermost function whose name contains the text.
+	static constexpr std::string_view Under = "under:";
+	if (focus.starts_with(Under)) {
+		const auto within  = focus.substr(Under.size());
+		uint64_t   matched = 0;
+		for (const auto& sample: samples) {
+			uint32_t outer = UINT32_MAX;
+			for (uint32_t i = 0; i < sample.count; i++) {
+				if (symbols.Name(sample.frames[i]).find(within) != std::string::npos) {
+					outer = i;
+				}
+			}
+			if (outer == UINT32_MAX) {
+				continue;
+			}
+			matched++;
+			self[symbols.Name(sample.frames[0])]++;
+			std::unordered_set<std::string_view> seen;
+			for (uint32_t i = 0; i < outer; i++) {
+				const auto& name = symbols.Name(sample.frames[i]);
+				if (seen.insert(name).second) {
+					inclusive[name]++;
+				}
+			}
+		}
+		Answer(Format("LIVE prof id=%" PRIu64 " thread=%s samples=%zu under %s: %.2f%% of them", id,
+		              thread_name.c_str(), samples.size(), within.c_str(),
+		              100.0 * static_cast<double>(matched) / static_cast<double>(samples.size())));
+		const auto list = [&](const char* kind, const std::unordered_map<std::string, uint64_t>& counts) {
+			std::vector<std::pair<std::string, uint64_t>> sorted(counts.begin(), counts.end());
+			std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+				return a.second != b.second ? a.second > b.second : a.first < b.first;
+			});
+			for (size_t i = 0; i < std::min(top, sorted.size()); i++) {
+				Answer(Format("LIVE prof id=%" PRIu64 " %s %5.2f%% %s", id, kind,
+				              100.0 * static_cast<double>(sorted[i].second) /
+				                  static_cast<double>(samples.size()),
+				              Short(sorted[i].first).c_str()));
+			}
+		};
+		list("self", self);
+		list("incl", inclusive);
+		Answer(Format("LIVE prof id=%" PRIu64 " end", id));
+		return;
+	}
 	// With a focus: the callers of the innermost function whose name contains it, three deep.
 	std::unordered_map<std::string, uint64_t> paths;
 	for (const auto& sample: samples) {
