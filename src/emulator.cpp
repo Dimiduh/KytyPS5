@@ -155,6 +155,20 @@ static void LoadElf(const std::filesystem::path& elf, bool dbg_print_reloc = fal
 	}
 }
 
+// The game's title id, from its parameters (PPSA07631).
+static std::string TitleId() {
+	std::string title_id;
+	Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id);
+	if (title_id.empty()) {
+		std::string content_id;
+		if (Loader::SystemContentParamSfoGetString("CONTENT_ID", &content_id) && content_id.size() == 36 &&
+		    content_id[6] == '-' && content_id[16] == '_') {
+			title_id = content_id.substr(7, 9);
+		}
+	}
+	return title_id;
+}
+
 static void Execute(const std::filesystem::path& game_patch) {
 	if (const auto list = Config::ExportPipelineListPath(); !list.empty()) {
 		// The renderer is up; the guest never starts.
@@ -163,7 +177,17 @@ static void Execute(const std::filesystem::path& game_patch) {
 	if (Config::PrecompileOnlyEnabled()) {
 		// Shaders from the game's files join the ones the game created in earlier sessions,
 		// before the precompile lists what to build.
-		if (const auto seeds = Config::ImportShadersPath(); !seeds.empty()) {
+		// (A folder stands for its <title id>.seeds, when it has one.)
+		auto            seeds = Config::ImportShadersPath();
+		std::error_code seeds_error;
+		if (std::filesystem::is_directory(seeds, seeds_error)) {
+			const auto title_id = TitleId();
+			seeds /= title_id + ".seeds";
+			if (title_id.empty() || !std::filesystem::exists(seeds, seeds_error)) {
+				seeds.clear();
+			}
+		}
+		if (!seeds.empty()) {
 			const auto imported = Libs::Graphics::ShaderImportSeeds(seeds);
 			Log::WriteToConsoleAndLog(fmt::format(
 			    "Shader import: {} shaders ({} compute programs) from {}{}{}\n", imported.shaders,

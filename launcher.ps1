@@ -28,7 +28,7 @@ $logNames = 'Off', 'File (in the logs folder)', 'Console (slow)'
 
 $settings = [ordered]@{ game = ''; data = ''; resolution = '1920x1080'; fullscreen = $false; stretch = $false; language = 1
 	gpu = -1; gpu_name = ''; present_mode = 'Mailbox'; hdr = $false; perf_overlay = $false; sound = $true
-	skip_notice_screen = $false; redzone = $false; precompile_pipelines = $true; pipeline_lists = $true; framegen = 1; streamline = ''; log = 'off'; extra_args = ''; environment = '' }
+	skip_notice_screen = $false; redzone = $false; precompile_pipelines = $true; pipeline_lists = $true; skip_pending_draws = $true; framegen = 1; streamline = ''; log = 'off'; extra_args = ''; environment = '' }
 if (Test-Path -LiteralPath $settingsPath) {
 	# (A file that cannot be read leaves the defaults.)
 	try {
@@ -239,6 +239,9 @@ function Get-RunArguments {
 	# The shared pipeline lists next to the launcher (pipeline-lists\<title id>.pipelinelist) are run-windows.ps1's
 	# default; off: none.
 	if (!$settings.pipeline_lists) { $arguments += @('-PipelineList', 'none') }
+	# A graphics pipeline nothing has built yet: built in the background with its draws left out meanwhile (on), or
+	# the game waits for it (off).
+	$arguments += @('-SkipPendingDraws', $(if ($settings.skip_pending_draws) { 'on' } else { 'off' }))
 	# Frame generation: the generated frames per rendered one and where NVIDIA's runtime is; 0 turns off what the
 	# launch config may set.
 	if ($frameGenAvailable -and [int]$settings.framegen -ge 2) {
@@ -465,6 +468,12 @@ $tips.SetToolTip($pipelineLists, "A pipeline list (pipeline-lists\<title id>.pip
 	"soon as the emulator has their code (from the game, as it creates its shaders). Off: only what this data folder`n" +
 	"recorded itself.")
 Add-Row '' @($pipelineLists)
+$skipPending = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Never wait for a new graphics shader: draw without it until it is built'; AutoSize = $true; Checked = [bool]$settings.skip_pending_draws }
+$tips.SetToolTip($skipPending, "A graphics shader combination the game uses for the first time, and that no earlier session or list prepared,`n" +
+	"has to be compiled. On: that happens in the background and what it draws appears a moment late (at most 2 s),`n" +
+	"so the game does not stall. Off: the game waits for every one, which shows as a hitch in new places.`n" +
+	"Compute shaders always have to be waited for; 'Precompile shaders' prepares those from the game's files.")
+Add-Row '' @($skipPending)
 $log = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 320 }
 $log.Items.AddRange($logNames)
 $log.SelectedIndex = [Math]::Max(0, [Array]::IndexOf($logModes, [string]$settings.log))
@@ -542,6 +551,7 @@ function Read-Form {
 	$settings.redzone              = $redzone.Checked
 	$settings.precompile_pipelines = $precompilePipelines.Checked
 	$settings.pipeline_lists       = $pipelineLists.Checked
+	$settings.skip_pending_draws   = $skipPending.Checked
 	# (An unavailable row keeps the saved choice for when the runtime is there.)
 	if ($frameGenAvailable) { $settings.framegen = [Math]::Max(0, $frameGen.SelectedIndex) + 1 }
 	$settings.log                  = $logModes[[Math]::Max(0, $log.SelectedIndex)]

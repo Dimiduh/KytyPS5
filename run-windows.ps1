@@ -25,6 +25,16 @@
 #                                            to the emulator as given)
 #   .\run-windows.ps1 -Precompile            compile every recorded shader and pipeline into the driver cache, then
 #                                            exit: its "Precompile done:" line and the time it took at the end
+#   .\run-windows.ps1 -ImportShaders <file>  with -Precompile: also build the compute shaders of this file, which
+#                                            holds the shaders taken out of the game's own files, so that they are
+#                                            ready before the game first uses them. A folder stands for its
+#                                            <title id>.seeds. Default: the shader-seeds folder next to this script,
+#                                            if there is one; none: no file
+#   .\run-windows.ps1 -SkipPendingDraws on   a graphics pipeline the game needs and nothing has built yet is built
+#                                            in the background, and the draws that use it are left out until it is
+#                                            ready (at most 2 s) instead of the game waiting for it: no stall, the
+#                                            object appears a moment late. off: the game waits (the emulator's
+#                                            default)
 #   .\run-windows.ps1 -PipelineList <file>   also compile the shaders and pipelines of a shared pipeline list (what
 #                                            another data folder or player recorded, without shader code; the code
 #                                            comes from what this game has created or imported): with -Precompile
@@ -72,6 +82,8 @@ param(
 	[switch]$SkipNotice,
 	[ValidateSet('', 'on', 'off')][string]$PrecompilePipelines = '',
 	[switch]$Precompile,
+	[string]$ImportShaders = '',
+	[ValidateSet('', 'on', 'off')][string]$SkipPendingDraws = '',
 	[string]$PipelineList = '',
 	[string]$ExportPipelineList = '',
 	[ValidateRange(-1, 5)][int]$FrameGen = -1,
@@ -201,6 +213,23 @@ if ($PrecompilePipelines) {
 # into the driver cache; the emulator saves it and exits (0: done, 1: the cache could not be saved, 2: stopped). The
 # game does not start.
 if ($Precompile) { Add-Flag '--precompile-only' }
+# -ImportShaders: the shaders of the game's own files (--import-shaders, taken by the precompile pass only): a file,
+# or a folder with <title id>.seeds. Without it the shader-seeds folder next to this script, when there is one.
+if ($Precompile) {
+	if ($ImportShaders -eq 'none') {
+		$at = $options.IndexOf('--import-shaders')
+		if ($at -ge 0) { $options.RemoveRange($at, 2) }
+	} elseif ($ImportShaders) {
+		Set-Option '--import-shaders' ($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ImportShaders))
+	} elseif ($options.IndexOf('--import-shaders') -lt 0 -and (Test-Path -LiteralPath "$PSScriptRoot\shader-seeds" -PathType Container)) {
+		Set-Option '--import-shaders' "$PSScriptRoot\shader-seeds"
+	}
+}
+# -SkipPendingDraws on|off: --skip-pending-draws, or the config's without it.
+if ($SkipPendingDraws) {
+	[void]$options.Remove('--skip-pending-draws')
+	if ($SkipPendingDraws -eq 'on') { $options.Add('--skip-pending-draws') }
+}
 # -PipelineList: a shared list of recorded programs and pipelines (--import-pipeline-list). It names shaders by
 # content and carries none: an entry is built once the emulator has its shaders' code, from what the game created in
 # any session or from shader binaries imported with --import-shaders. -ExportPipelineList writes this data folder's

@@ -200,7 +200,8 @@ static void PrintUsage() {
 	    "  --import-shaders <file>              With --precompile-only: also build the compute\n"
 	    "                                       shaders of this file, which holds shader binaries\n"
 	    "                                       taken from the game's files (so before the game\n"
-	    "                                       has created them).\n");
+	    "                                       has created them). A folder: its <title id>.seeds,\n"
+	    "                                       if any.\n");
 	::printf("  --serialize-dispatches               Order every guest compute dispatch after the\n"
 	         "                                       previous one, also where the guest sends no\n"
 	         "                                       flush between them.\n");
