@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PENDINGLABELS_H_
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cstdint>
@@ -68,6 +69,7 @@ public:
 		}
 		if (it->elided) {
 			m_elided.fetch_sub(1, std::memory_order_release);
+			CountElided(*it, false);
 		}
 		m_labels.erase(it);
 	}
@@ -85,6 +87,7 @@ public:
 		if (!label->elided) {
 			label->elided = true;
 			m_elided.fetch_add(1, std::memory_order_release);
+			CountElided(*label, true);
 		}
 		return true;
 	}
@@ -99,6 +102,9 @@ public:
 	// Overlays the elided labels onto `size` bytes read from `address`, in recording order: what
 	// the memory holds once they are stored.
 	void PatchElided(uint64_t address, uint64_t size, void* data) const {
+		if (!MayOverlapElided(address, size)) {
+			return;
+		}
 		std::lock_guard lock(m_mutex);
 		for (const auto& label: m_labels) {
 			if (!label.elided || !Overlaps(label, address, size)) {
@@ -116,9 +122,32 @@ public:
 		return m_elided.load(std::memory_order_acquire) != 0;
 	}
 
+	// Whether an elided label may overlap the range: false only when none does. Takes no lock:
+	// the GPU thread asks this for every read of guest memory (thousands a frame, most of them
+	// of buffers that hold no label), and the list's lock is shared with the thread that stores
+	// the labels. A label is elided on the thread that then reads (the GPU thread), so a read
+	// never misses one; a label whose elision ends on another thread may still count for a
+	// moment, which only sends the read to the list.
+	[[nodiscard]] bool MayOverlapElided(uint64_t address, uint64_t size) const noexcept {
+		if (size == 0 || !HasElided()) {
+			return false;
+		}
+		const auto first = address >> FILTER_PAGE_BITS;
+		const auto last  = (address + size - 1u) >> FILTER_PAGE_BITS;
+		if (last - first >= FILTER_LONG_RANGE) {
+			return true;
+		}
+		for (auto page = first; page <= last; ++page) {
+			if (m_elided_pages[FilterSlot(page)].load(std::memory_order_relaxed) != 0) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	// The latest submission an elided label overlapping the range completes with; 0 if none.
 	[[nodiscard]] uint64_t ElidedTick(uint64_t address, uint64_t size) const {
-		if (!HasElided()) {
+		if (!MayOverlapElided(address, size)) {
 			return 0;
 		}
 		std::lock_guard lock(m_mutex);
@@ -145,6 +174,7 @@ public:
 				if (label.elided) {
 					label.elided = false;
 					m_elided.fetch_sub(1, std::memory_order_release);
+					CountElided(label, false);
 				}
 			}
 		}
@@ -213,6 +243,31 @@ private:
 		return address < label.address + label.size && label.address < address + size;
 	}
 
+	// The filter of MayOverlapElided: per hashed page of guest memory, how many elided labels
+	// touch it. Pages that share a slot share its count, which errs on the side of the list.
+	static constexpr uint32_t FILTER_PAGE_BITS  = 12;
+	static constexpr size_t   FILTER_SLOTS      = size_t {1} << 12u;
+	static constexpr uint64_t FILTER_LONG_RANGE = 64;
+
+	static size_t FilterSlot(uint64_t page) noexcept {
+		constexpr uint32_t bits = std::countr_zero(FILTER_SLOTS);
+		return static_cast<size_t>((page * 0x9e3779b97f4a7c15ull) >> (64u - bits));
+	}
+
+	// Called with the list locked, when a label becomes or stops being elided.
+	void CountElided(const Label& label, bool elided) noexcept {
+		const auto first = label.address >> FILTER_PAGE_BITS;
+		const auto last  = (label.address + label.size - 1u) >> FILTER_PAGE_BITS;
+		for (auto page = first; page <= last; ++page) {
+			auto& count = m_elided_pages[FilterSlot(page)];
+			if (elided) {
+				count.fetch_add(1, std::memory_order_relaxed);
+			} else {
+				count.fetch_sub(1, std::memory_order_relaxed);
+			}
+		}
+	}
+
 	// The latest label overlapping the bytes when it covers them all and its value satisfies
 	// `condition(value)`, else null. The labels recorded later win: they are stored later.
 	template <typename Condition>
@@ -256,6 +311,7 @@ private:
 	std::vector<StoredValue>        m_stored  = std::vector<StoredValue>(STORED_CAPACITY);
 	uint64_t                        m_last_id = 0;
 	std::atomic<uint32_t>           m_elided {0};
+	std::array<std::atomic<uint32_t>, FILTER_SLOTS> m_elided_pages {};
 };
 
 } // namespace Libs::Graphics

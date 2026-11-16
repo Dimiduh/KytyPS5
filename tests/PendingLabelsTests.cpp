@@ -46,6 +46,43 @@ void TestElideAndStore() {
         "a stored label stays elided");
 }
 
+// A read is told without the list's lock that no elided label can overlap it:
+// by the pages the elided labels are on, counted as they come and go.
+void TestElidedFilter() {
+  PendingLabels labels;
+  Check(!labels.MayOverlapElided(0x5ffc, 8), "an empty list may overlap a read");
+  // One label across a page boundary, one elsewhere that stays elided.
+  const auto id = labels.Add(0x5ffc, 8, 5);
+  labels.SetTick(id, 1);
+  const auto other = labels.Add(0xa000, 4, 1);
+  labels.SetTick(other, 2);
+  Check(!labels.MayOverlapElided(0x5ffc, 8),
+        "a label nothing has elided a wait on counts");
+  Check(labels.Elide(0x5ffc, 8, Equals(5)) && labels.Elide(0xa000, 4, Equals(1)),
+        "the waits were not elided");
+  Check(labels.MayOverlapElided(0x5000, 4) && labels.MayOverlapElided(0x6ff0, 16) &&
+            labels.MayOverlapElided(0x5ffc, 8) && labels.MayOverlapElided(0xa800, 1),
+        "a read on a page of an elided label is not sent to the list");
+  Check(labels.MayOverlapElided(0x100000, 0x100000),
+        "a read of many pages is not sent to the list");
+  Check(!labels.MayOverlapElided(0x900000, 64) && !labels.MayOverlapElided(0x5ffc, 0),
+        "a read on another page, or of nothing, is sent to the list");
+  uint64_t away = 0;
+  labels.PatchElided(0x900000, 8, &away);
+  uint64_t at = 0;
+  labels.PatchElided(0x5ffc, 8, &at);
+  Check(away == 0 && at == 5, "the overlay changed with the filter");
+  Check(labels.ElidedTick(0x900000, 8) == 0 && labels.ElidedTick(0x6000, 2) == 1,
+        "the tick of an elided label changed with the filter");
+  // The pages are given up when the label is stored, either way.
+  labels.Stored(id);
+  Check(!labels.MayOverlapElided(0x5ffc, 8) && labels.MayOverlapElided(0xa000, 4),
+        "a stored label still counts, or took the other label's page with it");
+  labels.StoreCompleted(0xa000, 4, 2, [](const PendingLabels::Label &) {});
+  Check(!labels.MayOverlapElided(0xa000, 4) && !labels.HasElided(),
+        "a label stored by a settling access still counts");
+}
+
 void TestPartialAndNewest() {
   PendingLabels labels;
   const auto low = labels.Add(0x1000, 8, 0x0000000200000001ull);
@@ -207,6 +244,7 @@ void TestStoredValuesBounded() {
 
 int main() {
   TestElideAndStore();
+  TestElidedFilter();
   TestPartialAndNewest();
   TestStoreCompleted();
   TestPatchElided();
