@@ -40,7 +40,12 @@ RenderContext::RenderContext(GraphicContext& graphics)
 		                                 std::clamp(host / 8u, 1u, 2u));
 	}
 	if (!Config::PrecompileOnlyEnabled()) {
-		m_pipeline_cache.StartProgramPreparation(std::min(Config::PrepareThreads(), 8u));
+		// (Unless asked for: a quarter of the host's threads. They run at low priority, and with
+		// the shaders of the game's files there are thousands of programs to translate.)
+		const auto asked = Config::PrepareThreads();
+		m_pipeline_cache.StartProgramPreparation(
+		    asked == UINT32_MAX ? std::clamp(std::thread::hardware_concurrency() / 4u, 2u, 8u)
+		                        : std::min(asked, 8u));
 	}
 }
 

@@ -177,9 +177,12 @@ static void PrintUsage() {
 	    "                                       (0 = off, at most 8). Default: 2.\n");
 	::printf(
 	    "  --prepare-threads <n>                Threads that translate the shaders that earlier\n"
-	    "                                       sessions recorded, at low priority from the boot,\n"
-	    "                                       so that their first use needs no translation\n"
-	    "                                       (0 = off, at most 8). Default: 2.\n");
+	    "                                       sessions recorded, and then the compute shaders\n"
+	    "                                       the precompile built from their code alone (those\n"
+	    "                                       of the game's files, with --import-shaders), at\n"
+	    "                                       low priority from the boot, so that their first\n"
+	    "                                       use needs no translation (0 = off, at most 8).\n"
+	    "                                       Default: a quarter of the host's threads, 2 to 8.\n");
 	::printf(
 	    "  --precompile-only                    Build the recorded compute and graphics pipelines\n"
 	    "                                       and the created compute shaders into the driver\n"

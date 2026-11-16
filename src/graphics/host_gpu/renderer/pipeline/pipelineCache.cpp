@@ -63,6 +63,10 @@ constexpr auto DriverCacheSaveInterval = std::chrono::minutes {5};
 // and pipelines, and their first use takes them (WarmPipelines); 0: it destroys them, and the
 // first use creates each from the driver cache on the GPU thread.
 Common::LiveControl::Switch g_warm_pipelines("warm_pipelines", 1);
+// 1: the code-only modules of the created compute shaders (those of the game's files among them)
+// are translated in the background from the boot and kept for their first use
+// (ProgramCache::StartPreparation); 0: such a shader is translated at its first use.
+Common::LiveControl::Switch g_prepare_created("prepare_created", 1);
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -303,6 +307,8 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		ShaderProgram                                handle;
 		uint64_t                                     spirv_hash = 0;
+		// Prepared from the shader's code alone (StartPreparation), before any dispatch.
+		bool                                         code_only = false;
 	};
 
 	struct SourceEntry {
@@ -411,6 +417,8 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		// The ranges the last walk read back (ScalarReadCache::Prefetch).
 		std::vector<ScalarReadRange>                 walk_read_backs;
+		// The first dispatch served by a module prepared from the code alone has been counted.
+		bool                                         code_only_noted = false;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                    permutations;
@@ -455,6 +463,9 @@ struct PipelineCache::ProgramCache {
 		ProgramKey                                               key;
 		std::vector<std::shared_ptr<const ComputeProgramRecord>> compute;
 		std::vector<std::shared_ptr<const GraphicsStageRecord>>  stages;
+		// The created compute shader of this key whose code-only pipeline the precompile built
+		// (code_only_records), or null: its code-only module is prepared after the recorded ones.
+		std::shared_ptr<const ComputeProgramRecord> code_only;
 	};
 
 	// The programs earlier sessions recorded, translated on helper threads in the order they were
@@ -491,7 +502,9 @@ struct PipelineCache::ProgramCache {
 		key.stage           = ShaderType::Compute;
 		key.hash            = record.shader_hash;
 		key.user_data_count = record.user_data_count;
-		key.code_size       = static_cast<uint32_t>(record.code->size());
+		// A dispatch names the program (ShaderParams::code); the record of a created shader holds
+		// its whole binary, footer included.
+		key.code_size = static_cast<uint32_t>(ShaderProgramWords(*record.code).size());
 		BuildStageStaticKey(input, key.static_state);
 		return true;
 	}
@@ -528,8 +541,11 @@ struct PipelineCache::ProgramCache {
 	// Translates a record as Get translates the program for a permutation and compiles the
 	// record's specialization into `prepared`; the plans come from the first record that does.
 	// False when the record no longer translates to its specialization.
+	// `code_only`: a created compute shader's record, which has no specialization: the module is
+	// the one the precompile built from its code alone (PrecompileComputeProgram).
 	template <typename Record>
-	bool PrepareRecord(const Record& record, PreparedProgram& prepared) const {
+	bool PrepareRecord(const Record& record, PreparedProgram& prepared,
+	                   bool code_only = false) const {
 		ProgramKey                       key;
 		ShaderComputeInputInfo           compute {};
 		ShaderVertexInputInfo            vertex {};
@@ -575,15 +591,25 @@ struct PipelineCache::ProgramCache {
 		options.emit_debug_info = false;
 		const bool                                     first = prepared.permutations.empty();
 		std::optional<ShaderRecompiler::CompileResult> result;
+		auto                                           specialization = record.specialization;
+		// (As the precompile built it: outside the simplification store.)
+		std::optional<ShaderRecompiler::Spirv::SimplifiedStoreBypass> unstored;
+		if (code_only) {
+			unstored.emplace();
+		}
 		try {
 			const Common::RecoverableFatalScope recoverable;
 			auto source = ShaderRecompiler::PrepareShaderSource(*record.code, options);
 			if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) return false;
 			auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
+			if (code_only) {
+				auto from_code = ShaderRecompiler::IR::CodeOnlySpecialization(translated.program);
+				if (!from_code.has_value()) return false;
+				specialization = std::move(*from_code);
+			}
 			// A recompiler change may give the shader other resources than the record was made
 			// for.
-			if (!ShaderRecompiler::IR::SpecializationApplies(translated.program,
-			                                                 record.specialization))
+			if (!ShaderRecompiler::IR::SpecializationApplies(translated.program, specialization))
 				return false;
 			if (first) {
 				prepared.plan = ShaderRecompiler::IR::ExtractResourcePlan(
@@ -596,11 +622,14 @@ struct PipelineCache::ProgramCache {
 					        ShaderRecompiler::IR::SrtWalkerCompilation::Deferred));
 				}
 			}
-			result = ShaderRecompiler::CompileProgram(
-			    std::move(translated), options, record.specialization, record.push_data_cursor);
+			result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization,
+			                                          record.push_data_cursor);
 		} catch (const Common::RecoverableFatal& fatal) {
-			PipelineCacheLog("Program preparation: {:016x} cannot be translated: {}", key.hash,
-			                 fatal.message);
+			// (The precompile pass has said so for a created shader.)
+			if (!code_only) {
+				PipelineCacheLog("Program preparation: {:016x} cannot be translated: {}", key.hash,
+				                 fatal.message);
+			}
 			return false;
 		}
 		if (!ValidateShaderSpirv(options.dump_label, key.hash, result->spirv,
@@ -617,10 +646,11 @@ struct PipelineCache::ProgramCache {
 		const auto spirv_hash =
 		    XXH3_64bits(result->spirv.data(), result->spirv.size() * sizeof(uint32_t));
 		prepared.permutations.push_back({
-		    .specialization = record.specialization,
+		    .specialization = std::move(specialization),
 		    .program        = std::move(result->program).TakeCompiledInfo(),
 		    .handle         = {.module = module, .spirv_hash = spirv_hash},
 		    .spirv_hash     = spirv_hash,
+		    .code_only      = code_only,
 		});
 		prepared.push_data_cursors.push_back(record.push_data_cursor);
 		return true;
@@ -634,6 +664,10 @@ struct PipelineCache::ProgramCache {
 		}
 		for (const auto& record: job.stages) {
 			(void)PrepareRecord(*record, *prepared);
+		}
+		// Last: a module for the dispatch's own formats is found before it (FindPermutation).
+		if (job.code_only != nullptr) {
+			(void)PrepareRecord(*job.code_only, *prepared, true);
 		}
 		if (prepared->permutations.empty()) return nullptr;
 		return prepared;
@@ -662,7 +696,8 @@ struct PipelineCache::ProgramCache {
 			state.running--;
 			if (state.running == 0 && state.next == state.jobs.size()) {
 				PipelineCacheLog(
-				    "Programs prepared ahead: {} of {} recorded translated in {:.1f} s ({} failed)",
+				    "Programs prepared ahead: {} of {} recorded or built from their code translated "
+				    "in {:.1f} s ({} failed)",
 				    state.counts.prepared, state.counts.queued,
 				    std::chrono::duration<double>(std::chrono::steady_clock::now() - state.started)
 				        .count(),
@@ -707,6 +742,20 @@ struct PipelineCache::ProgramCache {
 				ShaderPixelInputInfo  pixel {};
 				if (PreparationKey(*records[i], key, vertex, pixel))
 					job_for(FirstSeenPosition(i, records.size()), key).stages.push_back(records[i]);
+			}
+		}
+		// The compute shaders whose pipelines the precompile built from their code alone (created
+		// by the game, or imported from its files): their code-only module is translated too,
+		// after everything recorded, so that a first use it serves takes it instead of
+		// translating the shader then.
+		if (code_only_records && g_prepare_created.On()) {
+			uint64_t position = uint64_t {1} << 32u;
+			for (auto& record: code_only_records()) {
+				ProgramKey             key;
+				ShaderComputeInputInfo input {};
+				if (!PreparationKey(*record, key, input)) continue;
+				auto& job = job_for(position++, key);
+				if (job.code_only == nullptr) job.code_only = std::move(record);
 			}
 		}
 		if (ordered.empty()) return;
@@ -776,6 +825,18 @@ struct PipelineCache::ProgramCache {
 	template <typename InputInfo>
 	auto AdoptPrepared(ShaderType stage, const ShaderParams& params, const InputInfo& input_info) {
 		auto prepared = TakePrepared(lookup_key);
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			// A shader prepared from its code alone has the input of the graphics queue
+			// (ShaderGetCreatedComputeInput). The queue changes nothing in a translation: it only
+			// decides whether S_GETREG_B32 has one.
+			if (prepared == nullptr && input_info.async_compute) {
+				auto input          = input_info;
+				input.async_compute = false;
+				auto key            = lookup_key;
+				BuildStageStaticKey(input, key.static_state);
+				prepared = TakePrepared(key);
+			}
+		}
 		if (prepared == nullptr) return programs.end();
 		auto entry = programs.try_emplace(lookup_key, std::move(prepared->plan), nullptr).first;
 		NoteGraphicsShaderUse(stage, params.code);
@@ -1095,7 +1156,28 @@ struct PipelineCache::ProgramCache {
 				permutation = cached.call_source ? cached.FindPermutation<true>(push_data_cursor)
 				                                 : cached.FindPermutation<false>(push_data_cursor);
 			}
-			if (permutation != nullptr) return bind(*permutation);
+			if (permutation != nullptr) {
+				// The first dispatch of a shader prepared from its code alone: when that module
+				// is not the one for the dispatch's own formats, that one is recorded and built in
+				// the background, for the next session (as when the shader is translated here).
+				if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+					if (permutation->code_only && !cached.code_only_noted) {
+						cached.code_only_noted = true;
+						if (permutation->specialization == cached.specialization) {
+							code_only_same++;
+						} else {
+							code_only_taken++;
+							auto record = ExactComputeRecord(params, input_info, push_data_cursor,
+							                                 cached.specialization);
+							if (manifest != nullptr && !cached.call_source &&
+							    !(list_predicts && list_predicts(record.Key()))) {
+								RecordExactComputeProgram(std::move(record));
+							}
+						}
+					}
+				}
+				return bind(*permutation);
+			}
 		}
 
 		const char* label = nullptr;
@@ -1446,6 +1528,8 @@ struct PipelineCache::ProgramCache {
 	// precompile built it), by shader hash; and the build of a program record on the precompile
 	// queue. Null without a driver cache file.
 	std::function<bool(uint64_t)>                                        code_only_built;
+	// The created compute shaders whose code-only pipelines the precompile has built.
+	std::function<std::vector<std::shared_ptr<const ComputeProgramRecord>>()> code_only_records;
 	std::function<void(std::shared_ptr<const ComputeProgramRecord>)>     build_later;
 	// First uses of shaders whose code-only module the precompile built: the dispatch's own
 	// module is that one, that one serves the dispatch (and was taken), or neither.
@@ -2189,6 +2273,19 @@ void PipelineCache::InitializeDriverCache() {
 		const auto entry = m_created_keys.find(shader_hash);
 		return entry != m_created_keys.end() && m_finished_created->Built(entry->second);
 	};
+	m_program_cache->code_only_records = [this] {
+		std::vector<std::shared_ptr<const ComputeProgramRecord>> built;
+		std::lock_guard                                          lock(m_list_mutex);
+		if (m_created == nullptr || m_finished_created == nullptr) {
+			return built;
+		}
+		for (auto& record: m_created->Records()) {
+			if (m_finished_created->Built(record->Key())) {
+				built.push_back(std::move(record));
+			}
+		}
+		return built;
+	};
 	m_program_cache->build_later = [this](std::shared_ptr<const ComputeProgramRecord> record) {
 		std::lock_guard lock(m_list_mutex);
 		if (m_precompile_queue == nullptr || m_precompile_only) {
@@ -2737,14 +2834,14 @@ void PipelineCache::QueuePrecompile(uint32_t thread_count) {
 	ImportPipelineList();
 	const auto listed = progress.Get().queued - recorded;
 	uint64_t   finished_before = 0;
-	// A created shader no session has dispatched gets the module of its code-only
-	// specialization, which the first dispatches of most such shaders use.
+	// A created shader gets the module of its code-only specialization, which the first
+	// dispatches of most shaders no session has dispatched use. So does a shader with recorded
+	// programs: a dispatch that binds it other formats or level counts than the recorded ones
+	// (another place of the game, another resolution) takes that module instead of waiting for
+	// one of its own.
 	if (m_created != nullptr) {
 		const auto created = m_created->Records();
 		for (size_t i = 0; i < created.size(); i++) {
-			if (m_manifest->HasShader(created[i]->shader_hash)) {
-				continue;
-			}
 			// Built by an earlier session of this emulator build into this driver cache.
 			if (m_finished_created != nullptr && m_finished_created->Contains(created[i]->Key())) {
 				finished_before++;
@@ -2932,9 +3029,9 @@ void PipelineCache::LogCoverage() {
 	}
 	if (programs.preparation != nullptr) {
 		const auto counts = GetProgramPreparationCounts();
-		PipelineCacheLog("Programs prepared ahead: {} of {} recorded translated ({} failed); {} "
-		                 "taken at their first use ({} waited for), {} first used before their "
-		                 "turn",
+		PipelineCacheLog("Programs prepared ahead: {} of {} recorded or built from their code "
+		                 "translated ({} failed); {} taken at their first use ({} waited for), {} "
+		                 "first used before their turn",
 		                 counts.prepared, counts.queued, counts.failed, counts.adopted,
 		                 counts.waited, counts.missed);
 	}

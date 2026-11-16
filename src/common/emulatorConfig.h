@@ -111,7 +111,7 @@ struct ConfigOptions {
 	// --import-shaders: shader binaries taken from the game's files (empty = none).
 	std::filesystem::path  import_shaders;
 	uint32_t               lookahead_threads               = 2;
-	uint32_t               prepare_threads                 = 2;
+	uint32_t               prepare_threads                 = UINT32_MAX; // automatic
 	bool                   tessellation_enabled        = false;
 	bool                   occlusion_queries_enabled   = false;
 	bool                   relaxed_shader_float        = false;
