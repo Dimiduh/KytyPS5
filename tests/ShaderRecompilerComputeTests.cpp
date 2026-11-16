@@ -10613,6 +10613,71 @@ public:
             "buffer bytes");
       }
       {
+        // A buffer write at the address of an image of 1 MiB or more that the
+        // GPU rendered, whose contents could not be moved into guest memory
+        // first, refreshes the image only if it is a fill of it in size. A
+        // write over less than half of it, or a buffer of twice its size that
+        // merely starts where it starts (transient resources handed the same
+        // heap memory at other times of the frame), leaves it as rendered.
+        constexpr uint64_t kept_offset = 0x1000000;
+        constexpr uint32_t kept_extent = 512;
+        constexpr uint64_t kept_size =
+            uint64_t{kept_extent} * kept_extent * sizeof(uint32_t);
+        constexpr uint32_t kept_value = 0x600dcafeu;
+        constexpr uint32_t kept_write = 0x0badf00du;
+        static_assert(kept_size == (1ull << 20));
+        std::memset(memory + kept_offset, 0, static_cast<size_t>(kept_size * 2));
+        const auto kept_address = base + kept_offset;
+        auto kept_desc = MakeLinearDesc(
+            kept_address, kept_size, vk::Format::eR32Uint,
+            Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+            {kept_extent, kept_extent, 1}, 1, 4, 1);
+        const auto kept = texture_cache.FindImage(kept_desc);
+        const auto write = [&](uint64_t offset, uint64_t size) {
+          texture_cache.PrepareGpuBufferWrite(kept_address + offset, size);
+          auto writable = resources.GetBufferCache().ObtainBuffer(
+              kept_address + offset, size, true, false);
+          Require(name, "kept image write buffer allocation",
+                  writable.first != nullptr,
+                  "failed to allocate the kept image write buffer");
+          writable.first->Fill(writable.second, size, kept_write);
+          texture_cache.InvalidateMemoryFromGPU(kept_address + offset, size);
+        };
+        // {size of the write at the image's address, whether the image keeps
+        // its rendered contents}
+        for (const auto &[size, keeps] :
+             {std::pair{uint64_t{sizeof(uint32_t)}, true},
+              std::pair{kept_size / 2, true},
+              std::pair{kept_size * 2, true},
+              std::pair{kept_size, false}}) {
+          vk::ClearValue painted{};
+          painted.color.uint32 = std::array{kept_value, 0u, 0u, 0u};
+          TextureCacheTestAccess::ClearImage(
+              texture_cache, scheduler.Current(), kept,
+              {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
+          // A write inside the image first: after it the image's contents are
+          // not moved into guest memory ahead of a write at its address.
+          write(3 * sizeof(uint32_t), sizeof(uint32_t));
+          write(0, size);
+          const bool source = texture_cache.GetImage(kept).IsGpuModified();
+          (void)texture_cache.FindTexture(kept, kept_desc);
+          const auto texels =
+              ReadCachedTexel(name, context, kept, {}, {4, 1, 1});
+          const uint32_t expected = keeps ? kept_value : kept_write;
+          Require(name,
+                  keeps ? "a buffer write that is no fill keeps the rendered image"
+                        : "a buffer write the size of the image refreshes it",
+                  !source && texels.size() == 4 && texels[0] == expected &&
+                      texels[1] == expected && texels[2] == expected,
+                  keeps ? "a buffer write over part of a rendered image, or a "
+                          "larger buffer at its address, replaced its texels "
+                          "with guest bytes or left it a source of guest bytes"
+                        : "a buffer write the size of a rendered image did not "
+                          "refresh it from the written bytes");
+        }
+        TextureCacheTestAccess::DeleteImage(texture_cache, kept);
+      }
+      {
         // Transient resources share heap memory: a large target bound later
         // spans a smaller GPU-written image further in. Which of their texels
         // the memory holds is unknown (binding a target does not write all of

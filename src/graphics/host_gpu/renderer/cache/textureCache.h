@@ -288,6 +288,10 @@ private:
 	// memory.
 	[[nodiscard]] static bool BufferWriteRefreshes(const Image& image, uint64_t address,
 	                                               uint64_t size);
+	// Whether a GPU buffer write that would refresh the image (BufferWriteRefreshes) is no fill
+	// of it, and the image keeps the contents the GPU rendered into it instead.
+	[[nodiscard]] static bool BufferWriteKeepsImage(const Image& image, uint64_t address,
+	                                                uint64_t size);
 	// Whether another image over the image's memory holds GPU-written contents or was written
 	// natively after it. Aliased images (a title's transient resources placed in one heap) share
 	// their bytes, and which of them the memory holds is unknown: a render target binding is not

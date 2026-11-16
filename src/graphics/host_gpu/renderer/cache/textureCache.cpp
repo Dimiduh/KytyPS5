@@ -5,6 +5,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/gpuTiming.h"
+#include "common/liveControl.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -1159,6 +1160,7 @@ void TextureCache::InitializeImage(ImageId id) {
 		}
 		UploadImage(image, *source, source_offset);
 		image.ClearBufferModified();
+		image.native_kept = false;
 	}
 	image.RefreshComplete();
 }
@@ -1891,6 +1893,7 @@ void TextureCache::CommitGpuWrite(Image& image) {
 	image.RefreshComplete();
 	image.MarkGpuModified();
 	image.buffer_written        = false;
+	image.native_kept           = false;
 	image.native_write_sequence = ++m_event_sequence;
 }
 
@@ -2313,6 +2316,40 @@ bool TextureCache::BufferWriteRefreshes(const Image& image, uint64_t address, ui
 	return image.info.data.address == address || inside;
 }
 
+// 1: a GPU buffer write at the address of an image of 1 MiB or more that holds contents the GPU
+// rendered, which guest memory does not hold, refreshes the image from guest memory only if it
+// is a fill of the image in size. A write over less than half of the image, or a buffer of twice
+// its size or more that merely starts where it starts, leaves the image as rendered.
+// Refreshing replaced every texel the write did not cover with stale guest bytes; on the
+// console those texels stay as rendered.
+// Unreal Engine hands the memory of its transient heap to several resources in one frame. In
+// Saros, buffers of 4 to 672 bytes (and of 128 MiB) written by compute shaders start where
+// 2304x1296 targets and a 48 MiB froxel volume start, each of which was uploaded again whole
+// from stale memory before the game rendered it anew: 240 of the 320 MiB of image uploads a
+// frame. Images below 1 MiB take the refresh as before: it costs little, and it puts the
+// written bytes in the image.
+// 0: every such write refreshes the image.
+static Common::LiveControl::Switch  g_image_buffer_writes("image_buffer_writes", 1);
+static Common::LiveControl::Counter g_image_keeps("image_keeps");
+static Common::LiveControl::Counter g_image_keep_kb("image_keep_kb");
+
+bool TextureCache::BufferWriteKeepsImage(const Image& image, uint64_t address, uint64_t size) {
+	constexpr uint64_t MinImageSize = 1ull << 20u;
+	const auto         image_size   = image.info.data.size;
+	if (!g_image_buffer_writes.On() || image.info.IsBlock() || image_size < MinImageSize) {
+		return false;
+	}
+	// With the rendered contents in guest memory (published, or uploaded from it), or with a
+	// refresh already pending, the refresh is exact.
+	if (!(image.IsGpuModified() || image.native_kept) || image.IsBufferModified() ||
+	    image.IsCpuDirty()) {
+		return false;
+	}
+	const bool covers =
+	    address <= image.info.data.address && address + size >= image.info.data.End();
+	return covers ? size / 2 >= image_size : size <= image_size / 2;
+}
+
 bool TextureCache::MemorySharedWithOtherContents(ImageId id) {
 	const auto& image  = m_slot_images[id];
 	bool        shared = false;
@@ -2361,6 +2398,15 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	ForEachImageInRegion(address, size, [&](ImageId, Image& image) {
 		if (!BufferWriteRefreshes(image, address, size)) {
+			return;
+		}
+		if (BufferWriteKeepsImage(image, address, size)) {
+			// The memory belongs to the buffer from here on: the image is no source of its bytes
+			// (a download would put texels over the buffer's contents).
+			image.ClearGpuModified();
+			image.native_kept = true;
+			g_image_keeps.Add(1);
+			g_image_keep_kb.Add(image.info.data.size / 1024);
 			return;
 		}
 		image.ClearGpuModified();

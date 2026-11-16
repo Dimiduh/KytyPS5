@@ -234,6 +234,10 @@ public:
 	// A GPU buffer write overlapped the image since its last native write (TextureCache::
 	// PrepareGpuBufferWrite): its memory may hold newer bytes than the image.
 	bool buffer_written = false;
+	// A GPU buffer write over the image's memory was no fill of it (TextureCache::
+	// BufferWriteKeepsImage): the image keeps what the GPU rendered into it, which guest memory
+	// does not hold and the image is no source of, until its next native write or refresh.
+	bool native_kept = false;
 
 private:
 	friend struct ImageTestAccess;
