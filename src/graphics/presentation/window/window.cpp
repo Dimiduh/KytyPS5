@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/liveControl.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -140,6 +141,11 @@ namespace {
 std::unique_ptr<WindowContext> g_window;
 Common::Mutex                  g_luminance_mutex;
 DisplayLuminance               g_luminance;
+
+// KYTY_HOST_GAMEPADS=0: the gamepads of this PC are ignored, so that an unattended test run is
+// not played by whoever uses a controller meanwhile. The measurement channel's scripted pad
+// (`pad`, `stick`) goes through the host-input controller and still works.
+Common::LiveControl::Switch g_host_gamepads("host_gamepads", 1);
 
 } // namespace
 
@@ -320,6 +326,7 @@ static void GameEventFinger([[maybe_unused]] const EventFinger& f) {
 
 static void GameEventController([[maybe_unused]] const EventController& f) {
 	EXIT_NOT_IMPLEMENTED(f.remapped);
+	if (!g_host_gamepads.On()) return;
 
 #ifdef KYTY_DBG_INPUT
 	if (f.added || f.removed) {
