@@ -33,6 +33,8 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	// VK_EXT_device_fault: the driver keeps a record of what lost the device (LogLostDevice).
+	bool                               device_fault_enabled                  = false;
 	// VK_EXT_memory_priority: allocations carry a residency priority. With
 	// VK_EXT_pageable_device_local_memory as well, priorities change as contents age.
 	bool                               memory_priority_enabled               = false;
@@ -140,6 +142,9 @@ struct GraphicContext {
 	[[nodiscard]] bool CreateAllocator();
 	void               DestroyAllocator();
 	void               LogMemoryBudget() const;
+	// After a call failed with a lost device: the memory state and the driver's fault record,
+	// to the console and the log.
+	void               LogLostDevice() const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;

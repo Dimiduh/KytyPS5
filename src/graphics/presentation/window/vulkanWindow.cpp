@@ -2,6 +2,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/liveControl.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -51,6 +52,9 @@ struct VulkanExtensions {
 };
 
 static constexpr const char* kValidationLayer = "VK_LAYER_KHRONOS_validation";
+
+// 1: the device is made with VK_EXT_device_fault where the driver has it (VulkanCreateDevice).
+static Common::LiveControl::Switch g_device_fault("device_fault", 1);
 
 vk::PhysicalDeviceVulkan11Features WindowContext::RequiredVulkan11Features() noexcept {
 	return {.storageBuffer16BitAccess = VK_TRUE, .shaderDrawParameters = VK_TRUE};
@@ -519,6 +523,17 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	// Frame generation: Streamline enables VK_NV_low_latency2 (Reflex) without the present-id
 	// extension it requires; current drivers then refuse the device.
 	const bool present_id = FrameGen::Requested() && add(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+	// VK_EXT_device_fault: what the driver recorded about a lost device goes into the log
+	// (GraphicContext::LogLostDevice). KYTY_DEVICE_FAULT=0 leaves the extension off.
+	vk::PhysicalDeviceFaultFeaturesEXT device_fault {};
+	if (g_device_fault.On() &&
+	    HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+		vk::PhysicalDeviceFeatures2 query {.pNext = &device_fault};
+		physical_device.getFeatures2(&query);
+	}
+	graphics.device_fault_enabled =
+	    device_fault.deviceFault == VK_TRUE && add(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+	LOGF("Vulkan device fault record: %s\n", graphics.device_fault_enabled ? "true" : "false");
 	physical_device.getFeatures2(&supported2);
 	const bool barycentric_supported = barycentric.fragmentShaderBarycentric == VK_TRUE;
 	const bool ray_query_enabled =
@@ -819,6 +834,12 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		auto& info               = create.get<vk::DeviceCreateInfo>();
 		present_id_feature.pNext = const_cast<void*>(info.pNext);
 		info.pNext               = &present_id_feature;
+	}
+	vk::PhysicalDeviceFaultFeaturesEXT device_fault_feature {.deviceFault = VK_TRUE};
+	if (graphics.device_fault_enabled) {
+		auto& info                 = create.get<vk::DeviceCreateInfo>();
+		device_fault_feature.pNext = const_cast<void*>(info.pNext);
+		info.pNext                 = &device_fault_feature;
 	}
 
 	// (Streamline's own answer whether DLSS-G can run here, asked before the device: a refused

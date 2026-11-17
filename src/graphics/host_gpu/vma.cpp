@@ -22,6 +22,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
+#include <fmt/format.h>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -270,6 +272,57 @@ void GraphicContext::LogMemoryBudget() const {
 		     i, static_cast<uint64_t>(budgets[i].usage), static_cast<uint64_t>(budgets[i].budget),
 		     static_cast<uint64_t>(budgets[i].statistics.allocationBytes),
 		     static_cast<uint64_t>(budgets[i].statistics.blockBytes));
+	}
+}
+
+// What a report of a lost device needs and the driver knows: how full the memory was, and with
+// VK_EXT_device_fault whether the GPU faulted on an address (and which) or stopped answering.
+// To the console as well: a launcher's log holds only that.
+void GraphicContext::LogLostDevice() const {
+	if (device == nullptr) {
+		return;
+	}
+	using MemoryBudget::MiB;
+	if (const auto heaps = SampleMemoryHeaps(); heaps.device.budget != 0) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Lost device: video memory {} of {} MiB budget ({} MiB of it the driver's own), "
+		    "shared memory {} of {} MiB\n",
+		    heaps.device.usage / MiB, heaps.device.budget / MiB,
+		    MemoryBudget::DriverUsage(heaps.device) / MiB, heaps.host.usage / MiB,
+		    heaps.host.budget / MiB));
+	}
+	vk::DeviceFaultCountsEXT counts {};
+	if (!device_fault_enabled ||
+	    device.getFaultInfoEXT(&counts, nullptr) != vk::Result::eSuccess) {
+		Log::WriteToConsoleAndLog("Lost device: the driver gave no fault record\n");
+		return;
+	}
+	counts.vendorBinarySize = 0;
+	std::vector<vk::DeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+	std::vector<vk::DeviceFaultVendorInfoEXT>  vendors(counts.vendorInfoCount);
+	vk::DeviceFaultInfoEXT                     info {};
+	info.pAddressInfos = addresses.empty() ? nullptr : addresses.data();
+	info.pVendorInfos  = vendors.empty() ? nullptr : vendors.data();
+	if (const auto result = device.getFaultInfoEXT(&counts, &info);
+	    result != vk::Result::eSuccess && result != vk::Result::eIncomplete) {
+		Log::WriteToConsoleAndLog("Lost device: the driver gave no fault record\n");
+		return;
+	}
+	// No address: the GPU did not fault on memory (a hang the OS ended, or the driver itself).
+	Log::WriteToConsoleAndLog(
+	    fmt::format("Lost device: the driver's record: \"{}\", {} address(es), {} vendor record(s)\n",
+	                info.description.data(), counts.addressInfoCount, counts.vendorInfoCount));
+	for (uint32_t i = 0; i < counts.addressInfoCount; ++i) {
+		Log::WriteToConsoleAndLog(
+		    fmt::format("Lost device: {} at {:#x} (to within {:#x} bytes)\n",
+		                vk::to_string(addresses[i].addressType), addresses[i].reportedAddress,
+		                addresses[i].addressPrecision));
+	}
+	for (uint32_t i = 0; i < counts.vendorInfoCount; ++i) {
+		Log::WriteToConsoleAndLog(
+		    fmt::format("Lost device: vendor record \"{}\", code {:#x}, data {:#x}\n",
+		                vendors[i].description.data(), vendors[i].vendorFaultCode,
+		                vendors[i].vendorFaultData));
 	}
 }
 
