@@ -33,7 +33,7 @@ struct AddressedBuffer {
 	MemoryUsage                           usage       = MemoryUsage::DeviceLocal;
 	std::chrono::steady_clock::time_point destroyed {};
 };
-constexpr size_t                    DESTROYED_KEPT = 4096;
+constexpr size_t                    DESTROYED_KEPT = 65536;
 std::mutex                          g_addressed_mutex;
 std::map<uint64_t, AddressedBuffer> g_addressed;
 std::deque<AddressedBuffer>         g_destroyed;
