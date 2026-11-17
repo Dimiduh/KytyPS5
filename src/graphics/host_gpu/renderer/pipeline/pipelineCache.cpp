@@ -3690,6 +3690,7 @@ void PipelineCache::QueuePrecompile(uint32_t thread_count) {
 	    thread_count, m_precompile_attempts != nullptr ? m_precompile_attempts->FailedCount() : 0,
 	    m_precompile_attempts != nullptr ? m_precompile_attempts->RetriedCount() : 0,
 	    finished_before, pairs_before);
+	m_precompile_built_before.store(finished_before + pairs_before, std::memory_order_relaxed);
 	// Entries of the list whose shaders the guest has not created stay queueable while it runs.
 	m_list_open = !m_precompile_only && m_list_resolver != nullptr && m_list_resolver->Pending();
 	if (!m_list_open && progress.EndQueueing()) {
@@ -3708,11 +3709,20 @@ void PipelineCache::PrecompileRunEnded() {
 
 void PipelineCache::LogPrecompileStats(const char* when) {
 	const auto counts = m_precompile_progress.Get();
+	// A pass after the whole game was built checks only the recorded programs and pipelines
+	// again; without the rest, its count reads as if the others were gone.
+	const auto  before = m_precompile_built_before.load(std::memory_order_relaxed);
+	std::string earlier;
+	if (before != 0) {
+		earlier = fmt::format("; {} more were built by earlier passes of this build and not "
+		                      "checked again ({} in all)",
+		                      before, before + counts.cached + counts.compiled);
+	}
 	PipelineCacheLog(
 	    "Precompile {}: {} pipelines already in the driver cache, {} compiled ({} s of "
-	    "driver time), {} skipped, {} timed out",
+	    "driver time), {} skipped, {} timed out{}",
 	    when, counts.cached, counts.compiled, counts.compile_ms / 1000u, counts.skipped,
-	    counts.timed_out);
+	    counts.timed_out, earlier);
 }
 
 void PipelineCache::StartPrecompile(uint32_t thread_count, uint32_t steady_thread_count) {

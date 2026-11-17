@@ -400,6 +400,9 @@ private:
 	std::unordered_set<uint64_t>            m_list_keys;
 	std::unique_ptr<ProgramPrecompileQueue> m_precompile_queue;
 	PrecompileProgress                      m_precompile_progress;
+	// Created compute shaders and shader pairs that earlier passes of this emulator build built
+	// into the driver cache, so that this run did not queue them (QueuePrecompile).
+	std::atomic<uint64_t> m_precompile_built_before {0};
 	// Set by precompile builds that added to the driver cache; the GPU thread checkpoints it.
 	std::atomic<bool> m_precompile_dirty {false};
 	// A precompile build that runs: when it started, and whether it has finished or timed out
