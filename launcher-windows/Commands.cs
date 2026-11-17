@@ -18,6 +18,10 @@ static class Options {
 	public static readonly string[] LogModes = { "off", "file", "console" };
 	// The size the game renders its 3D at, in percent of its own (run-windows.ps1 -RenderScale).
 	public static readonly int[] RenderScales = { 100, 85, 75, 67, 50 };
+	// What makes the 4K picture (run-windows.ps1 -Dlss): the game's own upscaler (off), or DLSS in one of its modes, each
+	// with the one size its 3D is rendered at.
+	public static readonly string[] DlssModes = { "off", "quality", "balanced", "performance", "ultra" };
+	public static readonly string[] DlssSizes = { "", "2560x1440", "2227x1253", "1920x1080", "1280x720" };
 
 	// `value` in the list's spelling; the list's first for anything else.
 	public static string Pick(string[] list, string value) {
@@ -114,6 +118,9 @@ sealed class Commands {
 	// Frame generation as chosen and possible here: the multiplier (2 to 6), or 1 for off.
 	public int FrameGen { get { return context.FrameGenAvailable && S.Int("framegen") >= 2 ? S.Int("framegen") : 1; } }
 
+	// The upscaler as chosen and possible here: DLSS's mode, or "off" for the game's own.
+	public string Dlss { get { return context.DlssAvailable ? S.Str("dlss") : "off"; } }
+
 	// run-windows.ps1's arguments for the settings. The choices with a value (window size, language, present mode, log,
 	// background shader preparation) are always passed, so that another default of the emulator or the launch config
 	// changes nothing here.
@@ -142,7 +149,7 @@ sealed class Commands {
 		if (FrameGen >= 2) arguments.AddRange(new[] { "-FrameGen", Number(FrameGen - 1), "-StreamlineDir", Quoted(context.Streamline) });
 		else arguments.AddRange(new[] { "-FrameGen", "0" });
 		// The size the game renders its 3D at, in percent of its own (Unreal Engine titles); 100 takes out what the
-		// launch config may set.
+		// launch config may set. (With a DLSS mode run-windows.ps1 leaves it out itself.)
 		arguments.AddRange(new[] { "-RenderScale", Number(S.Int("render_scale")) });
 		if (S.Bool("fullscreen")) arguments.Add("-Fullscreen");
 		// (Without it the game's picture keeps its aspect ratio, between black bars in a window of another shape.)
@@ -170,6 +177,11 @@ sealed class Commands {
 	// from Steam, maybe with only a gamepad at hand): no wait for a key.
 	public string PlayCommand(bool direct = false) {
 		var arguments = RunArguments();
+		// The upscaler, for the game only (the precompile pass shows no picture): DLSS's mode, or off, which also turns
+		// off what the launch config may set. DLSS's model is in NVIDIA's runtime folder, which frame generation has
+		// passed already when it is on.
+		arguments.AddRange(new[] { "-Dlss", Dlss });
+		if (Dlss != "off" && FrameGen < 2) arguments.AddRange(new[] { "-StreamlineDir", Quoted(context.Streamline) });
 		arguments.Add("-Follow");
 		return PowerShell() + " " + string.Join(" ", arguments) + (direct ? "" : " || pause");
 	}

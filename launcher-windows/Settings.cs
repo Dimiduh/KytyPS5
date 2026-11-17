@@ -20,7 +20,7 @@ sealed class Settings {
 		new object[] {"precompile_pipelines", true}, new object[] {"pipeline_lists", true},
 		new object[] {"shader_pairs", true},
 		new object[] {"skip_pending_draws", true}, new object[] {"framegen", 1}, new object[] {"render_scale", 100},
-		new object[] {"occlusion_queries", true},
+		new object[] {"dlss", "off"}, new object[] {"occlusion_queries", true},
 		new object[] {"streamline", ""}, new object[] {"log", "off"}, new object[] {"extra_args", ""},
 		new object[] {"environment", ""},
 		// (This launcher's own: the window's language, Advanced page; the precompile on the efficiency cores, Shaders page.)

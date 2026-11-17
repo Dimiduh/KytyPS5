@@ -50,9 +50,9 @@ partial class MainWindow : Window {
 	bool precompileClosed;
 
 	TextBox gamePath, dataPath, resolutionText, extraArgs, environment;
-	ComboBox resolution, present, renderScale, frameGen, language, gpu, log, uiLanguage;
+	ComboBox resolution, present, upscaling, renderScale, frameGen, language, gpu, log, uiLanguage;
 	CheckBox fullscreen, stretch, hdr, overlay, sound, skipNotice, redzone, background, lists, pairs, noWait, ecores, reopenLauncher, occlusion;
-	TextBlock resolutionNote, frameGenNote, streamlineText, bannerTitle, bannerLine, shaderLine, problemText;
+	TextBlock resolutionNote, renderNote, frameGenNote, streamlineText, bannerTitle, bannerLine, shaderLine, problemText;
 	Button precompilePageButton;
 	Image banner;
 	Border bannerFallback;
@@ -466,7 +466,18 @@ partial class MainWindow : Window {
 	FrameworkElement BuildGraphicsPage() {
 		var scales = Options.RenderScales.Select(scale => new Choice(scale + "%", scale));
 		renderScale = Combo(scales, Math.Max(0, Array.IndexOf(Options.RenderScales, S.Int("render_scale"))), 160);
+		renderNote = Desc("");
 		occlusion = Switch(S.Bool("occlusion_queries"));
+
+		// The upscaler: the game's own, or DLSS in one of its modes; the game's own without an NVIDIA RTX card or DLSS's
+		// model in NVIDIA's runtime (the saved choice is kept for when they are there).
+		var modes = Options.DlssModes.Select(mode => new Choice(mode == "off" ? T("upscaling.off") : DlssName(mode), mode));
+		upscaling = Combo(modes, context.DlssAvailable ? Array.IndexOf(Options.DlssModes, S.Str("dlss")) : 0);
+		upscaling.IsEnabled = context.DlssAvailable;
+		upscaling.SelectionChanged += (s, e) => UpdateRenderScale();
+		var upscalingNote = Desc(T(context.DlssAvailable ? "upscaling.ok" : !context.RtxGpu ? "upscaling.noRtx"
+			: context.Streamline == null ? "upscaling.noStreamline" : "upscaling.noModel"));
+		UpdateRenderScale();
 
 		// Frame generation: the multiplier, off without an NVIDIA RTX card or NVIDIA's runtime (the saved choice is kept
 		// for when they are there).
@@ -489,7 +500,8 @@ partial class MainWindow : Window {
 		gpu = Combo(cards, chosen < 0 ? 0 : context.VulkanGpus.Length != 0 ? chosen + 1 : 1, 360);
 		return Page("graphics.title",
 			Section("graphics.resolution"),
-			Row("render", renderScale, Desc(T("render.desc"))),
+			Row("upscaling", upscaling, upscalingNote),
+			Row("render", renderScale, renderNote),
 			Section("graphics.occlusion"),
 			Row("occlusion", occlusion, Desc(T("occlusion.desc"))),
 			Section("graphics.fg"),
@@ -499,10 +511,23 @@ partial class MainWindow : Window {
 			Row("gpu", gpu, Desc(T("gpu.desc"))));
 	}
 
+	// A DLSS mode as the list names it: its name and the size of its 3D.
+	static string DlssName(string mode) {
+		return F("upscaling.choice", T("dlss." + mode), Options.DlssSizes[Math.Max(0, Array.IndexOf(Options.DlssModes, mode))]);
+	}
+
+	// With a DLSS mode the 3D has that mode's one size: the percent of the game's own does not apply (it stays as chosen
+	// for the game's own upscaler).
+	void UpdateRenderScale() {
+		var dlss = context.DlssAvailable && upscaling.SelectedIndex > 0;
+		renderScale.IsEnabled = !dlss;
+		renderNote.Text = T(dlss ? "render.dlss" : "render.desc");
+	}
+
 	void ChooseStreamline() {
 		var dir = FolderPicker.Pick(this, T("dialog.streamline"), S.Str("streamline"));
 		if (dir == null) return;
-		// (Read first: the multiplier saved for when the runtime is there stays.)
+		// (Read first: the multiplier and the upscaler saved for when the runtime is there stay.)
 		ReadForm();
 		if (!context.UseStreamlineFolder(dir)) {
 			MessageBox.Show(this, T("dialog.streamlineBad"), T("graphics.fg"), MessageBoxButton.OK, MessageBoxImage.Warning);
@@ -648,6 +673,7 @@ partial class MainWindow : Window {
 		S.Set("skip_pending_draws", noWait.IsChecked == true);
 		// (An unavailable row keeps the saved choice for when the runtime is there.)
 		if (context.FrameGenAvailable) S.Set("framegen", Math.Max(0, frameGen.SelectedIndex) + 1);
+		if (context.DlssAvailable) S.Set("dlss", Options.DlssModes[Math.Max(0, upscaling.SelectedIndex)]);
 		S.Set("render_scale", Options.RenderScales[Math.Max(0, renderScale.SelectedIndex)]);
 		S.Set("occlusion_queries", occlusion.IsChecked == true);
 		S.Set("log", Options.LogModes[Math.Max(0, log.SelectedIndex)]);
@@ -667,6 +693,8 @@ partial class MainWindow : Window {
 
 		var window = F(S.Bool("fullscreen") ? "summary.fullscreen" : "summary.window", S.Str("resolution").Replace("x", "×"));
 		var frameGeneration = commands.FrameGen >= 2 ? "DLSS " + commands.FrameGen + "x" : T("framegen.off");
+		// (With a DLSS mode, the mode stands where the 3D resolution's percent does: that one does not apply.)
+		var dlss = commands.Dlss != "off";
 		var shaders = new List<string>();
 		if (S.Bool("precompile_pipelines")) shaders.Add(T("summary.background"));
 		if (S.Bool("pipeline_lists")) shaders.Add(T("summary.lists"));
@@ -689,7 +717,7 @@ partial class MainWindow : Window {
 		// (While a precompile runs, the bar says so: neither button starts another emulator on the same caches.)
 		if (precompileProcess != null) Summary.Text = precompileStatus ?? T("precompile.running");
 		else {
-			var parts = new List<string> { window, F("summary.render", S.Int("render_scale")), S.Str("present_mode") };
+			var parts = new List<string> { window, dlss ? T("dlss." + commands.Dlss) : F("summary.render", S.Int("render_scale")), S.Str("present_mode") };
 			if (commands.FrameGen >= 2) parts.Add(frameGeneration);
 			parts.AddRange(options);
 			Summary.Text = string.Join("   ·   ", parts);
@@ -699,7 +727,7 @@ partial class MainWindow : Window {
 		currentSettings.RowDefinitions.Clear();
 		var lines = new[] {
 			new[] { T("nav.display"), window + "  ·  " + T("present." + S.Str("present_mode").ToLowerInvariant()) },
-			new[] { T("summary.3d"), F("summary.percent", S.Int("render_scale")) },
+			new[] { T("summary.3d"), dlss ? DlssName(commands.Dlss) : F("summary.percent", S.Int("render_scale")) },
 			new[] { T("graphics.fg"), frameGeneration },
 			new[] { T("summary.shaders"), shaders.Count == 0 ? "—" : string.Join("  ·  ", shaders) },
 			new[] { T("summary.options"), options.Count == 0 ? "—" : string.Join("  ·  ", options) },

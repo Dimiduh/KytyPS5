@@ -97,6 +97,11 @@ public partial class App : Application {
 			? "NVIDIA's Streamline runtime in " + context.Streamline + "; chosen: " + (settings.Int("framegen") >= 2 ? settings.Int("framegen") + "x" : "off")
 			: !context.RtxGpu ? "no NVIDIA RTX graphics card"
 			: "no NVIDIA-signed Streamline runtime (settings: '" + settings.Str("streamline") + "')"));
+		text.AppendLine("dlss:       " + (context.DlssAvailable
+			? "nvngx_dlss.dll in " + context.Streamline + "; chosen: " + settings.Str("dlss")
+			: !context.RtxGpu ? "no NVIDIA RTX graphics card"
+			: context.Streamline == null ? "no NVIDIA-signed Streamline runtime (settings: '" + settings.Str("streamline") + "')"
+			: "no nvngx_dlss.dll in " + context.Streamline));
 		var gpus = new string[context.VulkanGpus.Length];
 		for (int i = 0; i < gpus.Length; i++) gpus[i] = i + ": " + context.VulkanGpus[i];
 		text.AppendLine("gpus:       " + (gpus.Length != 0 ? string.Join(", ", gpus) : "Vulkan lists none") + "; chosen: " +

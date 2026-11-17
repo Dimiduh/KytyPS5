@@ -20,10 +20,13 @@ sealed class LauncherContext {
 	public readonly long EfficiencyMask;  // the efficiency cores of a hybrid CPU as an affinity mask, or 0
 	public readonly List<GpuInfo> Gpus;   // the display adapters Windows lists (the Play page's check)
 	public readonly string[] VulkanGpus;  // the graphics cards as Vulkan lists them: run-windows.ps1 -Gpu takes a card's number in this list
-	public readonly bool RtxGpu;          // DLSS frame generation needs an NVIDIA RTX graphics card
+	public readonly bool RtxGpu;          // DLSS (frame generation, upscaling) needs an NVIDIA RTX graphics card
 	public readonly ulong RamBytes;
 	public string Streamline { get; private set; } // NVIDIA's signed Streamline runtime folder, or null
 	public bool FrameGenAvailable { get { return Streamline != null && RtxGpu; } }
+	// DLSS upscaling needs an NVIDIA RTX card too, and its model, which the emulator takes from that runtime folder.
+	public bool DlssModel { get; private set; }
+	public bool DlssAvailable { get { return DlssModel && RtxGpu; } }
 
 	public LauncherContext(string settingsFile = null) {
 		Root = FindRoot();
@@ -42,6 +45,7 @@ sealed class LauncherContext {
 		VulkanGpus = vulkan.Result;
 		Normalize();
 		Streamline = ResolveStreamline();
+		DlssModel = HasDlssModel(Streamline);
 	}
 
 	// The launcher sits next to run-windows.ps1 in a package; in the source tree it is built to _Build\launcher.
@@ -73,6 +77,7 @@ sealed class LauncherContext {
 		Settings.Set("framegen", Math.Min(6, Math.Max(1, Settings.Int("framegen"))));
 		var scale = Settings.Int("render_scale");
 		Settings.Set("render_scale", Array.IndexOf(Options.RenderScales, scale) >= 0 ? scale : 100);
+		Settings.Set("dlss", Options.Pick(Options.DlssModes, Settings.Str("dlss")));
 	}
 
 	// An NVIDIA RTX card among the display adapters Windows has now (Win32_VideoController, as launcher.ps1 asks).
@@ -123,11 +128,21 @@ sealed class LauncherContext {
 		return null;
 	}
 
+	// Whether the runtime's folder holds DLSS's model (nvngx_dlss.dll, which NVIDIA's Streamline SDK has in its bin\x64).
+	static bool HasDlssModel(string folder) {
+		try {
+			return folder != null && File.Exists(Path.Combine(folder, "nvngx_dlss.dll"));
+		} catch (Exception) {
+			return false;
+		}
+	}
+
 	public bool UseStreamlineFolder(string dir) {
 		var found = FindStreamline(dir);
 		if (found == null) return false;
 		Settings.Set("streamline", dir);
 		Streamline = found;
+		DlssModel = HasDlssModel(found);
 		return true;
 	}
 

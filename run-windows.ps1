@@ -67,6 +67,14 @@
 #                                            game's upscaler still makes the 4K picture. Less work for the graphics
 #                                            card, a softer picture: at one spot of Saros 31 fps at 100, 33 at 75, 36 at
 #                                            50 (RTX 4090). 100: as the game is, whatever the config says
+#   .\run-windows.ps1 -Dlss performance      Saros: NVIDIA DLSS makes the 4K picture in place of the game's own
+#                                            upscaler, from a 3D of one fixed size: quality (2560x1440), balanced
+#                                            (2227x1253), performance (1920x1080) or ultra (1280x720; the game's own
+#                                            is 1600x900 to 2304x1296). A cleaner picture than the game's upscaler
+#                                            makes of the same size, most of all of a small one; -RenderScale does
+#                                            not apply. NVIDIA RTX only; the model (nvngx_dlss.dll) is taken from
+#                                            NVIDIA's Streamline runtime (-StreamlineDir). off: the game's own
+#                                            upscaler, whatever the config says
 #   .\run-windows.ps1 -UnrealCvar r.X=1,r.Y=x0.5   Unreal Engine titles: console variables of the running game, set
 #                                            and kept set (--unreal-cvar: float and int variables the engine reads as
 #                                            it runs; x0.5: half the game's own value). none: not the config's either
@@ -114,6 +122,7 @@ param(
 	[string]$ShaderPairs = '',
 	[ValidateRange(-1, 5)][int]$FrameGen = -1,
 	[ValidateRange(0, 200)][int]$RenderScale = 0,
+	[ValidateSet('', 'off', 'ultra', 'performance', 'balanced', 'quality')][string]$Dlss = '',
 	[string[]]$UnrealCvar = @(),
 	[string]$StreamlineDir = '',
 	[ValidateSet('', 'off', 'file', 'console')][string]$Log = '',
@@ -222,6 +231,22 @@ if ($RenderScale -gt 0) {
 	if ($at -ge 0) { $options.RemoveRange($at, 2) }
 	if ($RenderScale -lt 10) { throw '-RenderScale takes 10 to 200 (percent)' }
 	if ($RenderScale -ne 100) { Set-Option '--unreal-render-scale' "$RenderScale" }
+}
+# -Dlss: --upscaler DLSS with the 3D at the mode's one size (--upscaler-render-percent, in percent of the output's;
+# the emulator finds the model in NVIDIA's Streamline runtime); the game's own scale does not apply then. off takes
+# the config's out.
+if ($Dlss) {
+	foreach ($name in '--upscaler', '--pssr-upscaler', '--upscaler-render-percent') {
+		$at = $options.IndexOf($name)
+		if ($at -ge 0) { $options.RemoveRange($at, 2) }
+	}
+	if ($Dlss -ne 'off') {
+		$at = $options.IndexOf('--unreal-render-scale')
+		if ($at -ge 0) { $options.RemoveRange($at, 2) }
+		$percent = @{ ultra = '33.3333'; performance = '50'; balanced = '58'; quality = '66.6667' }[$Dlss]
+		Set-Option '--upscaler' 'DLSS'
+		Set-Option '--upscaler-render-percent' $percent
+	}
 }
 # -UnrealCvar: one --unreal-cvar each, after the config's own (the later one of a name wins); none: no config's.
 if ($UnrealCvar.Count -gt 0) {

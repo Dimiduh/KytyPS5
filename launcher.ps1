@@ -28,7 +28,7 @@ $logNames = 'Off', 'File (in the logs folder)', 'Console (slow)'
 
 $settings = [ordered]@{ game = ''; data = ''; resolution = '1920x1080'; fullscreen = $false; stretch = $false; language = 1
 	gpu = -1; gpu_name = ''; present_mode = 'Mailbox'; hdr = $false; perf_overlay = $false; sound = $true
-	skip_notice_screen = $false; redzone = $false; precompile_pipelines = $true; pipeline_lists = $true; shader_pairs = $true; skip_pending_draws = $true; framegen = 1; render_scale = 100; occlusion_queries = $true; streamline = ''; log = 'off'; extra_args = ''; environment = '' }
+	skip_notice_screen = $false; redzone = $false; precompile_pipelines = $true; pipeline_lists = $true; shader_pairs = $true; skip_pending_draws = $true; framegen = 1; render_scale = 100; dlss = 'off'; occlusion_queries = $true; streamline = ''; log = 'off'; extra_args = ''; environment = '' }
 if (Test-Path -LiteralPath $settingsPath) {
 	# (A file that cannot be read leaves the defaults.)
 	try {
@@ -217,6 +217,14 @@ $settings.framegen = [Math]::Min(6, [Math]::Max(1, $(try { [int]$settings.frameg
 $renderScales = 100, 85, 75, 67, 50
 $settings.render_scale = $(try { [int]$settings.render_scale } catch { 100 })
 if ($renderScales -notcontains $settings.render_scale) { $settings.render_scale = 100 }
+# What makes the 4K picture (run-windows.ps1 -Dlss): the game's own upscaler (off), or DLSS in one of its modes, each
+# with the one size its 3D is rendered at. DLSS needs an NVIDIA RTX card and its model (nvngx_dlss.dll), which the
+# emulator takes from NVIDIA's Streamline runtime folder.
+$dlssModes = 'off', 'quality', 'balanced', 'performance', 'ultra'
+$dlssNames = "Game's own", 'DLSS Quality (2560x1440)', 'DLSS Balanced (2227x1253)', 'DLSS Performance (1920x1080)', 'DLSS Ultra Performance (1280x720)'
+$settings.dlss = @($dlssModes | Where-Object { $_ -eq [string]$settings.dlss }) + $dlssModes[0] | Select-Object -First 1
+function Test-Dlss { return $rtxGpu -and [bool]$streamline -and (Test-Path -LiteralPath (Join-Path $streamline 'nvngx_dlss.dll')) }
+$dlssAvailable = Test-Dlss
 
 function Get-Problems {
 	$problems = @()
@@ -254,7 +262,7 @@ function Get-RunArguments {
 		$arguments += @('-FrameGen', 0)
 	}
 	# The size the game renders its 3D at, in percent of its own (Unreal Engine titles); 100 takes out what the
-	# launch config may set.
+	# launch config may set. (With a DLSS mode run-windows.ps1 leaves it out itself.)
 	$arguments += @('-RenderScale', [int]$settings.render_scale)
 	# The game's occlusion queries: counted on the graphics card (on), or every object answered as visible (off).
 	$arguments += @('-OcclusionQueries', $(if ($settings.occlusion_queries) { 'on' } else { 'off' }))
@@ -280,8 +288,17 @@ function Get-RunArguments {
 	return $arguments
 }
 function Get-PlayCommand {
+	$arguments = @(Get-RunArguments)
+	# The upscaler, for the game only (the precompile pass shows no picture): DLSS's mode, or off, which also turns
+	# off what the launch config may set. DLSS's model is in NVIDIA's runtime folder, which frame generation has
+	# passed already when it is on.
+	$dlss = if ($dlssAvailable) { [string]$settings.dlss } else { 'off' }
+	$arguments += @('-Dlss', $dlss)
+	if ($dlss -ne 'off' -and !($frameGenAvailable -and [int]$settings.framegen -ge 2)) {
+		$arguments += @('-StreamlineDir', (Format-Quoted $streamline))
+	}
 	# The console stays for the live log; after a crash it waits for a key.
-	return "$powershellCommand " + ((@(Get-RunArguments) + '-Follow') -join ' ') + ' || pause'
+	return "$powershellCommand " + (($arguments + '-Follow') -join ' ') + ' || pause'
 }
 # The precompile pass with the same settings (run-windows.ps1 -Precompile: the emulator's --precompile-only); its
 # summary also goes to $resultFile, which the window shows.
@@ -298,6 +315,7 @@ if ($DryRun) {
 	"emulator:   $exe$(if (!(Test-Path -LiteralPath $exe)) { ' (missing: build it with build-windows.cmd)' })"
 	"data:       $(Get-DataFolder); logs: $(Get-LogFolder)"
 	"framegen:   $(if ($frameGenAvailable) { "NVIDIA's Streamline runtime in $streamline; chosen: $(if ([int]$settings.framegen -ge 2) { "$([int]$settings.framegen)x" } else { 'off' })" } elseif (!$rtxGpu) { 'no NVIDIA RTX graphics card' } else { "no NVIDIA-signed Streamline runtime (settings: '$($settings.streamline)')" })"
+	"dlss:       $(if ($dlssAvailable) { "nvngx_dlss.dll in $streamline; chosen: $($settings.dlss)" } elseif (!$rtxGpu) { 'no NVIDIA RTX graphics card' } elseif (!$streamline) { "no NVIDIA-signed Streamline runtime (settings: '$($settings.streamline)')" } else { "no nvngx_dlss.dll in $streamline" })"
 	"gpus:       $(if ($gpuList.Count) { $gpuList -join ', ' } else { 'Vulkan lists none' }); chosen: $(if ($settings.gpu -ge 0) { $settings.gpu } else { 'automatic' })"
 	Get-Problems | ForEach-Object { "note:       $_" }
 	return
@@ -450,15 +468,47 @@ $frameGenFolder.Add_Click({
 	$script:frameGenAvailable = $rtxGpu
 	$frameGen.Enabled = $rtxGpu
 	Update-FrameGenNote
+	# The upscaler's row too (DLSS's model is in that folder): its choice, made here or saved while the row was
+	# off, shows where DLSS can be chosen.
+	if ($dlssAvailable) { $settings.dlss = $dlssModes[[Math]::Max(0, $upscaling.SelectedIndex)] }
+	$script:dlssAvailable = Test-Dlss
+	$upscaling.SelectedIndex = if ($script:dlssAvailable) { [Array]::IndexOf($dlssModes, [string]$settings.dlss) } else { 0 }
+	Update-Upscaling
 })
 Add-Row 'Frame generation' @($frameGen, $frameGenFolder, $frameGenNote)
+# The upscaler: the game's own, or DLSS in one of its modes; the game's own without an NVIDIA RTX card or DLSS's
+# model in NVIDIA's runtime (the saved choice is kept for when they are there).
+$upscaling = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 320 }
+$upscaling.Items.AddRange($dlssNames)
+$upscaling.SelectedIndex = if ($dlssAvailable) { [Array]::IndexOf($dlssModes, [string]$settings.dlss) } else { 0 }
+$upscalingNote = New-Note ''
+$tips.SetToolTip($upscaling, "NVIDIA DLSS makes the 4K picture from a 3D of that one size, in place of the game's own upscaler:`n" +
+	"a cleaner picture than the game's upscaler makes of the same size. Game's own: the 3D is 1600x900 to`n" +
+	"2304x1296, picked by the game as it goes. NVIDIA RTX only (Saros). DLSS's model (nvngx_dlss.dll) is taken`n" +
+	"from the Streamline SDK folder chosen for frame generation ('Streamline...' above).")
 $renderScale = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 90 }
 $renderScale.Items.AddRange(@($renderScales | ForEach-Object { "$_%" }))
 $renderScale.SelectedIndex = [Array]::IndexOf($renderScales, [int]$settings.render_scale)
 $tips.SetToolTip($renderScale, "The size the game renders its 3D at, in percent of its own (Saros: 1600x900 to 2304x1296).`n" +
 	"The game's upscaler still makes the 4K picture: less work for the graphics card, a softer picture.`n" +
 	"At one spot of Saros (RTX 4090): 31 fps at 100%, 33 at 75%, 36 at 50%.")
-Add-Row '3D resolution' @($renderScale, (New-Note 'Unreal Engine games (Saros): lower is faster and softer'))
+$renderScaleNote = New-Note ''
+# The two rows as DLSS can be chosen and is chosen: with a DLSS mode the 3D has that mode's one size, so the percent
+# of the game's own does not apply (it stays as chosen for the game's own upscaler).
+function Update-Upscaling {
+	$upscaling.Enabled = $dlssAvailable
+	$upscalingNote.Text = if ($dlssAvailable) { 'DLSS: NVIDIA RTX only (Saros); uses the Streamline SDK folder chosen above' }
+		elseif (!$rtxGpu) { 'DLSS needs an NVIDIA RTX graphics card' }
+		elseif (!$streamline) { 'DLSS needs NVIDIA''s Streamline SDK: download it, then choose its folder above' }
+		else { 'DLSS needs nvngx_dlss.dll: choose the unpacked Streamline SDK above' }
+	$dlssChosen = $dlssAvailable -and $upscaling.SelectedIndex -gt 0
+	$renderScale.Enabled = !$dlssChosen
+	$renderScaleNote.Text = if ($dlssChosen) { 'DLSS sets the size of the 3D' } else { 'Unreal Engine games (Saros): lower is faster and softer' }
+}
+$upscaling.Add_SelectedIndexChanged({ Update-Upscaling })
+Update-Upscaling
+Add-Row 'Upscaling' @($upscaling, $upscalingNote)
+Add-Row '3D resolution' @($renderScale, $renderScaleNote)
 $occlusion = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Occlusion queries: leave out what the game finds hidden'; AutoSize = $true; Checked = [bool]$settings.occlusion_queries }
 $tips.SetToolTip($occlusion, "The game asks the graphics card which objects are behind others and stops drawing those.`n" +
 	"On: the emulator answers that question. Saros drew 60% fewer objects and ran a quarter faster in a large hall.`n" +
@@ -583,6 +633,7 @@ function Read-Form {
 	$settings.skip_pending_draws   = $skipPending.Checked
 	# (An unavailable row keeps the saved choice for when the runtime is there.)
 	if ($frameGenAvailable) { $settings.framegen = [Math]::Max(0, $frameGen.SelectedIndex) + 1 }
+	if ($dlssAvailable) { $settings.dlss = $dlssModes[[Math]::Max(0, $upscaling.SelectedIndex)] }
 	$settings.render_scale         = $renderScales[[Math]::Max(0, $renderScale.SelectedIndex)]
 	$settings.occlusion_queries    = $occlusion.Checked
 	$settings.log                  = $logModes[[Math]::Max(0, $log.SelectedIndex)]
