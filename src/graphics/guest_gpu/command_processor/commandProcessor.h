@@ -231,6 +231,15 @@ private:
 	// The packet the last lookahead plan stopped at, if any.
 	const uint32_t* m_lookahead_stop   = nullptr;
 	bool            m_lookahead_active = false;
+	// The buffer the stream enters next held GPU writes when it was called (ProcessIndirectBuffer
+	// read them back): a scan that passed it earlier read other commands.
+	bool m_lookahead_settled = false;
+	// Whether the last scan stopped at a packet of `commands`.
+	[[nodiscard]] bool LookaheadStoppedIn(std::span<const uint32_t> commands) const {
+		return m_lookahead_active && m_lookahead_stop != nullptr &&
+		       m_lookahead_stop >= commands.data() &&
+		       m_lookahead_stop < commands.data() + commands.size();
+	}
 	uint64_t        m_store_epoch      = 0;
 	// See SetLookaheadQueue; and the commands the scan may still plan in those submissions.
 	std::span<const std::span<const uint32_t>> m_lookahead_queued;

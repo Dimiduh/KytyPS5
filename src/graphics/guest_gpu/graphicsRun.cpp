@@ -686,6 +686,20 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	                                        : Pm4ProcessResult::Blocked;
 }
 
+// 1: the look-ahead scan is planned again where the stream leaves what the scan read.
+// - A called or chained buffer that holds GPU writes when the stream enters it: the scan passed
+//   it before that work was recorded and read the commands of an earlier frame (or stopped at
+//   the call, which plans again as before). Saros writes its dispatch lists with compute
+//   shaders; their dispatches had no planned walk and the GPU thread walked every one itself.
+// - A scan stop the stream never runs: the scan stopped inside a buffer the stream then left by
+//   a taken branch or chain before that packet (the branch at the end of such a list), or the
+//   buffer ended. Without a new plan nothing after the buffer was planned until the submission
+//   ended: hundreds of packets in Saros.
+// 0: a plan only where a scan stop is executed.
+static Common::LiveControl::Switch  g_lookahead_replan("lookahead_replan", 1);
+static Common::LiveControl::Counter g_lookahead_replans_settled("lookahead_replans_settled");
+static Common::LiveControl::Counter g_lookahead_replans_lost("lookahead_replans_lost");
+
 // The packets whose programs ResourceLookahead plans.
 static bool IsLookaheadCommand(uint32_t opcode) {
 	switch (opcode) {
@@ -976,6 +990,10 @@ void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands,
 	EXIT_IF(!g_current_execution->m_next_buffer.empty());
 	// Recorded GPU work may have written the commands: games generate command buffers with
 	// compute shaders and call them after that work.
+	m_lookahead_settled =
+	    m_lookahead_active && g_lookahead_replan.On() && !commands.empty() &&
+	    LibKernel::Memory::HasGpuDirtyBytes(reinterpret_cast<uint64_t>(commands.data()),
+	                                        commands.size_bytes());
 	SettleMemoryRead(commands.data(), commands.size_bytes());
 	g_current_execution->m_next_buffer = commands;
 	g_current_execution->m_chain       = chain;
@@ -997,7 +1015,13 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 		auto& cursor = execution.m_buffer_stack.back();
 		if (cursor.offset_dw == cursor.commands.size()) {
+			// A stop inside the finished buffer was never run (running it plans again).
+			const bool lost = g_lookahead_replan.On() && LookaheadStoppedIn(cursor.commands);
 			execution.m_buffer_stack.pop_back();
+			if (lost) {
+				g_lookahead_replans_lost.Add();
+				PlanLookahead(execution, {});
+			}
 			continue;
 		}
 
@@ -1051,7 +1075,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		if (lookahead_command) m_renderer.GetPipelineCache().SetLookaheadCommand(nullptr, nullptr);
-		const bool replan = packet == m_lookahead_stop;
+		bool replan = packet == m_lookahead_stop;
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
 			return;
@@ -1061,11 +1085,20 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		if (!execution.m_next_buffer.empty()) {
 			// Chains and taken branches reuse the fetcher; only calls retain a return cursor.
 			if (execution.m_chain) {
+				// The packets left behind are not run: a scan that stopped among them is over.
+				if (!replan && g_lookahead_replan.On() && LookaheadStoppedIn(cursor.commands)) {
+					g_lookahead_replans_lost.Add();
+					replan = true;
+				}
 				cursor = {execution.m_next_buffer};
 			} else {
 				execution.m_buffer_stack.push_back({execution.m_next_buffer});
 			}
 			execution.m_next_buffer = {};
+			if (std::exchange(m_lookahead_settled, false) && !replan) {
+				g_lookahead_replans_settled.Add();
+				replan = true;
+			}
 		}
 		if (replan) PlanLookahead(execution, {});
 	}
