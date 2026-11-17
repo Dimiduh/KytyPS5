@@ -24,7 +24,10 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
+#include <span>
+#include <utility>
 #include <vector>
 
 namespace Libs::VideoOut {
@@ -89,6 +92,13 @@ public:
 	// `label_id`: the label's PendingLabels entry, 0 for none.
 	void DeliverLabel(void* dst, uint64_t value, uint32_t size,
 	                  Common::UniqueFunction<void>&& notify, uint64_t label_id = 0);
+	// A dump of the guest's z-pass counters (OcclusionQueries), delivered as a label is and in
+	// order with the labels: by the completion thread through the guest backing, or on the GPU
+	// thread when a cache watches the page or a label already waits for that thread. A batch of
+	// (address, samples), in order.
+	void DeliverZPassCounters(std::span<const std::pair<uint64_t, uint64_t>> dumps);
+	// GPU thread: writes the dumps handed to it that are not written yet.
+	void WritePendingZPassCounters();
 
 	// End-of-pipe labels recorded and not yet stored (GPU thread adds, delivery removes).
 	PendingLabels& GetPendingLabels() { return m_pending_labels; }
@@ -141,6 +151,9 @@ private:
 	// Labels handed to the GPU thread and not yet written.
 	std::atomic<uint32_t> m_gpu_thread_labels {0};
 	PendingLabels         m_pending_labels;
+	// Z-pass counter dumps handed to the GPU thread (address, samples), in order.
+	std::mutex                                 m_zpass_mutex;
+	std::vector<std::pair<uint64_t, uint64_t>> m_zpass_pending;
 	// m_gpu for threads outside the GPU thread's lifetime, and how many of them use it now.
 	std::atomic<GuestGpu*> m_notified_gpu {nullptr};
 	std::atomic<uint32_t>  m_gpu_notifiers {0};

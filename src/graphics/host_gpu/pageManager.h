@@ -29,6 +29,11 @@ public:
 	// return false. False, with nothing written, when a page is watched, the range crosses a
 	// tracking region or lies outside the tracked space, or it has no backing.
 	[[nodiscard]] bool TryWriteUnwatched(uint64_t vaddr, const void* data, uint64_t size);
+	// The same for `count` 8-byte words `stride` bytes apart, the bytes between them left as
+	// they are. False also when a word has no backing: the caller then writes them all again
+	// another way.
+	[[nodiscard]] bool TryWriteUnwatchedWords(uint64_t vaddr, const uint64_t* words, uint32_t count,
+	                                          uint32_t stride);
 	// Whether TryWriteUnwatched would find no watcher on the range now.
 	[[nodiscard]] bool IsUnwatched(uint64_t vaddr, uint64_t size);
 

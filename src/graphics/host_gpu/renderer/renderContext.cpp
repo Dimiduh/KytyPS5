@@ -11,6 +11,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cstring>
 #include <thread>
@@ -238,6 +239,51 @@ void RenderContext::DeliverLabel(void* dst, uint64_t value, uint32_t size,
 		}
 		m_gpu_thread_labels.fetch_sub(1, std::memory_order_release);
 	});
+}
+
+void RenderContext::DeliverZPassCounters(std::span<const std::pair<uint64_t, uint64_t>> dumps) {
+	// The words WriteZPassCounters stores: a begin dump is one block of counters and cleared
+	// ends, an end dump every other word of it.
+	std::array<uint64_t, OCCLUSION_QUERY_DBS * 2u> block {};
+	std::array<uint64_t, OCCLUSION_QUERY_DBS>      words {};
+	for (uint32_t db = 0; db < OCCLUSION_QUERY_DBS; db++) {
+		words[db] = block[db * 2u] = OCCLUSION_QUERY_READY;
+	}
+	bool handed = false;
+	for (const auto& [address, samples]: dumps) {
+		words[0] = block[0] = OCCLUSION_QUERY_READY | samples;
+		const bool begin = (address & 8u) == 0;
+		if (m_gpu_thread_labels.load(std::memory_order_acquire) == 0 &&
+		    (begin ? m_page_manager.TryWriteUnwatched(address, block.data(), sizeof(block))
+		           : m_page_manager.TryWriteUnwatchedWords(address, words.data(),
+		                                                   OCCLUSION_QUERY_DBS,
+		                                                   2u * sizeof(uint64_t)))) {
+			continue;
+		}
+		// From here on the dumps, and the labels after them, follow each other on the GPU thread.
+		m_gpu_thread_labels.fetch_add(1, std::memory_order_relaxed);
+		std::lock_guard lock(m_zpass_mutex);
+		m_zpass_pending.emplace_back(address, samples);
+		handed = true;
+	}
+	if (handed) {
+		GetGpu().SendCommand([this] { WritePendingZPassCounters(); });
+	}
+	NotifyGpuMemoryWritten();
+}
+
+void RenderContext::WritePendingZPassCounters() {
+	std::vector<std::pair<uint64_t, uint64_t>> pending;
+	{
+		std::lock_guard lock(m_zpass_mutex);
+		pending.swap(m_zpass_pending);
+	}
+	for (const auto& [address, samples]: pending) {
+		// (A watched page takes the write fault here, as it did when this thread wrote them all.)
+		WriteZPassCounters(reinterpret_cast<volatile uint64_t*>(address), samples,
+		                   (address & 8u) == 0);
+		m_gpu_thread_labels.fetch_sub(1, std::memory_order_release);
+	}
 }
 
 void RenderContext::SettleElidedLabels(uint64_t vaddr, uint64_t size) {

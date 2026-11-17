@@ -63615,12 +63615,17 @@ void CheckPm4Flip() {
     Pm4Execution execution;
     complete =
         processor.Process(execution, commands) == Pm4ProcessResult::Complete;
-    for (const auto counter : results) {
-      published &= (counter & OCCLUSION_QUERY_READY) != 0;
-    }
     copied = !TextureCacheTestAccess::PendingDownload(texture_cache, image);
     processor.BufferFlush();
+    // The counters are written when the GPU has run the dumps, ahead of the flip's completion.
+    renderer.GetCommandScheduler().DrainPriorityOperations();
   });
+  // This array is no guest memory, so the completion thread handed the stores to the GPU
+  // thread: they are written before its next command.
+  gpu.SendCommandSync([] {});
+  for (const auto counter : results) {
+    published &= (counter & OCCLUSION_QUERY_READY) != 0;
+  }
   Require(name, "GL2 writeback", queued && copied,
           "the flip did not copy a GPU-written storage image back");
 

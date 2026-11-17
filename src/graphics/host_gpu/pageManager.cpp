@@ -322,6 +322,23 @@ bool PageManager::TryWriteUnwatched(uint64_t vaddr, const void* data, uint64_t s
 	    vaddr, size, [&] { return Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size); });
 }
 
+bool PageManager::TryWriteUnwatchedWords(uint64_t vaddr, const uint64_t* words, uint32_t count,
+                                         uint32_t stride) {
+	if (count == 0 || stride < sizeof(uint64_t)) {
+		return false;
+	}
+	const uint64_t size = uint64_t {count - 1u} * stride + sizeof(uint64_t);
+	return WithUnwatched(vaddr, size, [&] {
+		for (uint32_t i = 0; i < count; i++) {
+			if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr + uint64_t {i} * stride, &words[i],
+			                                              sizeof(uint64_t))) {
+				return false;
+			}
+		}
+		return true;
+	});
+}
+
 bool PageManager::IsUnwatched(uint64_t vaddr, uint64_t size) {
 	return WithUnwatched(vaddr, size, [] { return true; });
 }

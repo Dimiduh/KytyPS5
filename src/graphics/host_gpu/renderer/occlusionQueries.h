@@ -4,7 +4,9 @@
 #include "common/common.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <atomic>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -28,7 +30,8 @@ inline void WriteZPassCounters(volatile uint64_t* results, uint64_t samples, boo
 }
 
 // The guest's z-pass counters from host occlusion queries: a draw counts its samples while a guest
-// query is open, and the dumps' counters are written before the guest can see the GPU ran them.
+// query is open, and the dumps' counters are written before the guest can see the GPU ran them:
+// when the GPU has run them, ahead of the labels that follow (see PublishDumps).
 class OcclusionQueries {
 public:
 	OcclusionQueries(GraphicContext& graphics, CommandScheduler& scheduler);
@@ -49,35 +52,43 @@ public:
 
 	// A PIXEL_PIPE_STAT_DUMP to address, after the draws recorded so far.
 	void Dump(uint64_t address);
-	// Waits for the GPU to run the dumps and writes their counters.
-	void Publish() {
-		if (!m_dumps.empty()) {
-			PublishDumps();
+	// Before a label, a flush or a flip: the dumps recorded so far are written once the GPU has
+	// run them, ahead of what the guest is told next. `now`: this thread reads the counters
+	// itself (predication) and waits until they are written.
+	void Publish(bool now = false) {
+		if (!m_dumps.empty() || (now && m_queued_tick != 0)) {
+			PublishDumps(now);
 		}
 	}
 
 private:
 	struct PendingDump {
 		uint64_t address;
-		uint64_t tick;
 		uint64_t queries;
 		uint64_t uncounted;
 	};
 
 	int32_t BeginQuery(vk::CommandBuffer command);
-	void    PublishDumps();
+	void    PublishDumps(bool now);
+	// Completion thread: reads the dumps' queries and writes the counters.
+	void Complete(const std::vector<PendingDump>& dumps);
 
 	CommandScheduler&        m_scheduler;
 	vk::Device               m_device;
 	vk::QueryPool            m_pool;
 	vk::QueryControlFlags    m_control;
 	std::vector<PendingDump> m_dumps;
-	std::vector<uint64_t>    m_results;
-	uint32_t                 m_open      = 0;
-	uint64_t                 m_begun     = 0;
-	uint64_t                 m_read      = 0;
-	uint64_t                 m_samples   = 0;
-	uint64_t                 m_uncounted = 0;
+	uint32_t                 m_open        = 0;
+	uint64_t                 m_begun       = 0;
+	uint64_t                 m_uncounted   = 0;
+	// The tick the dumps queued last wait for; 0 once this thread waited for them.
+	uint64_t                 m_queued_tick = 0;
+	// Queries read and reset: the completion thread advances it, BeginQuery reads it.
+	std::atomic<uint64_t>    m_read {0};
+	// Completion thread only.
+	std::vector<uint64_t>                      m_results;
+	std::vector<std::pair<uint64_t, uint64_t>> m_counters;
+	uint64_t                                   m_samples = 0;
 };
 
 } // namespace Libs::Graphics

@@ -1163,7 +1163,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 			return;
 		case 0x01: {
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
-			m_renderer.GetOcclusionQueries().Publish();
+			m_renderer.GetOcclusionQueries().Publish(true);
 			// One begin/end pair per DB; bit 63 marks each counter ready.
 			constexpr uint64_t ready_bit = 1ull << 63u;
 			SettleLabelAccess(address, 16u * 2u * sizeof(uint64_t));
