@@ -3,11 +3,14 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/gpuTiming.h"
+#include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cinttypes>
 #include <cstring>
 #include <immintrin.h>
 #include <numeric>
@@ -120,13 +123,33 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		}
 		return result;
 	};
+	// A device buffer is made in video memory: within the budget if it can be, over it if not.
+	// Left to the allocator, a buffer made while the budget was full went to its next memory
+	// type, system memory, and stayed there: the GPU then read it over the bus at every draw
+	// (a simulated 12 GB card: 2.2 GB of buffers there after a level loaded, 24 fps where the
+	// same spot gives 60). Over the budget, Windows moves out what has the lowest priority
+	// instead, textures nobody used lately, and the texture collector frees them.
+	const bool device_local = usage == MemoryUsage::DeviceLocal;
+	if (device_local && !want_mapping) {
+		allocation_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	}
 	auto result = allocate();
 	if (result != vk::Result::eSuccess && want_mapping) {
 		// No mappable device-local memory, or no budget left in it: an ordinary device buffer.
 		allocation_info.flags &=
 		    ~(VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
-		allocation_info.requiredFlags = 0;
+		allocation_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 		result                        = allocate();
+	}
+	if (result != vk::Result::eSuccess && device_local) {
+		allocation_info.flags &= ~static_cast<VmaAllocationCreateFlags>(
+		    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT);
+		result = allocate();
+		if (result != vk::Result::eSuccess) {
+			// No video memory left at all: system memory keeps the game running.
+			allocation_info.requiredFlags = 0;
+			result                        = allocate();
+		}
 	}
 	if (result != vk::Result::eSuccess) {
 		graphics.LogMemoryBudget();
@@ -148,6 +171,16 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	VkMemoryPropertyFlags properties = 0;
 	vmaGetAllocationMemoryProperties(graphics.allocator, m_allocation, &properties);
 	m_coherent = (properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+	if (device_local && (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) {
+		static std::atomic<uint64_t> count {0};
+		static std::atomic<uint64_t> bytes {0};
+		const auto                   total = bytes.fetch_add(size) + size;
+		if (const auto n = count.fetch_add(1) + 1; (n & (n - 1)) == 0) {
+			LOGF("Warning: a GPU buffer of %" PRIu64 " KiB is in system memory, where the GPU reads "
+			     "it over the bus (%" PRIu64 " so far, %" PRIu64 " MiB): video memory is full\n",
+			     size >> 10u, n, total >> 20u);
+		}
+	}
 	if (allocation_result.pMappedData != nullptr) {
 		m_mapped = {static_cast<uint8_t*>(allocation_result.pMappedData),
 		            static_cast<size_t>(size)};
