@@ -18716,6 +18716,8 @@ public:
         shaders.SetCsUserSgpr(5, static_cast<u32>(count_address >> 32u));
       };
       u32 previous = 0;
+      // What guest memory holds of the count: the last one read back.
+      u32 published = 0;
       for (const u32 count : {3u, 7u, 5u, 0u, 8u}) {
         shaders.SetCsShader(
             {.data_addr = reinterpret_cast<uint64_t>(writer.data()),
@@ -18732,7 +18734,7 @@ public:
                 cache.HasGpuDirtyBytes(count_address, sizeof(u32)) &&
                     LibKernel::Memory::TryReadBacking(count_address, &stale,
                                                       sizeof(stale)) &&
-                    stale == previous,
+                    stale == published,
                 "the count was visible to the CPU before the consumer was "
                 "recorded");
         cache.FillBuffer(output, groups * sizeof(u32), sentinel, false);
@@ -18753,22 +18755,34 @@ public:
                       std::to_string(group) + " wrote " + Hex(actual[group]));
         }
 
-        // The count reaches the shader through the host-flattened SRT, and a
-        // clean count costs no further GPU drain.
+        // The count reaches the shader through the flattened SRT: only the
+        // shader takes it, so while the GPU holds it the walk leaves its flat
+        // word to the dispatch, which copies the count there on the GPU (the
+        // consumer above wrote it, so the copy carried it); read back, it is
+        // in the host's flat words. Either way the walk drains nothing.
         ShaderComputeInputInfo input{};
         const auto tick = scheduler.CurrentTick();
         (void)context.GetPipelineCache().GetComputeProgram(shaders.GetCs(), input);
+        const auto *walked = input.stage.resources;
+        const bool left = walked != nullptr &&
+                          std::ranges::any_of(walked->gpu_words, [&](const auto &word) {
+                            return word.second == count_address;
+                          });
+        Require(name, "count left to the GPU while it holds it",
+                left == cache.HasGpuDirtyBytes(count_address, sizeof(u32)),
+                "the walk did not leave a GPU-held count to the dispatch, or "
+                "left one the CPU has");
         Require(
             name, "host-flattened count",
-            input.stage.resources != nullptr &&
-                std::ranges::find(input.stage.resources->flattened_srt,
-                                  count) !=
-                    input.stage.resources->flattened_srt.end(),
+            walked != nullptr &&
+                (left || std::ranges::find(walked->flattened_srt, count) !=
+                             walked->flattened_srt.end()),
             "the count did not reach the consumer through the flattened SRT");
         Require(name, "clean count stays cheap",
                 scheduler.CurrentTick() == tick,
                 "a walk over clean memory drained the GPU");
         previous = count;
+        if (!left) published = count;
       }
       context.UnmapMemory(base, allocation_size);
       scheduler.Finish();

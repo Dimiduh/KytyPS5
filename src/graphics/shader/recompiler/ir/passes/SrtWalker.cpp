@@ -23,6 +23,7 @@ SrtRuntime SrtReadCapture::ObservedRuntime() {
 	runtime.read_specialization_memory = m_source.read_specialization_memory != nullptr
 	                                         ? Read : nullptr;
 	runtime.read_memory                = m_source.read_memory != nullptr ? ReadMemory : nullptr;
+	runtime.read_data_memory = m_source.read_data_memory != nullptr ? ReadData : nullptr;
 	return runtime;
 }
 
@@ -30,6 +31,12 @@ SrtRuntime SrtReadCapture::ObservedRuntime() {
 bool SrtReadCapture::ReadMemory(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	const auto& source = static_cast<SrtReadCapture*>(userdata)->m_source;
 	return source.read_memory(source.userdata, address, values);
+}
+
+bool SrtReadCapture::ReadData(void* userdata, uint64_t address, uint32_t flat_offset,
+                              uint32_t& value) {
+	const auto& source = static_cast<SrtReadCapture*>(userdata)->m_source;
+	return source.read_data_memory(source.userdata, address, flat_offset, value);
 }
 
 bool SrtReadCapture::Read(void* userdata, uint64_t address, std::span<uint32_t> values) {
@@ -187,6 +194,16 @@ uint64_t KYTY_SYSV_ABI ReadWalkerMemory(const SrtRuntime* runtime, uint64_t addr
 	uint32_t word = 0;
 	return runtime->read_memory != nullptr &&
 	               runtime->read_memory(runtime->userdata, address, {&word, 1})
+	           ? word
+	           : uint64_t {1} << 32u;
+}
+
+// The same for a load whose value only goes to flat word `flat_offset`.
+uint64_t KYTY_SYSV_ABI ReadWalkerDataMemory(const SrtRuntime* runtime, uint64_t address,
+                                            uint32_t flat_offset) {
+	if (runtime->read_data_memory == nullptr) return ReadWalkerMemory(runtime, address);
+	uint32_t word = 0;
+	return runtime->read_data_memory(runtime->userdata, address, flat_offset, word)
 	           ? word
 	           : uint64_t {1} << 32u;
 }
@@ -415,6 +432,8 @@ private:
 		uint32_t             slot = 0, state = 0;
 		Xbyak::Label         label;
 		bool                 pending = true, referenced = false, masked = false;
+		// The flat word of a load nothing else takes (MarkDataLoads), else UINT32_MAX.
+		uint32_t data_flat = UINT32_MAX;
 	};
 
 	static constexpr auto Near = Xbyak::CodeGenerator::T_NEAR;
@@ -451,8 +470,11 @@ private:
 	void EmitNode(uint32_t index);
 	void EmitRead(const Node& node);
 	void EmitStrict(const Node& node);
-	void    EmitLoad(const Xbyak::RegExp& address);
-	void    EmitReadThunk();
+	void    EmitLoad(const Xbyak::RegExp& address, uint32_t data_flat);
+	void    EmitReadThunk(bool data);
+	void    MarkDataLoads(std::span<const Operand> reads, std::span<const Operand> conditions,
+	                      std::span<const std::vector<Operand>> descriptors,
+	                      std::span<const Operand> outputs);
 
 	ResourcePlan&                                     m_plan;
 	Xbyak::CodeGenerator&                             m_code;
@@ -461,7 +483,8 @@ private:
 	std::map<std::pair<const Inst*, uint32_t>, uint32_t> m_memo;
 	std::vector<Value>                                m_outputs;
 	std::vector<std::vector<uint32_t>>                m_output_gates;
-	Xbyak::Label                                         m_ret, m_read;
+	Xbyak::Label                                         m_ret, m_read, m_read_data;
+	bool                                                 m_data_loads = false;
 	bool                                                 m_reader = false;
 	uint32_t m_shader_base = 0, m_reach = 0, m_states = 0, m_states_end = 0;
 	uint32_t m_user_data = 0, m_captures = 0;
@@ -708,7 +731,7 @@ WalkerCompiler::Operand WalkerCompiler::AnalyzeRead(Node& node, const auto& arg,
 void WalkerCompiler::Layout() {
 	uint32_t offset = OutputOffset(m_plan) + static_cast<uint32_t>(m_outputs.size()) * 8u;
 	m_shader_base = offset;
-	offset += 16u; // The shader base, then the runtime.
+	offset += 24u; // The shader base, the runtime, then the flat word of the data load being read.
 	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
 		if (!Thunk(index)) continue;
 		m_nodes[index].slot = offset;
@@ -956,7 +979,7 @@ void WalkerCompiler::EmitRead(const Node& node) {
 			c.mov(c.rcx, c.rax);
 			c.shr(c.rcx, 48);
 			c.jnz(m_ret, Near);
-			EmitLoad(c.rax);
+			EmitLoad(c.rax, node.data_flat);
 		} else {
 			Load(c.r11, args[1]);
 			c.shr(c.r11d, 16);
@@ -986,7 +1009,7 @@ void WalkerCompiler::EmitRead(const Node& node) {
 			c.lea(c.r11, c.ptr[c.r9 + static_cast<size_t>(immediate) + 4u]);
 			c.cmp(c.r11, c.rcx);
 			c.ja(zero, Near);
-			EmitLoad(c.rax + c.r9 + static_cast<size_t>(immediate));
+			EmitLoad(c.rax + c.r9 + static_cast<size_t>(immediate), node.data_flat);
 		}
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
@@ -1000,25 +1023,33 @@ void WalkerCompiler::EmitRead(const Node& node) {
 
 // A direct load is mov eax, [r10] (41 8b 02), so a fault completes it as a zero read. A reader
 // load calls the read thunk with the address in r10; a refused read leaves the value unknown.
-void WalkerCompiler::EmitLoad(const Xbyak::RegExp& address) {
+// The load of a value only the flat buffer takes names its flat word and calls the data thunk.
+void WalkerCompiler::EmitLoad(const Xbyak::RegExp& address, uint32_t data_flat) {
 	auto& c = m_code;
 	c.lea(c.r10, c.ptr[address]);
 	if (!m_reader) {
 		c.mov(c.eax, c.dword[c.r10]);
 		return;
 	}
-	c.call(m_read);
+	if (data_flat != UINT32_MAX) {
+		m_data_loads = true;
+		c.mov(c.dword[c.rdx + m_shader_base + 16u], data_flat);
+		c.call(m_read_data);
+	} else {
+		c.call(m_read);
+	}
 	c.bt(c.rax, 32);
 	c.jc(m_ret, Near);
 }
 
 // Reads the DWORD at r10 (DWORD-aligned, like every walker load) into rax; keeps rdi, rsi, rdx, r8
 // and r10. A read whose 128-byte chunk the runtime's read cache holds under its tag loads it from
-// there; anything else (no cache, a miss) calls ReadWalkerMemory.
-void WalkerCompiler::EmitReadThunk() {
+// there; anything else (no cache, a miss) calls ReadWalkerMemory, or for a data load (the data
+// thunk) ReadWalkerDataMemory with the flat word EmitLoad named.
+void WalkerCompiler::EmitReadThunk(bool data) {
 	auto&        c = m_code;
 	Xbyak::Label slow;
-	c.L(m_read);
+	c.L(data ? m_read_data : m_read);
 	c.mov(c.r11, c.qword[c.rdx + m_shader_base + 8u]);
 	c.mov(c.rcx, c.qword[c.r11 + offsetof(SrtRuntime, read_cache)]);
 	c.test(c.rcx, c.rcx);
@@ -1048,7 +1079,12 @@ void WalkerCompiler::EmitReadThunk() {
 	c.and_(c.rsp, -16);
 	c.mov(c.rdi, c.qword[c.rdx + m_shader_base + 8u]);
 	c.mov(c.rsi, c.r10);
-	c.mov(c.rax, reinterpret_cast<uint64_t>(&ReadWalkerMemory));
+	if (data) {
+		c.mov(c.edx, c.dword[c.rdx + m_shader_base + 16u]);
+		c.mov(c.rax, reinterpret_cast<uint64_t>(&ReadWalkerDataMemory));
+	} else {
+		c.mov(c.rax, reinterpret_cast<uint64_t>(&ReadWalkerMemory));
+	}
 	c.call(c.rax);
 	c.lea(c.rsp, c.ptr[c.rbp - 40]);
 	c.pop(c.r10);
@@ -1280,6 +1316,56 @@ void WalkerCompiler::EmitStrict(const Node& node) {
 	Store(node);
 }
 
+// Marks the loads whose value only the flat buffer takes: a raw scalar load that exactly one
+// flat word is, that no other value, descriptor, block condition or output of the walk has as
+// an operand, and whose flat word the host reads nowhere after the walk (the address bases and
+// the TLAS header of the shader info). Such a load may be answered without its bytes
+// (SrtRuntime::read_data_memory): nothing the walk decides can depend on it.
+void WalkerCompiler::MarkDataLoads(std::span<const Operand> reads,
+                                   std::span<const Operand> conditions,
+                                   std::span<const std::vector<Operand>> descriptors,
+                                   std::span<const Operand> outputs) {
+	std::vector<uint8_t>  taken(m_nodes.size(), 0);
+	std::vector<uint32_t> words(m_nodes.size(), 0);
+	const auto            take = [&](const Operand& operand) {
+		if (operand.kind == Kind::Node) taken[operand.value] = 1;
+	};
+	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
+		const auto& node = m_nodes[index];
+		for (const auto& operand: node.args) take(operand);
+		// (A node that stands for another one: whoever asked for it holds that one.)
+		if (node.result != Operand {Kind::Node, index}) take(node.result);
+	}
+	for (const auto& operand: conditions) take(operand);
+	for (const auto& source: descriptors) {
+		for (const auto& operand: source) take(operand);
+	}
+	for (const auto& operand: outputs) take(operand);
+	for (const auto& operand: reads) {
+		if (operand.kind == Kind::Node) ++words[operand.value];
+	}
+	const auto host_reads = [&](uint32_t flat) {
+		for (const auto& base: m_plan.info.address_bases) {
+			if (base[0] == flat || base[1] == flat) return true;
+		}
+		return m_plan.info.ray_query &&
+		       (m_plan.info.ray_query_tlas[0] == flat || m_plan.info.ray_query_tlas[1] == flat);
+	};
+	for (uint32_t slot = 0; slot < reads.size(); ++slot) {
+		const auto& operand = reads[slot];
+		const auto  flat    = m_plan.srt_reads[slot].flat_offset;
+		if (operand.kind != Kind::Node || flat >= reads.size() || host_reads(flat)) continue;
+		auto&      node = m_nodes[operand.value];
+		const auto op   = node.inst->GetOpcode();
+		if (taken[operand.value] != 0 || words[operand.value] != 1u || node.context != 0 ||
+		    node.result != operand ||
+		    (op != ValueOpcode::LoadAddressU32 && op != ValueOpcode::ReadConstBuffer)) {
+			continue;
+		}
+		node.data_flat = flat;
+	}
+}
+
 void WalkerCompiler::Compile(std::span<const Value> values) {
 	auto&       c         = m_code;
 	const auto& sources   = m_plan.descriptor_sources;
@@ -1301,6 +1387,7 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 		}
 	}
 	for (const auto value: m_outputs) outputs.push_back(Evaluate(value, 0).operand);
+	if (resources && m_reader) MarkDataLoads(reads, conditions, descriptors, outputs);
 	Layout();
 
 	Xbyak::Label pass, fail, reset;
@@ -1444,7 +1531,8 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
 		if (Thunk(index)) EmitNode(index);
 	}
-	if (m_reader) EmitReadThunk();
+	if (m_reader) EmitReadThunk(false);
+	if (m_reader && m_data_loads) EmitReadThunk(true);
 	m_plan.srt_scratch.assign(m_plan.srt_captures / 8u + m_captures, 0u);
 	m_plan.srt_user_data = m_user_data;
 	c.readyRE();

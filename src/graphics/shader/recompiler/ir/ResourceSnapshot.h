@@ -85,6 +85,10 @@ struct ResourceSnapshot {
 	// GPU-selected roots bound as null because their candidates cannot be served (only with
 	// SrtRuntime::null_failed_roots).
 	uint32_t nulled_roots = 0;
+	// Flat words the walk left to its caller (SrtRuntime::read_data_memory): the word and the
+	// guest address of its DWORD. flattened_srt does not hold the DWORD there: whoever hands
+	// the flat buffer to a shader puts it in first.
+	std::vector<std::pair<uint32_t, uint64_t>> gpu_words;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

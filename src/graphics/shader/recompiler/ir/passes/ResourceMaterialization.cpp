@@ -3257,6 +3257,7 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 	for (auto& keys: program.selector_keys) keys.resolved = false;
 	snapshot.unavailable  = false;
 	snapshot.nulled_roots = 0u;
+	snapshot.gpu_words.clear();
 	if (!program.resource_tracking_complete) return false;
 	const auto uses_workgroup_count = [](const DescriptorSource& source) {
 		return source.indirect_descriptor && source.indirect_descriptor->workgroup_axis != UINT32_MAX;

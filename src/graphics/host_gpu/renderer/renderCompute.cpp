@@ -4,6 +4,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/gpuTiming.h"
+#include "common/liveControl.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -239,6 +240,57 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 		     descriptor.Base48(), size, packed_clear);
 	}
 	return true;
+}
+
+// Flat words a frame's dispatches got on the GPU instead of a readback (`measure`).
+static Common::LiveControl::Counter g_gpu_scalar_words("gpu_scalar_words");
+
+// The flat words the walk left to the dispatch (ResourceSnapshot::gpu_words, in word order):
+// DWORDs the GPU has written, or will by the time the dispatch runs, whose value only the
+// shader takes. func(word, address, count) gets each run of consecutive words whose DWORDs
+// follow each other in guest memory (a struct the shader reads field by field).
+template <typename Func>
+static void ForEachGpuWordRun(const ShaderStageRuntime& stage, Func&& func) {
+	const auto& words = stage.resources->gpu_words;
+	for (size_t first = 0; first < words.size();) {
+		size_t last = first + 1;
+		while (last < words.size() && words[last].first == words[last - 1].first + 1u &&
+		       words[last].second == words[last - 1].second + sizeof(uint32_t)) {
+			++last;
+		}
+		func(words[first].first, words[first].second, static_cast<uint32_t>(last - first));
+		first = last;
+	}
+}
+
+// The buffers that hold them are found before the dispatch's own buffers are bound, since
+// finding one can merge cache buffers.
+static void FindGpuWords(RenderContext& context, const ShaderStageRuntime& stage) {
+	ForEachGpuWordRun(stage, [&](uint32_t, uint64_t address, uint32_t count) {
+		(void)context.GetBufferCache().ObtainBuffer(address, count * sizeof(uint32_t), false);
+	});
+}
+
+// Each run is copied from the buffer that holds it into the uploaded flat buffer: in command
+// order after the work that writes it and before the dispatch that reads it, so the shader
+// loads what its own load would have, and the GPU thread does not wait for the bytes.
+static void FillGpuWords(RenderContext& context, CommandBuffer& command,
+                         const ShaderStageRuntime& stage, const PreparedBindings& bindings) {
+	const auto& flat = bindings.flattened_srt;
+	// (A module that reads no flat word binds no flat buffer.)
+	if (stage.resources->gpu_words.empty() || !flat.buffer) return;
+	auto& cache  = context.GetBufferCache();
+	auto& stream = cache.GetUtilityBuffer(MemoryUsage::Stream);
+	EXIT_IF(flat.buffer != stream.Handle());
+	ForEachGpuWordRun(stage, [&](uint32_t word, uint64_t address, uint32_t count) {
+		const auto destination = uint64_t {word} * sizeof(uint32_t);
+		const auto bytes       = uint64_t {count} * sizeof(uint32_t);
+		if (destination + bytes > flat.range) return;
+		// (Found before the bindings: nothing is merged now.)
+		const auto [source, offset] = cache.ObtainBuffer(address, bytes, false);
+		stream.CopyFrom(command, *source, offset, flat.offset + destination, bytes);
+		g_gpu_scalar_words.Add(count);
+	});
 }
 
 // Global loads read pages without a buffer as zero. Back the 32 KiB after each base the shader
@@ -501,7 +553,9 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	}
 	RebindImages(bindings);
 	BindSharedMemory(m_context, input_info, bindings);
+	FindGpuWords(m_context, input_info.stage);
 	RebindBuffers(bindings);
+	FillGpuWords(m_context, buffer, input_info.stage, bindings);
 	if (FrameGen::Enabled()) {
 		const uint32_t groups[] {thread_group_x, thread_group_y, thread_group_z};
 		FrameGen::FindInputs(program.shader_hash, resources, bindings, groups);
@@ -662,7 +716,9 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF((args_offset & 3u) != 0);
+	FindGpuWords(m_context, input_info.stage);
 	RebindBuffers(bindings);
+	FillGpuWords(m_context, buffer, input_info.stage, bindings);
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	const auto vk_buffer = buffer.DispatchHandle(DispatchMayWriteMemory(program, bindings),

@@ -7,6 +7,7 @@
 #include <cstring>
 #include <span>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -63,17 +64,43 @@ public:
 		return std::span(m_read_backs).first(m_read_back_count);
 	}
 
+	// The DWORD at `address` for a reader that can do without bytes the GPU still holds: false
+	// when it has GPU-dirty bytes (nothing is read back, `value` is zero), else what Read gives.
+	[[nodiscard]] bool ReadUnlessGpuDirty(uint64_t address, uint32_t& value) {
+		value = 0;
+		DropAfterGpuWrite();
+		const auto base = address & ~(ChunkBytes - 1u);
+		if (address - base + sizeof(uint32_t) <= ChunkBytes) {
+			auto& entry = m_entries[Index(base)];
+			if (entry.base != base) {
+				Fill(entry, base);
+			}
+			if (entry.base == base) {
+				if (entry.dirty && m_backend.HasGpuDirtyBytes(address, sizeof(uint32_t))) {
+					return false;
+				}
+				std::memcpy(&value, reinterpret_cast<const uint8_t*>(entry.words) + (address - base),
+				            sizeof(uint32_t));
+				return true;
+			}
+		}
+		if (m_backend.HasGpuDirtyBytes(address, sizeof(uint32_t))) {
+			return false;
+		}
+		if (!m_backend.Read(address, &value, sizeof(uint32_t))) {
+			value = 0;
+		}
+		return true;
+	}
+	// The flat words a data reader left to the walk's caller (flat word, guest address), in
+	// the order they were left; a walk that starts over leaves a word again.
+	[[nodiscard]] std::vector<std::pair<uint32_t, uint64_t>>& Deferred() { return m_deferred; }
+
 	// Unmapped guest memory reads as zeros: the walk evaluates loads the shader may never
 	// execute, e.g. through a null SRT pointer.
 	void Read(uint64_t address, std::span<uint32_t> values) {
 		const auto bytes = values.size_bytes();
-		if (const auto sequence = m_backend.GpuWriteSequence(); sequence != m_sequence) {
-			for (auto& entry: m_entries) {
-				entry.base = UINT64_MAX;
-			}
-			m_tags.fill(UINT64_MAX);
-			m_sequence = sequence;
-		}
+		DropAfterGpuWrite();
 		const auto base = address & ~(ChunkBytes - 1u);
 		if (bytes <= ChunkBytes && address - base + bytes <= ChunkBytes) {
 			auto& entry = m_entries[Index(base)];
@@ -101,6 +128,17 @@ public:
 	}
 
 private:
+	// A GPU write recorded since the chunks were filled drops them all.
+	void DropAfterGpuWrite() {
+		if (const auto sequence = m_backend.GpuWriteSequence(); sequence != m_sequence) {
+			for (auto& entry: m_entries) {
+				entry.base = UINT64_MAX;
+			}
+			m_tags.fill(UINT64_MAX);
+			m_sequence = sequence;
+		}
+	}
+
 	static constexpr std::array<uint64_t, Entries> MakeEmptyTags() {
 		std::array<uint64_t, Entries> tags {};
 		tags.fill(UINT64_MAX);
@@ -151,6 +189,7 @@ private:
 	std::span<const ScalarReadRange>          m_prefetch;
 	std::array<ScalarReadRange, MaxReadBacks> m_read_backs {};
 	size_t                                    m_read_back_count = 0;
+	std::vector<std::pair<uint32_t, uint64_t>> m_deferred;
 };
 
 } // namespace Libs::Graphics

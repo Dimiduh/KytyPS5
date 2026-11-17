@@ -229,6 +229,27 @@ bool ReadShaderScalarMemory(void* userdata, uint64_t address, std::span<uint32_t
 	return true;
 }
 
+// 1: a compute dispatch's walk does not wait for a DWORD the GPU still writes when only the
+// shader takes its value (SrtRuntime::read_data_memory): the dispatch copies the DWORD into
+// its flat buffer on the GPU (FillGpuWords, renderCompute.cpp). 0: every such DWORD is read back.
+// Saros chains small compute passes, each reading a few bytes the one before wrote: 3 of the 8
+// waits of a frame at a heavy spot were for a struct of six floats one of them hands the next.
+Common::LiveControl::Switch g_gpu_scalars("gpu_scalars", 1);
+
+// The reader of a walk's data-only loads on the GPU thread.
+bool ReadShaderDataMemory(void* userdata, uint64_t address, uint32_t flat_offset,
+                          uint32_t& value) {
+	auto* cache = static_cast<GuestScalarReadCache*>(userdata);
+	if (cache == nullptr) {
+		ReadShaderScalarMemoryUncached(address, {&value, 1});
+		return true;
+	}
+	if (!cache->ReadUnlessGpuDirty(address, value)) {
+		cache->Deferred().emplace_back(flat_offset, address);
+	}
+	return true;
+}
+
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
 	if (!Config::GraphicsDebugDumpEnabled()) {
@@ -397,9 +418,26 @@ struct PipelineCache::ProgramCache {
 		// bind failed roots as null directly (a walk where every root is served is unchanged).
 		bool Materialize(const ShaderRecompiler::IR::SrtRuntime& runtime, ShaderType stage) {
 			auto       walk        = runtime;
+			// The words the walk leaves to the dispatch (ReadShaderDataMemory), each once.
+			auto* leaving = walk.read_data_memory == ReadShaderDataMemory
+			                    ? static_cast<GuestScalarReadCache*>(walk.userdata)
+			                    : nullptr;
 			const auto materialize = [&] {
+				if (leaving != nullptr) leaving->Deferred().clear();
 				const bool done = ShaderRecompiler::IR::MaterializeResources(
 				    resource_plan, walk, resources, specialization);
+				if (leaving != nullptr) {
+					for (const auto& word: leaving->Deferred()) {
+						const auto same = std::ranges::find(resources.gpu_words, word.first,
+						                                    &std::pair<uint32_t, uint64_t>::first);
+						if (same == resources.gpu_words.end()) {
+							resources.gpu_words.push_back(word);
+						} else {
+							same->second = word.second;
+						}
+					}
+					std::ranges::sort(resources.gpu_words);
+				}
 				// The first report of each shader also goes to the log.
 				if (const auto report = ShaderRecompiler::IR::TakeSpecializationFailureReport();
 				    !report.empty()) {
@@ -1459,6 +1497,8 @@ struct PipelineCache::ProgramCache {
 			options.input_info.compute = &input_info;
 			runtime.workgroup_counts   = input_info.workgroup_counts;
 			runtime.indirect_args_address = input_info.indirect_args_address;
+			// (Compute only: a draw's flat buffer is uploaded inside a render pass.)
+			if (g_gpu_scalars.On()) runtime.read_data_memory = ReadShaderDataMemory;
 		}
 		const auto stage           = options.stage;
 		lookup_key.stage           = stage;

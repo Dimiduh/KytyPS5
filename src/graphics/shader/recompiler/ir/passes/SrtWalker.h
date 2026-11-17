@@ -9,6 +9,11 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uint32_t> values);
+// The reader of a load whose value only goes to the flat buffer (SrtRuntime::read_data_memory):
+// `flat_offset` is the flat word the DWORD at `address` is for. False refuses the read, as an
+// SrtMemoryReader does.
+using SrtDataReader = bool (*)(void* userdata, uint64_t address, uint32_t flat_offset,
+                              uint32_t& value);
 
 // Image descriptors at base + first + k * step, k < count, within size bytes that a sampled
 // root selects by GPU-computed byte offset. The host keeps them resident instead of
@@ -89,6 +94,13 @@ struct SrtRuntime {
 	// support) is bound as null instead of failing the walk; ResourceSnapshot::nulled_roots
 	// counts them. For work that must run even when one of its resources cannot.
 	bool null_failed_roots = false;
+	// Optional, for reader loads. A load whose value nothing but the flat buffer takes (no
+	// descriptor, address, condition or output of the walk depends on it, and the host reads
+	// its flat word nowhere) asks this reader instead of read_memory when the read cache does
+	// not hold its chunk. The reader may answer without the bytes, with any value, and see to
+	// it that the flat word is right by the time the shader reads it (the renderer: a copy on
+	// the GPU of bytes the GPU still writes, instead of a wait for them).
+	SrtDataReader read_data_memory = nullptr;
 };
 
 // How walker loads read guest memory: in place (a fault completes the load as a zero read), or
@@ -104,6 +116,7 @@ public:
 private:
 	static bool Read(void* userdata, uint64_t address, std::span<uint32_t> values);
 	static bool ReadMemory(void* userdata, uint64_t address, std::span<uint32_t> values);
+	static bool ReadData(void* userdata, uint64_t address, uint32_t flat_offset, uint32_t& value);
 
 	SrtRuntime                                  m_source;
 	std::vector<std::pair<uint64_t, uint64_t>>& m_ranges;

@@ -432,6 +432,106 @@ void TestReaderLoadsThroughCacheView() {
   }
 }
 
+void TestDataLoadsAskTheDataReader() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  // A load whose value only the flat buffer takes asks read_data_memory, with
+  // its flat word; the reader may answer without the bytes. A load another
+  // load's address depends on asks read_memory, whatever its flat word.
+  alignas(128) static std::array<uint32_t, 64> table{};
+  for (uint32_t index = 0; index < table.size(); ++index)
+    table[index] = 0x100u + index;
+  table[2] = 40u; // The offset the fourth load reads at.
+  const auto address = reinterpret_cast<uint64_t>(table.data());
+  std::array<uint32_t, 3> user_data{static_cast<uint32_t>(address),
+                                    static_cast<uint32_t>(address >> 32u), 0u};
+  auto program = SrtProgram(0u);
+  program.user_data_base = 4;
+  program.user_data_count = 3;
+  program.srt_reads.clear();
+  auto &block = *program.blocks[0];
+  const auto emit = [&](ValueOpcode opcode, std::initializer_list<Value> args) {
+    return Value(&block.AppendNewInst(opcode, args));
+  };
+  const auto root =
+      emit(ValueOpcode::GetAddressResource,
+           {emit(ValueOpcode::GetUserData, {Value(ScalarReg(4))}),
+            emit(ValueOpcode::GetUserData, {Value(ScalarReg(5))})});
+  const auto zero = emit(ValueOpcode::GetUserData, {Value(ScalarReg(6))});
+  const auto load = [&](Value offset) {
+    const auto value = emit(ValueOpcode::LoadAddressU32,
+                            {root, offset, Value(0u), Value(true)});
+    value.Instruction()->SetFlags(MemoryFlags{.index = 0});
+    program.srt_reads.push_back(
+        {value, static_cast<uint32_t>(program.srt_reads.size())});
+    return value;
+  };
+  load(emit(ValueOpcode::IAdd32, {zero, Value(0u)}));  // flat 0: data
+  load(emit(ValueOpcode::IAdd32, {zero, Value(4u)}));  // flat 1: data
+  const auto pointer =
+      load(emit(ValueOpcode::IAdd32, {zero, Value(8u)})); // flat 2: an offset
+  load(emit(ValueOpcode::IAdd32, {zero, pointer}));        // flat 3: data
+  auto plan = ExtractResourcePlan(program, SrtWalkerLoads::Reader);
+  Check(plan.srt_code != nullptr, "data loads were not compiled");
+  struct Reads {
+    uint32_t ordinary = 0;
+    std::vector<std::pair<uint64_t, uint32_t>> data; // address, flat word
+    uint64_t left = 0;                                // the address left out
+  } reads;
+  const auto read_memory = [](void *data, uint64_t at,
+                              std::span<uint32_t> words) {
+    ++static_cast<Reads *>(data)->ordinary;
+    std::memcpy(words.data(), reinterpret_cast<const void *>(at),
+                words.size_bytes());
+    return true;
+  };
+  const auto read_data = [](void *data, uint64_t at, uint32_t flat,
+                            uint32_t &value) {
+    auto &seen = *static_cast<Reads *>(data);
+    seen.data.emplace_back(at, flat);
+    if (at == seen.left) {
+      value = 0xdead0000u + flat;
+    } else {
+      std::memcpy(&value, reinterpret_cast<const void *>(at), sizeof(value));
+    }
+    return true;
+  };
+  SrtRuntime runtime{.user_data = user_data,
+                     .read_memory = read_memory,
+                     .userdata = &reads,
+                     .read_specialization_memory = read_memory};
+  {
+    // Without a data reader every load is an ordinary one.
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              reads.ordinary == 4u && reads.data.empty() &&
+              snapshot.flattened_srt.size() >= 4u &&
+              snapshot.flattened_srt[0] == table[0] &&
+              snapshot.flattened_srt[3] == table[10] &&
+              snapshot.gpu_words.empty(),
+          "data loads without a data reader did not read as ordinary loads");
+  }
+  runtime.read_data_memory = read_data;
+  reads = {};
+  reads.left = address + 4u;
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "the walk failed with a data reader");
+  std::ranges::sort(reads.data);
+  const std::vector<std::pair<uint64_t, uint32_t>> expected{
+      {address, 0u}, {address + 4u, 1u}, {address + 40u, 3u}};
+  Check(reads.data == expected,
+        "the data reader was not asked for exactly the data loads");
+  Check(reads.ordinary == 1u,
+        "a load that an address depends on did not read as an ordinary load");
+  Check(snapshot.flattened_srt[0] == table[0] &&
+            snapshot.flattened_srt[1] == 0xdead0001u &&
+            snapshot.flattened_srt[2] == 40u &&
+            snapshot.flattened_srt[3] == table[10],
+        "the flat words of data loads are not what the readers answered");
+}
+
 void TestRangeOverlapIndex() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   // The sorted index answers exactly as a scan of every range does, including
@@ -2207,6 +2307,7 @@ int main() {
   TestSnapshotReleasesUnusedCapacity();
   TestNativeNestedSrtRefresh();
   TestReaderLoadsThroughCacheView();
+  TestDataLoadsAskTheDataReader();
   TestResourceLookahead();
   TestLookaheadReleasesReadBuffers();
   TestSpecializationFailureReports();
