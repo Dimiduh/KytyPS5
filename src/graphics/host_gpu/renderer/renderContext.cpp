@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/gpuTiming.h"
+#include "common/liveControl.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
@@ -10,10 +11,22 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <cstring>
 #include <thread>
 
 namespace Libs::Graphics {
+
+namespace {
+
+// 2: the session builds pipelines beside the game unless the card is short of video memory
+// (RenderContext::RenderContext); 1: on any card; 0: on none.
+Common::LiveControl::Switch g_session_precompile("session_precompile", 2);
+// A video memory budget under this counts as short: cards of 12 GB and less (the budget of a
+// card of 16 GB is about 15 GiB).
+constexpr uint64_t SmallVideoMemory = 13ull << 30u;
+
+} // namespace
 
 RenderContext::RenderContext(GraphicContext& graphics)
     : m_graphics(graphics), m_render_executor(*this), m_command_scheduler(*this, graphics),
@@ -30,7 +43,24 @@ RenderContext::RenderContext(GraphicContext& graphics)
 		m_ray_tracing = std::make_unique<RayTracing>(*this);
 	}
 	// After the bindless table: precompiled layouts reference its set layout.
-	if (Config::PrecompilePipelinesEnabled() && !Config::PrecompileOnlyEnabled()) {
+	// The builds beside the game cost video memory: the pipelines kept for their first use, and
+	// what the driver keeps of every pipeline created through its cache (1.6 GB less without
+	// them at a heavy spot of Saros), and giving them up later does not give the memory back.
+	// A card whose budget is under SmallVideoMemory leaves them out: what a precompile pass
+	// built comes from the driver cache at its first use (a few milliseconds), anything else
+	// is compiled then. session_precompile: 1 builds beside the game on any card, 0 on none.
+	bool beside_the_game = Config::PrecompilePipelinesEnabled() && !Config::PrecompileOnlyEnabled();
+	if (beside_the_game && g_session_precompile.Get() != 1) {
+		const auto budget = graphics.SampleMemoryHeaps().device.budget;
+		if (g_session_precompile.Get() == 0 || (budget != 0 && budget < SmallVideoMemory)) {
+			beside_the_game = false;
+			LOGF("Precompile beside the game: left out (%" PRIu64 " MiB of video memory budget; "
+			     "it keeps about 1.6 GB of video memory). Pipelines come from the driver cache "
+			     "at their first use: run the precompile pass before play\n",
+			     budget >> 20u);
+		}
+	}
+	if (beside_the_game) {
 		// While the session boots, about half the host threads (at low priority) build what
 		// earlier sessions or the list recorded, which the game is about to need; then as many
 		// as the background pipeline builds use: driver compilers are multithreaded themselves,
