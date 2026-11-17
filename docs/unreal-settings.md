@@ -16,6 +16,12 @@ emulator can set them in the running game. Nothing of the game is patched.
 `--unreal-render-scale` is `x<percent / 100>` for `r.ScreenPercentage`,
 `r.DynamicRes.MinScreenPercentage` and `r.DynamicRes.MaxScreenPercentage`.
 
+With DLSS in place of the game's upscaler ([dlss-upscaling.md](dlss-upscaling.md)) the same
+three variables are set to one number, `--upscaler-render-percent`: the 3D at one size, in
+percent of the output's. An assignment written `upscaler?<name>=<number>` is set only while
+the emulator's upscaler makes the picture, so a PC where DLSS cannot be loaded keeps the game's
+own sizes.
+
 Only float and int variables that the engine reads as it runs can be set. Variables of another
 kind (a reference to a global, a string, a bool) are refused with a line in the log. A variable's
 change callback does not run, so the scalability groups (`sg.*`) do nothing, and a variable the

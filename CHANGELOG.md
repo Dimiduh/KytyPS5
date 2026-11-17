@@ -32,6 +32,21 @@ with them; other places and machines will differ.
 - Menus, movies and loading screens are shown as they are.
 - Details: [docs/frame-generation.md](docs/frame-generation.md).
 
+### DLSS upscaling
+
+- **NVIDIA DLSS makes Saros's 4K picture in place of the game's own upscaler.** The game's
+  upscaler breaks thin and distant things up into stairs and dots, the more the smaller the 3D
+  it starts from; DLSS makes a clean picture of the same 3D.
+- Launcher row "Upscaling", or `run-windows.ps1 -Dlss <quality|balanced|performance|ultra>`:
+  the 3D at 2560x1440, 2227x1253, 1920x1080 or 1280x720 (the game's own: 1600x900 to
+  2304x1296).
+- At one spot (RTX 4090): the game as it is 41.7 fps, DLSS performance 41.3, DLSS ultra 46.7,
+  balanced 39.5, quality 32.8. At the same 3D size DLSS costs about what the game's upscaler
+  does, because the game's own last pass is left out.
+- Needs an NVIDIA RTX card and DLSS's model (`nvngx_dlss.dll`) from NVIDIA's Streamline SDK,
+  the folder frame generation uses; both work together. Without them the game's upscaler stays.
+- Details: [docs/dlss-upscaling.md](docs/dlss-upscaling.md).
+
 ### 3D resolution and the game's own Unreal settings
 
 - Unreal Engine titles keep their console variables; the emulator can now set them in the running
@@ -147,8 +162,11 @@ with them; other places and machines will differ.
 - **A lost graphics device leaves a record.** With the driver's `VK_EXT_device_fault` the log,
   and the launcher's log, say how full video memory was and what the driver recorded: the
   address the GPU faulted on, or none (the GPU stopped answering and Windows reset it).
-  `KYTY_DEVICE_FAULT=0` leaves the extension off. Not seen at work yet: no device was lost
-  here.
+  `KYTY_DEVICE_FAULT=0` leaves the extension off. An address is looked up among the emulator's
+  buffers, the live ones and the last 65,536 destroyed, and the record says whether an
+  upscaler's commands were in the lost submission. Two records so far: a player's (a write
+  through an invalid address, hours into a session) and one here (a read through an address of
+  no buffer, during the load into a save, with DLSS upscaling on).
 - With 12 GB of video memory or 16 GB of RAM Saros is still at the edge; a lower 3D resolution
   and no frame generation leave more room.
 
@@ -224,8 +242,9 @@ unmodified `saros` branch gave 37 fps and the first batch of changes below 47.9.
 
 Most of the changes above can be turned off while the game runs, through the live channel below:
 `vulkan_recording`, `bda_lazy`, `stream_share`, `heap_by_content`, `lookahead_replan`,
-`guest_image_writes`, `image_buffer_writes`, `guest_copy`, `readback_narrow`, `gpu_scalars`. Each also reads an
-environment variable `KYTY_<NAME>` at start.
+`guest_image_writes`, `image_buffer_writes`, `guest_copy`, `readback_narrow`, `gpu_scalars`,
+`game_upscaler`, `game_upscaler_skip`. Each also reads an environment variable `KYTY_<NAME>` at
+start. `present_crop` 1 to 9 shows a part of the picture pixel for pixel in the window.
 
 ## Tools for measuring
 
@@ -268,7 +287,10 @@ environment variable `KYTY_<NAME>` at start.
   generation about ten minutes in, whose log names neither the card nor its memory). Not
   reproduced here: two boots with frame generation on a 24 GB card with 8 to 9 GB of it taken
   away ran without one. The next report will carry the driver's fault record (see above).
-- DLSS Super Resolution is not included; the game's own upscaler makes the picture.
+- With DLSS upscaling on, one of about twenty-five test boots lost the graphics device during
+  the load into a save (the record above); four more boots of the same setting did not. Not
+  explained, and not known to be DLSS's doing: the next record says which submission held
+  DLSS's commands.
 - A shader that reads the resident texture table is another compiled variant than before. It is
   built at first use in each part of the game and cached from then on.
 - CPU writes into memory that a rendered image also uses still cause whole-image uploads (about

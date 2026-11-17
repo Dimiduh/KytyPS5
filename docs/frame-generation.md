@@ -98,4 +98,5 @@ clip-to-previous-clip matrix gives for that pixel's depth.
   (the Demon's Souls fork has an optional HUD-less image for this).
 - The game's frames are still shown on the emulator's 60 Hz flip schedule; below 60 fps they
   arrive unevenly, which generated frames cannot smooth out.
-- AMD FSR frame generation and DLSS super resolution, which the Demon's Souls fork also has.
+- AMD FSR frame generation, which the Demon's Souls fork also has. (DLSS super resolution in
+  place of the game's upscaler: [dlss-upscaling.md](dlss-upscaling.md).)

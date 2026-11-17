@@ -1,8 +1,8 @@
 # KytyPS5
 
-> **This fork** (branch `saros-port`) adds a Windows launcher, DLSS Frame Generation, a 3D
-> resolution option for Unreal Engine titles, shader precompilation for a whole game and
-> performance work for Saros. See [CHANGELOG.md](CHANGELOG.md) for what changed and what was
+> **This fork** (branch `saros-port`) adds a Windows launcher, DLSS Frame Generation, DLSS
+> upscaling in place of Saros's own upscaler, a 3D resolution option for Unreal Engine titles,
+> shader precompilation for a whole game and performance work for Saros. See [CHANGELOG.md](CHANGELOG.md) for what changed and what was
 > measured. The rest of this page is the upstream project's.
 
 [![Build KytyPS5 (Windows)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28Windows%29&label=Build%20KytyPS5%20%28Windows%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
