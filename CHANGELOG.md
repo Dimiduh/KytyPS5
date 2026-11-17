@@ -1,8 +1,9 @@
 # Changes in this fork
 
 This branch (`saros-port`) starts from the `saros` branch of
-[CarRamRod-963/KytyPS5](https://github.com/CarRamRod-963/KytyPS5) and adds the work below, most of
-it for Saros (PPSA07631) on Windows. Several pieces are ported from, or follow ideas of, the
+[CarRamRod-963/KytyPS5](https://github.com/CarRamRod-963/KytyPS5) (its `saros-v0.1.7` since
+2026-11-17, `saros-v0.1.5` before) and adds the work below, most of it for Saros (PPSA07631) on
+Windows. Several pieces are ported from, or follow ideas of, the
 Demon's Souls fork [chenxiao07/KytyPS5](https://github.com/chenxiao07/KytyPS5); those are marked
 "from the DS fork".
 
@@ -62,7 +63,40 @@ with them; other places and machines will differ.
 - The driver's own shader disk cache is kept in the game's data folder.
 - The pass's summary now also says how much earlier passes already built, so a short re-check no
   longer looks like a lost cache.
+- **The pass builds on every CPU but two.** It used half of the threads and never more than
+  eight. Nearly all of its time is the graphics driver's shader compiler (94 to 98% of a build
+  thread with an NVIDIA card), so the gain is what the extra threads are worth: on an i9-13900K
+  the same first 3,000 builds take 118 s instead of 208 s, and the first phase (the recorded,
+  listed and compute shaders, 13,800 builds) 15 minutes instead of about 27. On a PC with
+  little memory it takes fewer threads; `-PrecompileThreads <n>` names a count.
+- **The progress line says how far the pass is**: the total, the share done and about how long
+  is left at the pace of the last two minutes.
+- **A pass can be stopped and continued.** Closing the emulator's window ends it; what it built
+  is saved then, and every five minutes while it runs, and the next pass goes on from there.
+  Before, the save after a stop could fail and lose everything the pass had built, a pass saved
+  nothing until its end, and stopping twice during the same long compile shut that shader out
+  of later passes.
+- **"Also build likely shader pairs"** in the launcher (on by default; `-ShaderPairs none`):
+  off, a first pass leaves out the shader pairs, about 23,000 of the 37,000 pipelines of Saros.
 - Details: [docs/shader-precompile.md](docs/shader-precompile.md).
+
+### Crashes and memory
+
+- **The Saros fork's fixes up to `saros-v0.1.7` are merged**: the emulator follows the driver's
+  current video memory budget and frees memory at once when it is over the limit, a lost
+  graphics device on the lift ride into Shattered Rise and in similar spots is fixed (an older
+  copy of a picture was written over newer game data), and so is a freeze when video memory
+  was nearly full. A failed wait for the GPU now names the Vulkan result and the memory heaps
+  in the log, and the log warns while video memory is over its budget.
+- **The shader preparation gives way where memory is short.** Translating the compute shaders
+  of the whole game ahead of their first use holds 6.6 GB of RAM in a Saros session (23.1 GB
+  against 16.5 GB at one spot): it is done on a PC with more than 40 GB of RAM, and left to
+  the first use (about 13 ms each) on one with less; `KYTY_PREPARE_CREATED=1` or `=0` decides
+  it by hand. The pipelines a session keeps ready for their first use take about 0.7 GB of
+  video memory: they are released, and no more are kept, when video memory comes near its
+  limit.
+- With 12 GB of video memory or 16 GB of RAM Saros is still at the edge; a lower 3D resolution
+  and no frame generation leave more room.
 
 ### Smaller things
 

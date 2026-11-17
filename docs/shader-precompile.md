@@ -56,9 +56,35 @@ graphics driver update:
 .\run-windows.ps1 -Precompile -Game <game>
 ```
 
-A first pass compiles everything (for Saros about 14,000 compute pipelines and 23,000 graphics
-pipelines of shader pairs, 50 to 60 minutes on the PC above, a cache of a little over 2 GB); a
-later one only what changed.
+A first pass compiles everything (for Saros about 14,000 recorded, listed and compute pipelines
+and 23,000 graphics pipelines of shader pairs, a cache of about 2 GB); a later one only what
+changed.
+
+## How long the pass takes
+
+Nearly all of the pass is the graphics driver's shader compiler: 94 to 98% of a build thread
+with an NVIDIA card. So the time depends on the processor, and on how many builds run at a
+time:
+
+- The pass builds one pipeline for each logical CPU the emulator may use but two, on threads
+  below normal priority, so the PC stays usable. `-PrecompileThreads <n>`
+  (`--precompile-threads`) names another count. On the PC above (8 fast and 16 small cores)
+  the same first 3,000 builds take 208 s on 8 threads and 118 s on 30, and the first phase
+  (everything but the shader pairs, 13,800 builds) 15 minutes on 30 threads against about 27
+  on 8. A processor without small cores gains less: its second threads are worth about a
+  third of a core each.
+- Memory bounds the count: the driver's compiler takes up to two thirds of a gigabyte for
+  each build it has at a time (22 GB at the peak with 30 builds), so a PC with 16 GB of RAM
+  builds 14 at a time at most.
+- The shader pairs come last and are about half of a first pass. The launcher's "Also build
+  likely shader pairs" (`-ShaderPairs none`) leaves them out: their pipelines are then built
+  in the background the first time they are drawn.
+- The pass can be stopped at any time by closing the emulator's window ("Kyty: precompiling
+  pipelines"). It saves what it has built then, and every five minutes while it runs, and the
+  next pass goes on from there.
+- Every 30 seconds it says where it is: `Precompile: 21378 builds left of 36943 (42% done;
+  about 12 min left at this pace)`. The kinds of builds differ in what they cost, so the
+  estimate moves.
 
 ## What is still compiled during play
 

@@ -7,7 +7,9 @@ that a material no session has shown yet can find its pipeline there. The file h
 numbers only, no shader code; the code comes from `shader-seeds/<title id>.seeds`.
 
 `run-windows.ps1` passes this folder to the emulator (`--shader-pairs`) when it exists;
-`-ShaderPairs none` leaves it out, `-ShaderPairs <file>` names another list.
+`-ShaderPairs none` leaves it out (the launcher's "Also build likely shader pairs", off),
+`-ShaderPairs <file>` names another list. The pairs are the last and longest part of a first
+precompile: for Saros about 23,000 of its 37,000 pipelines.
 
 ## What a line builds
 
