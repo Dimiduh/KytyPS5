@@ -65,6 +65,14 @@ public:
 	                                          const ProgramManifest*  programs,
 	                                          const ProgramManifest*  created,
 	                                          const PipelineManifest* pipelines);
+	// Adds the entries of `more` that `contents` lacks, after its own (a list is built from its
+	// front, and what a list had stays where it was); how many it added.
+	struct Added {
+		size_t compute   = 0;
+		size_t stages    = 0;
+		size_t pipelines = 0;
+	};
+	static Added Merge(PipelineListContents& contents, const PipelineListContents& more);
 };
 
 // The position of the `index`th of `count` entries, scaled to [0, 2^32): entries of lists of

@@ -21,7 +21,66 @@ constexpr uint32_t              MaxTitle     = 64;
 // Kind, code id, code-only flag.
 constexpr size_t ComputePrefix = 1 + sizeof(uint64_t) + sizeof(uint32_t) + 1;
 
+// An entry as the file holds it.
+std::vector<uint8_t> Encode(const PipelineListContents::Compute& entry) {
+	std::vector<uint8_t> payload;
+	Writer               w(payload);
+	w.Put(KindCompute);
+	w.Put(entry.code.hash);
+	w.Put(entry.code.words);
+	w.PutBool(entry.code_only);
+	// The body carries the code's length only; the code itself is not listed.
+	auto record     = entry.record;
+	record.code     = std::make_shared<const std::vector<uint32_t>>(entry.code.words);
+	const auto body = ProgramManifest::EncodeComputeBody(record);
+	payload.insert(payload.end(), body.begin(), body.end());
+	return payload;
+}
+
+std::vector<uint8_t> Encode(const GraphicsStageRecord& stage) {
+	std::vector<uint8_t> payload;
+	Writer               w(payload);
+	w.Put(KindStage);
+	PipelineRecordFormat::PutStage(w, stage);
+	w.Put(stage.spirv_hash);
+	return payload;
+}
+
+std::vector<uint8_t> Encode(const GraphicsPipelineRecord& pipeline) {
+	std::vector<uint8_t> payload;
+	Writer               w(payload);
+	w.Put(KindPipeline);
+	PipelineRecordFormat::PutPipeline(w, pipeline);
+	return payload;
+}
+
+std::string Bytes(const std::vector<uint8_t>& payload) {
+	return {payload.begin(), payload.end()};
+}
+
 } // namespace
+
+PipelineList::Added PipelineList::Merge(PipelineListContents&       contents,
+                                        const PipelineListContents& more) {
+	Added added;
+	// (An entry is the same when the file would hold the same bytes for it.)
+	const auto merge = [](auto& kept, const auto& offered, size_t& count) {
+		std::unordered_set<std::string> have;
+		for (const auto& entry: kept) {
+			have.insert(Bytes(Encode(entry)));
+		}
+		for (const auto& entry: offered) {
+			if (have.insert(Bytes(Encode(entry))).second) {
+				kept.push_back(entry);
+				count++;
+			}
+		}
+	};
+	merge(contents.compute, more.compute, added.compute);
+	merge(contents.stages, more.stages, added.stages);
+	merge(contents.pipelines, more.pipelines, added.pipelines);
+	return added;
+}
 
 PipelineListContents PipelineList::FromManifests(const std::string&      title_id,
                                                  const ProgramManifest*  programs,
@@ -85,33 +144,13 @@ bool PipelineList::Write(const std::filesystem::path& path, const PipelineListCo
 		payloads.push_back(std::move(header));
 	}
 	for (const auto& entry: contents.compute) {
-		std::vector<uint8_t> payload;
-		Writer               w(payload);
-		w.Put(KindCompute);
-		w.Put(entry.code.hash);
-		w.Put(entry.code.words);
-		w.PutBool(entry.code_only);
-		// The body carries the code's length only; the code itself is not listed.
-		auto record     = entry.record;
-		record.code     = std::make_shared<const std::vector<uint32_t>>(entry.code.words);
-		const auto body = ProgramManifest::EncodeComputeBody(record);
-		payload.insert(payload.end(), body.begin(), body.end());
-		payloads.push_back(std::move(payload));
+		payloads.push_back(Encode(entry));
 	}
 	for (const auto& stage: contents.stages) {
-		std::vector<uint8_t> payload;
-		Writer               w(payload);
-		w.Put(KindStage);
-		PipelineRecordFormat::PutStage(w, stage);
-		w.Put(stage.spirv_hash);
-		payloads.push_back(std::move(payload));
+		payloads.push_back(Encode(stage));
 	}
 	for (const auto& pipeline: contents.pipelines) {
-		std::vector<uint8_t> payload;
-		Writer               w(payload);
-		w.Put(KindPipeline);
-		PipelineRecordFormat::PutPipeline(w, pipeline);
-		payloads.push_back(std::move(payload));
+		payloads.push_back(Encode(pipeline));
 	}
 	return ManifestFormat::WriteEntryFile(path, ListMagic, FormatVersion, payloads);
 }

@@ -3971,8 +3971,28 @@ bool PipelineCache::ExportPipelineList(const std::filesystem::path& path) {
 		PipelineCacheLog("Pipeline list: no manifests for this title; nothing to export");
 		return false;
 	}
-	const auto contents = PipelineList::FromManifests(m_title_id, m_manifest.get(), m_created.get(),
-	                                                  m_pipeline_manifest.get());
+	auto contents = PipelineList::FromManifests(m_title_id, m_manifest.get(), m_created.get(),
+	                                            m_pipeline_manifest.get());
+	// With a list given for the title (--import-pipeline-list): that list first, then what this
+	// folder recorded besides. Exported over the list that ships, a folder's recordings are added
+	// to it; they do not take the place of what other sessions recorded.
+	if (const auto given = Config::ImportPipelineListPath(); !given.empty()) {
+		const auto              list = PipelineList::FileFor(given, m_title_id);
+		PipelineList::ReadStats stats;
+		auto                    merged = PipelineList::Read(list, m_title_id, &stats);
+		if (stats.valid && stats.title_matches && stats.rejected == 0) {
+			const size_t had_compute   = merged.compute.size();
+			const size_t had_pipelines = merged.pipelines.size();
+			const auto   added         = PipelineList::Merge(merged, contents);
+			PipelineCacheLog("Pipeline list: {} had {} compute programs and {} graphics pipelines; "
+			                 "this data folder's recordings add {} and {} ({} of its {} and {} "
+			                 "were listed already)",
+			                 Common::PathToString(list), had_compute, had_pipelines, added.compute,
+			                 added.pipelines, contents.compute.size() - added.compute,
+			                 contents.compute.size(), contents.pipelines.size());
+			contents = std::move(merged);
+		}
+	}
 	if (!PipelineList::Write(path, contents)) {
 		PipelineCacheLog("Pipeline list: failed to write {}", Common::PathToString(path));
 		return false;

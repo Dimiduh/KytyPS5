@@ -537,6 +537,51 @@ void TestListRoundTrip() {
   Check(!stats.valid && garbage.compute.empty(), "garbage is not a list");
 }
 
+void TestMerge() {
+  ListFixture fixture;
+  auto list = fixture.Contents();
+  // The same recordings add nothing.
+  auto added = PipelineList::Merge(list, fixture.Contents());
+  Check(added.compute == 0 && added.stages == 0 && added.pipelines == 0 &&
+            list.compute.size() == 2 && list.stages.size() == 3 &&
+            list.pipelines.size() == 3,
+        "recordings a list holds are not added again");
+  // Another folder's recordings: a second program of a listed shader, a
+  // pipeline of listed stages with another state, and one with a new stage.
+  ProgramManifest programs;
+  programs.Add(Compute(1, fixture.cs_code));
+  programs.Add(Compute(2, fixture.cs_code));
+  const auto ps3 = PixelStage(9, fixture.ps_code);
+  PipelineManifest pipelines;
+  pipelines.AddStage(fixture.vs);
+  pipelines.AddStage(fixture.ps);
+  pipelines.AddStage(ps3);
+  pipelines.AddPipeline(Pipeline(fixture.vs, &fixture.ps, 1));
+  pipelines.AddPipeline(Pipeline(fixture.vs, &fixture.ps, 7));
+  pipelines.AddPipeline(Pipeline(fixture.vs, &ps3, 1));
+  const auto more =
+      PipelineList::FromManifests("PPSA00001", &programs, nullptr, &pipelines);
+  added = PipelineList::Merge(list, more);
+  Check(added.compute == 1 && added.stages == 1 && added.pipelines == 2,
+        "only what a list lacks is added");
+  Check(list.compute.size() == 3 &&
+            list.compute.back().record.push_data_cursor == 2 &&
+            list.stages.back().Key() == ps3.Key() &&
+            list.pipelines[3].Key() ==
+                Pipeline(fixture.vs, &fixture.ps, 7).Key() &&
+            list.pipelines[4].Key() == Pipeline(fixture.vs, &ps3, 1).Key(),
+        "what is new comes after what the list had");
+  // The merged list is a list: it is written and read back whole.
+  const auto path = TempPath("merged.plist");
+  PipelineList::ReadStats stats;
+  Check(PipelineList::Write(path, list), "the merged list is written");
+  const auto read = PipelineList::Read(path, "PPSA00001", &stats);
+  Check(stats.valid && stats.dropped_bytes == 0 && read.compute.size() == 3 &&
+            read.stages.size() == 4 && read.pipelines.size() == 5,
+        "the merged list reads back");
+  std::filesystem::remove(path);
+}
+
 void TestResolver() {
   ListFixture fixture;
   PipelineListResolver resolver(fixture.Contents());
@@ -669,6 +714,7 @@ int main() {
   TestFieldValidation();
   TestCodeStore();
   TestListRoundTrip();
+  TestMerge();
   TestResolver();
   TestAttempts();
   std::printf("PipelineListTests: all tests passed\n");
