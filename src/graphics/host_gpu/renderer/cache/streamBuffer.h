@@ -11,6 +11,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -45,6 +46,12 @@ inline constexpr vk::BufferUsageFlags AllFlags =
 //   Read    shaders read it: the guest's stores reach it at every command ordering point.
 //   Probed  Read and watched again for a while, to find out whether shaders still read it.
 enum class BdaUse : uint8_t { Unread, Read, Probed };
+
+// What a GPU address belongs to, for the report of a lost device: a buffer that has it, one
+// destroyed lately that had it, or the buffers nearest to it. Shaders reach guest memory through
+// such addresses unchecked (the BDA page table), so a fault names one. `precision`: how exactly
+// the driver knows the address.
+[[nodiscard]] std::string DescribeGpuAddress(uint64_t address, uint64_t precision);
 
 class Buffer {
 public:

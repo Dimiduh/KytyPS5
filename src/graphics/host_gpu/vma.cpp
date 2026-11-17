@@ -18,6 +18,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <algorithm>
 #include <chrono>
@@ -314,9 +315,11 @@ void GraphicContext::LogLostDevice() const {
 	                info.description.data(), counts.addressInfoCount, counts.vendorInfoCount));
 	for (uint32_t i = 0; i < counts.addressInfoCount; ++i) {
 		Log::WriteToConsoleAndLog(
-		    fmt::format("Lost device: {} at {:#x} (to within {:#x} bytes)\n",
+		    fmt::format("Lost device: {} at {:#x} (to within {:#x} bytes): {}\n",
 		                vk::to_string(addresses[i].addressType), addresses[i].reportedAddress,
-		                addresses[i].addressPrecision));
+		                addresses[i].addressPrecision,
+		                DescribeGpuAddress(addresses[i].reportedAddress,
+		                                   addresses[i].addressPrecision)));
 	}
 	for (uint32_t i = 0; i < counts.vendorInfoCount; ++i) {
 		Log::WriteToConsoleAndLog(

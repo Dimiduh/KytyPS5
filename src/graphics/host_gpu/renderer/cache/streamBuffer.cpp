@@ -10,15 +10,42 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cstring>
+#include <deque>
+#include <fmt/format.h>
 #include <immintrin.h>
+#include <map>
+#include <mutex>
 #include <numeric>
 #include <vk_mem_alloc.h>
 
 namespace Libs::Graphics {
 
 namespace {
+
+// The buffers with a GPU address, and the last of them destroyed (DescribeGpuAddress).
+struct AddressedBuffer {
+	uint64_t                              address     = 0;
+	uint64_t                              size        = 0;
+	uint64_t                              cpu_address = 0;
+	MemoryUsage                           usage       = MemoryUsage::DeviceLocal;
+	std::chrono::steady_clock::time_point destroyed {};
+};
+constexpr size_t                    DESTROYED_KEPT = 4096;
+std::mutex                          g_addressed_mutex;
+std::map<uint64_t, AddressedBuffer> g_addressed;
+std::deque<AddressedBuffer>         g_destroyed;
+
+std::string NameOf(const AddressedBuffer& buffer) {
+	return buffer.cpu_address != 0
+	           ? fmt::format("the buffer of guest memory {:#x} ({} KiB, GPU address {:#x})",
+	                         buffer.cpu_address, buffer.size >> 10u, buffer.address)
+	           : fmt::format("an emulator buffer (kind {}, {} KiB, GPU address {:#x})",
+	                         static_cast<uint32_t>(buffer.usage), buffer.size >> 10u,
+	                         buffer.address);
+}
 
 constexpr size_t WATCHES_INITIAL_RESERVE = 0x4000;
 constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
@@ -63,6 +90,47 @@ constexpr vk::AccessFlags MEMORY_ACCESS =
 }
 
 } // namespace
+
+std::string DescribeGpuAddress(uint64_t address, uint64_t precision) {
+	std::lock_guard lock(g_addressed_mutex);
+	const auto      end = address + std::max<uint64_t>(precision, 1u);
+	const auto      overlaps = [&](const AddressedBuffer& buffer) {
+		return buffer.address < end && address < buffer.address + buffer.size;
+	};
+	std::string text;
+	const auto  after = g_addressed.upper_bound(address);
+	if (after != g_addressed.begin() && overlaps(std::prev(after)->second)) {
+		const auto& buffer = std::prev(after)->second;
+		text = fmt::format("inside {}, {:#x} bytes in", NameOf(buffer), address - buffer.address);
+	} else if (after != g_addressed.end() && overlaps(after->second)) {
+		text = fmt::format("at the start of {}", NameOf(after->second));
+	}
+	// The newest destroyed buffer that held it: a write through an address kept too long.
+	const auto now = std::chrono::steady_clock::now();
+	for (auto buffer = g_destroyed.rbegin(); buffer != g_destroyed.rend(); ++buffer) {
+		if (overlaps(*buffer)) {
+			const auto ms =
+			    std::chrono::duration_cast<std::chrono::milliseconds>(now - buffer->destroyed).count();
+			text += fmt::format("{}inside {}, destroyed {} ms before", text.empty() ? "" : "; also ",
+			                    NameOf(*buffer), ms);
+			break;
+		}
+	}
+	if (!text.empty()) {
+		return text;
+	}
+	text = "in no buffer the emulator has or lately had";
+	if (after != g_addressed.begin()) {
+		const auto& below = std::prev(after)->second;
+		text += fmt::format("; {:#x} bytes past the end of {}",
+		                    address - (below.address + below.size), NameOf(below));
+	}
+	if (after != g_addressed.end()) {
+		text += fmt::format("; {:#x} bytes before {}", after->second.address - address,
+		                    NameOf(after->second));
+	}
+	return text;
+}
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
                uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size, bool host_readable)
@@ -166,6 +234,8 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		address_info.buffer = m_buffer;
 		m_device_address    = graphics.device.getBufferAddress(address_info);
 		EXIT_IF(m_device_address == 0);
+		std::lock_guard lock(g_addressed_mutex);
+		g_addressed[m_device_address] = {m_device_address, size, cpu_address, usage, {}};
 	}
 
 	VkMemoryPropertyFlags properties = 0;
@@ -188,6 +258,17 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 }
 
 Buffer::~Buffer() {
+	if (m_device_address != 0) {
+		std::lock_guard lock(g_addressed_mutex);
+		if (const auto it = g_addressed.find(m_device_address); it != g_addressed.end()) {
+			it->second.destroyed = std::chrono::steady_clock::now();
+			g_destroyed.push_back(it->second);
+			if (g_destroyed.size() > DESTROYED_KEPT) {
+				g_destroyed.pop_front();
+			}
+			g_addressed.erase(it);
+		}
+	}
 	if (m_buffer != nullptr) {
 		m_graphics->UntrackAllocation(m_memory, MemoryPriority::Class::Pinned);
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
