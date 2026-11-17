@@ -41,6 +41,26 @@ with them; other places and machines will differ.
 - Saros at one heavy spot: 31 fps as it is, 33 at 75%, 36 at 50%.
 - Details: [docs/unreal-settings.md](docs/unreal-settings.md).
 
+### Occlusion queries
+
+- **The game's occlusion queries are answered.** A game asks the graphics card how much of an
+  object can be seen and stops drawing what is hidden. The emulator answered "visible" every
+  time unless it was started with `--occlusion-queries`. The launcher (Graphics, "Occlusion
+  queries") and `run-windows.ps1` now turn that option on; `-OcclusionQueries off` gives the old
+  behaviour. The notes of the [Jetsku fork](https://github.com/Jetsku/KytyPS5) pointed here.
+- Saros at 50% 3D resolution, at two heavy spots: 41 to 50.6 fps (+24%) in a large hall, with
+  1,547 to 619 draws a frame, and 41 to 57 fps (+37%) at another, with 1,540 to 725. Where
+  little is hidden the gain is small: 51.5 to 53.7 fps while turning all the way round. With
+  frame generation on it is the same gain.
+- **Their results no longer stop the thread that feeds the GPU** (after the Jetsku fork). They
+  were written at the next label, flush or flip, after a wait for the GPU: one wait of 2 ms a
+  frame in Saros. They are now written when the GPU has run them, by the thread that writes
+  the labels and ahead of the labels that follow: 50.1 to 51.2 fps in three off/on rounds
+  (`occlusion_defer`).
+- Checked: the still picture is the same, and captures taken while the camera turned, and
+  right after a fast turn, miss nothing. Not judged by eye in motion. That fork turned its own
+  queries off by default: they cost half the frame rate in the heaviest levels of another game.
+
 ### Shaders compiled before play instead of during it
 
 - **Precompile pass** (`run-windows.ps1 -Precompile`, or the launcher's button): builds everything
@@ -212,7 +232,9 @@ environment variable `KYTY_<NAME>` at start.
 - **Live channel** (`KYTY_LIVE_FILE=<file>`): commands written to a file while the game runs.
   `measure <seconds>` reports fps, frame times, GPU time and per-frame counters; `prof` samples a
   thread and can look inside one function; `set <switch> <value>` flips a switch; `mem` searches,
-  reads and writes the game's memory; `pad` and `stick` send controller input.
+  reads and writes the game's memory; `pad` and `stick` send controller input. `measure`
+  switches the performance panel's counters on for its window; `fps <seconds>` reports the
+  frame rate alone and leaves them as they are (off and on gave the same rate on Saros).
 - **A performance log of a whole play session** (`KYTY_PERF_LOG=<seconds>`, for example
   `KYTY_PERF_LOG=10` in the launcher's Environment field): every such window of play writes one
   `Perf <time of day> ...` line with the numbers of `measure` into the log, so a session played
