@@ -92,6 +92,20 @@ Common::LiveControl::Counter g_guest_copy_again("guest_copy_again");
 // every frame for nothing: 40.4 -> 47.9 fps in one process, write faults 3,770 -> 840 a frame,
 // uploads 16.8 -> 4.3 MiB, protection requests of the GPU thread 1,930 -> 590.
 Common::LiveControl::Switch g_bda_lazy("bda_lazy", 1);
+
+// 1: the uses of a small range the guest wrote share one stream copy of it (ObtainBuffer's
+// stream path) instead of copying it at every use. On the console a guest store reaches GPU
+// work only through an ordering point of the command stream (BdaSyncQueue), so within one such
+// stretch every use reads the same bytes, unless the emulator itself stores into them. A copy
+// is shared while the scheduler tick the ring keeps it for, the count of ordering points and the
+// stores InvalidateMemory was told of over its pages (guest write faults, the command
+// processor's own stores, unmaps) are those of the copy, and the range is still guest-written
+// and holds no GPU write. In Saros 10,600 such copies a frame (21 MiB), 8,000 of them of a
+// range copied before in the same tick: a frame's constants, bound by draw after draw.
+// 0: a copy at every use.
+Common::LiveControl::Switch  g_stream_share("stream_share", 1);
+Common::LiveControl::Counter g_stream_copies("stream_copies");
+Common::LiveControl::Counter g_stream_shared("stream_shared");
 // The buffer parts a BDA synchronization left to their bindings.
 Common::LiveControl::Counter g_bda_unread("bda_unread");
 
@@ -515,7 +529,33 @@ BufferCache::~BufferCache() {
 	}
 }
 
+void BufferCache::NoteStreamCopyStore(uint64_t vaddr, uint64_t size) {
+	if (size == 0) {
+		return;
+	}
+	constexpr uint64_t MaxPages = 64;
+	const auto         first    = vaddr >> PageTable::kPageBits;
+	const auto         last     = (vaddr + size - 1) >> PageTable::kPageBits;
+	if (last - first >= MaxPages) {
+		m_stream_wide_stores.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	for (auto page = first; page <= last; page++) {
+		m_stream_page_stores[page % StreamStoreSlots].fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+BufferCache::StreamCopyStamp BufferCache::StreamCopyStores(uint64_t vaddr, uint64_t size) const {
+	const auto count = [this](uint64_t page) {
+		return m_stream_page_stores[page % StreamStoreSlots].load(std::memory_order_relaxed);
+	};
+	return {.wide  = m_stream_wide_stores.load(std::memory_order_relaxed),
+	        .first = count(vaddr >> PageTable::kPageBits),
+	        .last  = count((vaddr + size - 1) >> PageTable::kPageBits)};
+}
+
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size, bool guest_store) {
+	NoteStreamCopyStore(vaddr, size);
 	if (!guest_store) {
 		// A store of the emulated command processor, a write-back or an unmap: an upload the
 		// worker still has to copy from these pages belongs to earlier commands and must not
@@ -1412,6 +1452,17 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (!is_written && size <= CACHING_PAGESIZE &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+		// The stores are read before the bytes: one that lands during the copy leaves a stamp
+		// no later use matches.
+		const auto tick   = m_scheduler.CurrentTick();
+		const auto stores = StreamCopyStores(vaddr, size);
+		auto&      shared = m_stream_copies[(vaddr >> 4u) % m_stream_copies.size()];
+		if (g_stream_share.On() && shared.vaddr == vaddr && shared.size == size &&
+		    shared.tick == tick && shared.order == m_stream_copy_order &&
+		    shared.stores == stores) {
+			g_stream_shared.Add();
+			return {&m_stream_buffer, shared.offset};
+		}
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
@@ -1420,6 +1471,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
 			}
 			m_stream_buffer.Commit();
+			shared = {vaddr, size, offset, tick, m_stream_copy_order, stores};
+			g_stream_copies.Add();
 			return {&m_stream_buffer, offset};
 		}
 	}
@@ -1853,6 +1906,9 @@ void BufferCache::NoteBdaOrderingPoint(uint64_t epoch) {
 	// The ordered epoch belongs to the GPU thread, which also takes (only guest stores queue
 	// elsewhere).
 	m_bda_sync.NoteOrderingPoint(epoch);
+	// The work after the point reads the guest's stores before it: no stream copy is shared
+	// across it.
+	m_stream_copy_order++;
 }
 
 void BufferCache::TakeBdaSync(BdaSyncDue& due) {

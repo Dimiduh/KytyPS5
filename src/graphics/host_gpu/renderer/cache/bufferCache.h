@@ -431,6 +431,35 @@ private:
 	std::atomic<uint64_t>                             m_bda_store_epoch {0};
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
+	// The stores a stream copy's pages have seen (StreamCopyStores).
+	struct StreamCopyStamp {
+		uint64_t wide  = 0;
+		uint32_t first = 0;
+		uint32_t last  = 0;
+		bool     operator==(const StreamCopyStamp&) const = default;
+	};
+	// A stream copy of a small range the guest wrote, shared by the range's later uses
+	// (ObtainBuffer) while the copy is still what those uses must read.
+	struct StreamCopy {
+		uint64_t        vaddr  = 0;
+		uint64_t        size   = 0;
+		uint64_t        offset = 0;
+		uint64_t        tick   = 0;
+		uint64_t        order  = 0;
+		StreamCopyStamp stores;
+	};
+	// (On the heap: a RenderContext may live on a thread's stack.)
+	std::vector<StreamCopy> m_stream_copies = std::vector<StreamCopy>(4096);
+	// Ordering points of the command stream so far (NoteBdaOrderingPoint; GPU thread).
+	uint64_t m_stream_copy_order = 0;
+	// Stores into guest memory that InvalidateMemory was told of, counted per cache page
+	// (hashed), and those over too many pages to count each.
+	static constexpr uint64_t                StreamStoreSlots = 16384;
+	std::unique_ptr<std::atomic<uint32_t>[]> m_stream_page_stores =
+	    std::make_unique<std::atomic<uint32_t>[]>(StreamStoreSlots);
+	std::atomic<uint64_t> m_stream_wide_stores {0};
+	void                  NoteStreamCopyStore(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] StreamCopyStamp StreamCopyStores(uint64_t vaddr, uint64_t size) const;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;

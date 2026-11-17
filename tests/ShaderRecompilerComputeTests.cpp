@@ -10678,6 +10678,56 @@ public:
         TextureCacheTestAccess::DeleteImage(texture_cache, kept);
       }
       {
+        // The uses of a small range the guest wrote share one stream copy
+        // until its bytes can differ for the work at hand: a store the
+        // emulator is told of, or an ordering point of the command stream. A
+        // guest store in between races with that work and is not looked for.
+        constexpr uint64_t shared_offset = 0x1300000;
+        constexpr uint64_t shared_size = 256;
+        constexpr uint32_t first_value = 0x11111111u;
+        constexpr uint32_t second_value = 0x22222222u;
+        constexpr uint32_t third_value = 0x33333333u;
+        const auto shared_address = base + shared_offset;
+        auto &buffers = resources.GetBufferCache();
+        const auto store = [&](uint32_t value) {
+          std::memcpy(memory + shared_offset, &value, sizeof(value));
+        };
+        const auto bind = [&] {
+          return buffers.ObtainBuffer(shared_address, shared_size, false, false);
+        };
+        const auto read = [&](const auto &bound) {
+          uint32_t value = 0;
+          std::memcpy(&value, bound.first->Mapped().data() + bound.second,
+                      sizeof(value));
+          return value;
+        };
+        std::memset(memory + shared_offset, 0, shared_size);
+        store(first_value);
+        const auto first = bind();
+        const auto again = bind();
+        store(second_value);
+        const auto raced = bind();
+        buffers.InvalidateMemory(shared_address, sizeof(uint32_t));
+        const auto stored = bind();
+        store(third_value);
+        const auto before_point = bind();
+        buffers.NoteBdaOrderingPoint();
+        const auto ordered = bind();
+        Require(name, "uses of a guest-written range share its stream copy",
+                first.first == again.first && first.second == again.second &&
+                    raced.first == first.first && raced.second == first.second &&
+                    read(first) == first_value,
+                "a second use of a small guest-written range took another "
+                "stream copy, or the copy did not hold the range's bytes");
+        Require(name, "a store or an ordering point ends a shared stream copy",
+                stored.second != first.second && read(stored) == second_value &&
+                    before_point.second == stored.second &&
+                    ordered.second != stored.second &&
+                    read(ordered) == third_value,
+                "a use after an emulator store or an ordering point read the "
+                "copy taken before it, or one before the point did not share");
+      }
+      {
         // Transient resources share heap memory: a large target bound later
         // spans a smaller GPU-written image further in. Which of their texels
         // the memory holds is unknown (binding a target does not write all of
