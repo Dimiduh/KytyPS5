@@ -51,7 +51,7 @@ partial class MainWindow : Window {
 
 	TextBox gamePath, dataPath, resolutionText, extraArgs, environment;
 	ComboBox resolution, present, renderScale, frameGen, language, gpu, log, uiLanguage;
-	CheckBox fullscreen, stretch, hdr, overlay, sound, skipNotice, redzone, background, lists, pairs, noWait, ecores, reopenLauncher;
+	CheckBox fullscreen, stretch, hdr, overlay, sound, skipNotice, redzone, background, lists, pairs, noWait, ecores, reopenLauncher, occlusion;
 	TextBlock resolutionNote, frameGenNote, streamlineText, bannerTitle, bannerLine, shaderLine, problemText;
 	Button precompilePageButton;
 	Image banner;
@@ -466,6 +466,7 @@ partial class MainWindow : Window {
 	FrameworkElement BuildGraphicsPage() {
 		var scales = Options.RenderScales.Select(scale => new Choice(scale + "%", scale));
 		renderScale = Combo(scales, Math.Max(0, Array.IndexOf(Options.RenderScales, S.Int("render_scale"))), 160);
+		occlusion = Switch(S.Bool("occlusion_queries"));
 
 		// Frame generation: the multiplier, off without an NVIDIA RTX card or NVIDIA's runtime (the saved choice is kept
 		// for when they are there).
@@ -489,6 +490,8 @@ partial class MainWindow : Window {
 		return Page("graphics.title",
 			Section("graphics.resolution"),
 			Row("render", renderScale, Desc(T("render.desc"))),
+			Section("graphics.occlusion"),
+			Row("occlusion", occlusion, Desc(T("occlusion.desc"))),
 			Section("graphics.fg"),
 			Row("framegen", frameGen, frameGenNote),
 			Row("streamline", Horizontal(chooseStreamline, streamlineText), Desc(T("streamline.desc"))),
@@ -646,6 +649,7 @@ partial class MainWindow : Window {
 		// (An unavailable row keeps the saved choice for when the runtime is there.)
 		if (context.FrameGenAvailable) S.Set("framegen", Math.Max(0, frameGen.SelectedIndex) + 1);
 		S.Set("render_scale", Options.RenderScales[Math.Max(0, renderScale.SelectedIndex)]);
+		S.Set("occlusion_queries", occlusion.IsChecked == true);
 		S.Set("log", Options.LogModes[Math.Max(0, log.SelectedIndex)]);
 		S.Set("extra_args", extraArgs.Text.Trim());
 		S.Set("environment", environment.Text.Trim());
@@ -674,6 +678,7 @@ partial class MainWindow : Window {
 		if (S.Bool("stretch")) options.Add(T("summary.stretch"));
 		if (S.Bool("perf_overlay")) options.Add(T("summary.overlay"));
 		if (!S.Bool("sound")) options.Add(T("summary.noSound"));
+		if (!S.Bool("occlusion_queries")) options.Add(T("summary.noOcclusion"));
 		if (S.Bool("skip_notice_screen")) options.Add(T("summary.skipNotice"));
 		if (S.Bool("redzone")) options.Add(T("summary.redzone"));
 		if (S.Str("log") != "off") options.Add(F("summary.log", S.Str("log")));

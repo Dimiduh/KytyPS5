@@ -40,6 +40,10 @@
 #                                            ready (at most 2 s) instead of the game waiting for it: no stall, the
 #                                            object appears a moment late. off: the game waits (the emulator's
 #                                            default)
+#   .\run-windows.ps1 -OcclusionQueries off  the game's occlusion queries are answered "visible" instead of
+#                                            being counted on the GPU. on (this script's default): the game
+#                                            leaves out what it finds hidden: Saros drew 60% fewer objects and
+#                                            ran a quarter faster at one spot. off is the emulator's own default
 #   .\run-windows.ps1 -PipelineList <file>   also compile the shaders and pipelines of a shared pipeline list (what
 #                                            another data folder or player recorded, without shader code; the code
 #                                            comes from what this game has created or imported): with -Precompile
@@ -104,6 +108,7 @@ param(
 	[ValidateRange(0, 64)][int]$PrecompileThreads = 0,
 	[string]$ImportShaders = '',
 	[ValidateSet('', 'on', 'off')][string]$SkipPendingDraws = '',
+	[ValidateSet('', 'on', 'off')][string]$OcclusionQueries = '',
 	[string]$PipelineList = '',
 	[string]$ExportPipelineList = '',
 	[string]$ShaderPairs = '',
@@ -275,6 +280,11 @@ if ($Precompile) {
 if ($SkipPendingDraws) {
 	[void]$options.Remove('--skip-pending-draws')
 	if ($SkipPendingDraws -eq 'on') { $options.Add('--skip-pending-draws') }
+}
+# -OcclusionQueries on|off: --occlusion-queries; without it the config's, and on when the config has none.
+if ($OcclusionQueries -or $options.IndexOf('--occlusion-queries') -lt 0) {
+	[void]$options.Remove('--occlusion-queries')
+	if ($OcclusionQueries -ne 'off') { $options.Add('--occlusion-queries') }
 }
 # -PipelineList: a shared list of recorded programs and pipelines (--import-pipeline-list). It names shaders by
 # content and carries none: an entry is built once the emulator has its shaders' code, from what the game created in

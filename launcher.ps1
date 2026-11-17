@@ -28,7 +28,7 @@ $logNames = 'Off', 'File (in the logs folder)', 'Console (slow)'
 
 $settings = [ordered]@{ game = ''; data = ''; resolution = '1920x1080'; fullscreen = $false; stretch = $false; language = 1
 	gpu = -1; gpu_name = ''; present_mode = 'Mailbox'; hdr = $false; perf_overlay = $false; sound = $true
-	skip_notice_screen = $false; redzone = $false; precompile_pipelines = $true; pipeline_lists = $true; shader_pairs = $true; skip_pending_draws = $true; framegen = 1; render_scale = 100; streamline = ''; log = 'off'; extra_args = ''; environment = '' }
+	skip_notice_screen = $false; redzone = $false; precompile_pipelines = $true; pipeline_lists = $true; shader_pairs = $true; skip_pending_draws = $true; framegen = 1; render_scale = 100; occlusion_queries = $true; streamline = ''; log = 'off'; extra_args = ''; environment = '' }
 if (Test-Path -LiteralPath $settingsPath) {
 	# (A file that cannot be read leaves the defaults.)
 	try {
@@ -256,6 +256,8 @@ function Get-RunArguments {
 	# The size the game renders its 3D at, in percent of its own (Unreal Engine titles); 100 takes out what the
 	# launch config may set.
 	$arguments += @('-RenderScale', [int]$settings.render_scale)
+	# The game's occlusion queries: counted on the graphics card (on), or every object answered as visible (off).
+	$arguments += @('-OcclusionQueries', $(if ($settings.occlusion_queries) { 'on' } else { 'off' }))
 	if ($settings.fullscreen) { $arguments += '-Fullscreen' }
 	# (Without it the game's picture keeps its aspect ratio, between black bars in a window of another shape.)
 	if ($settings.stretch) { $arguments += '-Stretch' }
@@ -457,6 +459,11 @@ $tips.SetToolTip($renderScale, "The size the game renders its 3D at, in percent 
 	"The game's upscaler still makes the 4K picture: less work for the graphics card, a softer picture.`n" +
 	"At one spot of Saros (RTX 4090): 31 fps at 100%, 33 at 75%, 36 at 50%.")
 Add-Row '3D resolution' @($renderScale, (New-Note 'Unreal Engine games (Saros): lower is faster and softer'))
+$occlusion = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Occlusion queries: leave out what the game finds hidden'; AutoSize = $true; Checked = [bool]$settings.occlusion_queries }
+$tips.SetToolTip($occlusion, "The game asks the graphics card which objects are behind others and stops drawing those.`n" +
+	"On: the emulator answers that question. Saros drew 60% fewer objects and ran a quarter faster in a large hall.`n" +
+	"Off: every object counts as visible, as in earlier builds. Turn it off if objects appear late or are missing.")
+Add-Row '' @($occlusion)
 $overlay = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Performance panel (frame rate, frame times, CPU and GPU; F2 in the game switches it, Shift+F2 its details)'; AutoSize = $true; Checked = [bool]$settings.perf_overlay }
 Add-Row '' @($overlay)
 $sound = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Sound'; AutoSize = $true; Checked = [bool]$settings.sound }
@@ -577,6 +584,7 @@ function Read-Form {
 	# (An unavailable row keeps the saved choice for when the runtime is there.)
 	if ($frameGenAvailable) { $settings.framegen = [Math]::Max(0, $frameGen.SelectedIndex) + 1 }
 	$settings.render_scale         = $renderScales[[Math]::Max(0, $renderScale.SelectedIndex)]
+	$settings.occlusion_queries    = $occlusion.Checked
 	$settings.log                  = $logModes[[Math]::Max(0, $log.SelectedIndex)]
 	$settings.extra_args           = $extraArgs.Text.Trim()
 	$settings.environment          = $switches.Text.Trim()

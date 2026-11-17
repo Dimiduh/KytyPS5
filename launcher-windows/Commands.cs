@@ -134,6 +134,9 @@ sealed class Commands {
 		// A graphics pipeline nothing has built yet: built in the background with its draws left out meanwhile (on), or
 		// the game waits for it (off).
 		arguments.AddRange(new[] { "-SkipPendingDraws", S.Bool("skip_pending_draws") ? "on" : "off" });
+		// The game's occlusion queries: counted on the graphics card, so the game leaves out what it finds hidden (on),
+		// or every object answered as visible (off).
+		arguments.AddRange(new[] { "-OcclusionQueries", S.Bool("occlusion_queries") ? "on" : "off" });
 		// Frame generation: the generated frames per rendered one and where NVIDIA's runtime is; 0 turns off what the
 		// launch config may set.
 		if (FrameGen >= 2) arguments.AddRange(new[] { "-FrameGen", Number(FrameGen - 1), "-StreamlineDir", Quoted(context.Streamline) });
