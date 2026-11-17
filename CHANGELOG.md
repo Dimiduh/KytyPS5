@@ -166,6 +166,15 @@ unmodified `saros` branch gave 37 fps and the first batch of changes below 47.9.
 - **Readbacks over 64 KiB go through the download buffer**: 40.7 to 41.6 fps, worst frame 66 to
   34 ms.
 - In-place readbacks copy with streaming loads.
+- **A value only the shader takes is copied to it on the GPU instead of read back** (the DS
+  fork's direction for GPU-written draw arguments, here for the values a resource walk loads).
+  Saros chains small compute passes, each loading a few bytes the one before wrote, and the
+  thread that feeds the GPU stopped for every such load: 8 waits a frame at the heavy spot.
+  The walker now knows which loaded values nothing on the host depends on; for those a
+  compute dispatch copies the bytes into its own data on the GPU. Waits 6.9 to 5.0 a frame,
+  35.0 to 35.6 fps in four off/on rounds on a busy PC (`gpu_scalars`). The waits that remain
+  are values the host needs itself: two counts that go into a buffer's address, the thread
+  counts of two indirect dispatches, and a command list the game builds on the GPU.
 
 ### Textures
 
@@ -185,7 +194,7 @@ unmodified `saros` branch gave 37 fps and the first batch of changes below 47.9.
 
 Most of the changes above can be turned off while the game runs, through the live channel below:
 `vulkan_recording`, `bda_lazy`, `stream_share`, `heap_by_content`, `lookahead_replan`,
-`guest_image_writes`, `image_buffer_writes`, `guest_copy`, `readback_narrow`. Each also reads an
+`guest_image_writes`, `image_buffer_writes`, `guest_copy`, `readback_narrow`, `gpu_scalars`. Each also reads an
 environment variable `KYTY_<NAME>` at start.
 
 ## Tools for measuring
@@ -210,6 +219,11 @@ environment variable `KYTY_<NAME>` at start.
 
 - Table mode of the DS fork is not ported: as written it takes only draws without bound vertex
   buffers, which is 3% of Saros's draws. Its ideas that carry over are in the list above.
+- The thread that feeds the GPU still waits about 5 times a frame at a heavy spot for bytes the
+  GPU writes and the host needs itself, and time saved before those waits comes back as longer
+  waits. An upload worker for the per-draw uploads (the DS fork's scope) cut that thread's
+  copies and page protections by 5% of its time and changed no frame rate for that reason; it
+  is not in.
 - The DS fork's merged page protections are not ported: they join protections of adjacent
   pages that follow each other, of which Demon's Souls has about 110 a frame and Saros one.
 - Cards of 12 GB and less are not confirmed. With the rest of a 24 GB card taken away
