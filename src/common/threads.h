@@ -28,6 +28,9 @@ void LowerCurrentThreadPriority();
 // GPU commands: the guest's own threads otherwise hold its CPUs for whole time slices while they
 // load). Best effort.
 void RaiseCurrentThreadPriority();
+// The logical CPUs the process may use: those of its affinity mask where the platform has one,
+// all of the host's otherwise. At least 1.
+uint32_t AvailableProcessors();
 // The CPUs the calling thread may run on, from a list such as "2,3,8-15" (logical CPUs 0-63 of
 // its processor group); other threads are not kept off them. "auto" names the performance cores
 // without the core of CPU 0, which serves most interrupts. False when nothing was changed (an

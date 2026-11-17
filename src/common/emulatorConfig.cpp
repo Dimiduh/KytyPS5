@@ -245,6 +245,10 @@ uint32_t PrepareThreads() {
 	return g_config->prepare_threads;
 }
 
+uint32_t PrecompileThreads() {
+	return g_config->precompile_threads;
+}
+
 bool SerializeDispatchesEnabled() {
 	return g_config->serialize_dispatches;
 }

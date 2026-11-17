@@ -116,6 +116,8 @@ struct ConfigOptions {
 	std::vector<std::string> unreal_cvars; // "name=number" each (kernel/unrealCvars.h)
 	uint32_t               lookahead_threads               = 2;
 	uint32_t               prepare_threads                 = UINT32_MAX; // automatic
+	// --precompile-threads: build threads of the precompile-only pass.
+	uint32_t               precompile_threads              = UINT32_MAX; // automatic
 	bool                   tessellation_enabled        = false;
 	bool                   occlusion_queries_enabled   = false;
 	bool                   relaxed_shader_float        = false;
@@ -211,6 +213,7 @@ std::filesystem::path ShaderPairsPath();
 const std::vector<std::string>& UnrealCvars();
 uint32_t LookaheadThreads();
 uint32_t PrepareThreads();
+uint32_t PrecompileThreads();
 bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
 bool RelaxedShaderFloatEnabled();

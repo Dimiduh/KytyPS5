@@ -3585,9 +3585,9 @@ uint64_t PipelineCache::QueueShaderPairs(uint64_t& finished_before) {
 void PipelineCache::QueuePrecompile(uint32_t thread_count) {
 	EXIT_IF(thread_count == 0);
 	if (m_precompile_queue == nullptr) {
-		// Next to a running guest the builds yield to it.
-		m_precompile_queue =
-		    std::make_unique<ProgramPrecompileQueue>(thread_count, !m_precompile_only);
+		// Next to a running guest the builds yield to it; the pass by itself takes nearly every
+		// CPU, and yields to whatever else the PC is used for meanwhile.
+		m_precompile_queue = std::make_unique<ProgramPrecompileQueue>(thread_count, true);
 	}
 	auto&           progress = m_precompile_progress;
 	std::lock_guard lock(m_list_mutex);
@@ -3751,16 +3751,43 @@ PipelineCache::PrecompileResult PipelineCache::PrecompileAll(uint32_t thread_cou
 	}
 	auto next_report = std::chrono::steady_clock::now() + std::chrono::seconds {30};
 	bool interrupted = false;
+	// What was finished at the last reports, for the pace of the last two minutes.
+	struct Report {
+		std::chrono::steady_clock::time_point at;
+		uint64_t                              finished = 0;
+	};
+	std::vector<Report> reports {{std::chrono::steady_clock::now(), 0}};
+	// A long pass says that it need not be sat through.
+	if (m_precompile_progress.Get().queued >= 2000) {
+		PipelineCacheLog("Precompile: the pass can be stopped at any time by closing the emulator's "
+		                 "window: what it has built is kept (it is also saved every few minutes), "
+		                 "and the next pass goes on from there");
+	}
 	while (!m_precompile_progress.Complete()) {
 		if (pump && !pump()) {
 			interrupted = true;
 			break;
 		}
 		CheckPrecompileTimeouts();
-		if (std::chrono::steady_clock::now() >= next_report) {
+		if (const auto now = std::chrono::steady_clock::now(); now >= next_report) {
 			next_report += std::chrono::seconds {30};
 			const auto counts = m_precompile_progress.Get();
-			PipelineCacheLog("Precompile: {} builds left", counts.queued - counts.finished);
+			const auto left   = counts.queued - counts.finished;
+			reports.push_back({now, counts.finished});
+			if (reports.size() > 5) {
+				reports.erase(reports.begin());
+			}
+			// The kinds of builds differ in what they cost, so the estimate is of this pace only.
+			const auto   built   = counts.finished - reports.front().finished;
+			const double seconds = std::chrono::duration<double>(now - reports.front().at).count();
+			std::string  estimate;
+			if (built != 0 && seconds > 0.0) {
+				const double minutes = static_cast<double>(left) * seconds / static_cast<double>(built) / 60.0;
+				estimate = minutes < 1.5 ? std::string("; about a minute left at this pace")
+				                         : fmt::format("; about {:.0f} min left at this pace", minutes);
+			}
+			PipelineCacheLog("Precompile: {} builds left of {} ({}% done{})", left, counts.queued,
+			                 counts.queued != 0 ? counts.finished * 100 / counts.queued : 100, estimate);
 		}
 		std::this_thread::sleep_for(std::chrono::milliseconds {250});
 	}

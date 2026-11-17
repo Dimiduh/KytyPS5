@@ -24,7 +24,11 @@
 #                                            beside the game (on: compiled, the emulator's default; either is passed
 #                                            to the emulator as given)
 #   .\run-windows.ps1 -Precompile            compile every recorded shader and pipeline into the driver cache, then
-#                                            exit: its "Precompile done:" line and the time it took at the end
+#                                            exit: its "Precompile done:" line and the time it took at the end.
+#                                            The pass can be stopped by closing the emulator's window: what it
+#                                            built is kept, and the next pass goes on from there
+#   .\run-windows.ps1 -PrecompileThreads 6   with -Precompile: build 6 pipelines at a time (default: every logical
+#                                            CPU but two; fewer leaves more of the PC for other things)
 #   .\run-windows.ps1 -ImportShaders <file>  with -Precompile: also build the compute shaders of this file, which
 #                                            holds the shaders taken out of the game's own files, so that they are
 #                                            ready before the game first uses them. A folder stands for its
@@ -97,6 +101,7 @@ param(
 	[switch]$SkipNotice,
 	[ValidateSet('', 'on', 'off')][string]$PrecompilePipelines = '',
 	[switch]$Precompile,
+	[ValidateRange(0, 64)][int]$PrecompileThreads = 0,
 	[string]$ImportShaders = '',
 	[ValidateSet('', 'on', 'off')][string]$SkipPendingDraws = '',
 	[string]$PipelineList = '',
@@ -250,6 +255,9 @@ if ($PrecompilePipelines) {
 # into the driver cache; the emulator saves it and exits (0: done, 1: the cache could not be saved, 2: stopped). The
 # game does not start.
 if ($Precompile) { Add-Flag '--precompile-only' }
+# -PrecompileThreads: how many pipelines the pass builds at a time (--precompile-threads). Without it the emulator
+# takes every logical CPU it may use but two, fewer on a PC with little memory.
+if ($Precompile -and $PrecompileThreads -gt 0) { Set-Option '--precompile-threads' "$PrecompileThreads" }
 # -ImportShaders: the shaders of the game's own files (--import-shaders, taken by the precompile pass only): a file,
 # or a folder with <title id>.seeds (written there by the pass from the game's files when it is missing or the game
 # has changed). Without it the shader-seeds folder next to this script, when there is one.

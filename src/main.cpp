@@ -206,6 +206,11 @@ static void PrintUsage() {
 	    "                                       has created them). A folder: its <title id>.seeds,\n"
 	    "                                       if any.\n");
 	::printf(
+	    "  --precompile-threads <n>             With --precompile-only: how many pipelines are\n"
+	    "                                       built at a time (1 to 64). Default: one for each\n"
+	    "                                       logical CPU the process may use but two, fewer on\n"
+	    "                                       a PC with little memory.\n");
+	::printf(
 	    "  --shader-pairs <file>                A list of the vertex and pixel shaders of the\n"
 	    "                                       game's files that are drawn together, each with a\n"
 	    "                                       recorded pipeline of the same kind. With\n"
@@ -571,6 +576,12 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			if (!ParseUint32(value, options.config.prepare_threads) ||
 			    options.config.prepare_threads > 8u) {
 				::printf("invalid preparation thread count: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--precompile-threads") {
+			if (!ParseUint32(value, options.config.precompile_threads) ||
+			    options.config.precompile_threads == 0u || options.config.precompile_threads > 64u) {
+				::printf("invalid precompile thread count: %s\n", value.c_str());
 				return false;
 			}
 		} else if (arg == "--trophy-duration") {

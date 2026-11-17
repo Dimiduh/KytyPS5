@@ -139,6 +139,22 @@ void Thread::LowerCurrentThreadPriority() {
 #endif
 }
 
+uint32_t Thread::AvailableProcessors() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	DWORD_PTR process = 0;
+	DWORD_PTR system  = 0;
+	if (GetProcessAffinityMask(GetCurrentProcess(), &process, &system) != 0 && process != 0) {
+		uint32_t count = 0;
+		for (; process != 0; process &= process - 1) {
+			count++;
+		}
+		// (A mask covers one processor group; the host may have more CPUs than it names.)
+		return count;
+	}
+#endif
+	return std::max(std::thread::hardware_concurrency(), 1u);
+}
+
 void Thread::RaiseCurrentThreadPriority() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	(void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);

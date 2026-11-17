@@ -910,8 +910,18 @@ uint64_t WindowPendingBackgroundBuilds() {
 
 int WindowPrecompilePipelines() {
 	EXIT_IF(g_window == nullptr);
-	// About half the host threads: nothing else runs, and each driver compile is mostly serial.
-	const auto threads = std::clamp(std::thread::hardware_concurrency() / 2u, 1u, 8u);
+	// Nearly all of the pass is the driver's shader compiler, which works on the thread that
+	// asked for the pipeline: a build for every logical CPU the process may use but two, which
+	// stay free for the rest of the PC (--precompile-threads names another count). Measured on
+	// Saros with an i9-13900K (8 fast and 16 small cores): the same 3,000 builds take 208 s on
+	// 8 threads and 118 s on 30. Each build at a time costs about a quarter of a gigabyte of
+	// memory in the driver, next to the 2 to 3 GB the pass holds anyway.
+	const auto asked     = Config::PrecompileThreads();
+	const auto cpus      = Common::Thread::AvailableProcessors();
+	const auto memory    = static_cast<uint32_t>(std::max(SDL_GetSystemRAM(), 0)); // MiB; 0: unknown
+	const auto by_memory = memory == 0 ? 64u : memory > 5632u ? (memory - 4096u) / 384u : 4u;
+	const auto threads =
+	    asked != UINT32_MAX ? asked : std::clamp(std::min(cpus > 2u ? cpus - 2u : 1u, by_memory), 1u, 64u);
 	SDL_SetWindowTitle(g_window->window, "Kyty: precompiling pipelines");
 	// The window keeps answering messages, so that Windows does not end the process as hung.
 	const auto pump = [] {
