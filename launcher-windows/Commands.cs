@@ -129,6 +129,8 @@ sealed class Commands {
 		// The shared pipeline lists next to run-windows.ps1 (pipeline-lists\<title id>.pipelinelist) are its default;
 		// off: none.
 		if (!S.Bool("pipeline_lists")) arguments.AddRange(new[] { "-PipelineList", "none" });
+		// The shader pairs next to run-windows.ps1 are its default too; off: none (a much shorter first precompile).
+		if (!S.Bool("shader_pairs")) arguments.AddRange(new[] { "-ShaderPairs", "none" });
 		// A graphics pipeline nothing has built yet: built in the background with its draws left out meanwhile (on), or
 		// the game waits for it (off).
 		arguments.AddRange(new[] { "-SkipPendingDraws", S.Bool("skip_pending_draws") ? "on" : "off" });

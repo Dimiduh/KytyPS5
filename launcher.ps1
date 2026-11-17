@@ -28,7 +28,7 @@ $logNames = 'Off', 'File (in the logs folder)', 'Console (slow)'
 
 $settings = [ordered]@{ game = ''; data = ''; resolution = '1920x1080'; fullscreen = $false; stretch = $false; language = 1
 	gpu = -1; gpu_name = ''; present_mode = 'Mailbox'; hdr = $false; perf_overlay = $false; sound = $true
-	skip_notice_screen = $false; redzone = $false; precompile_pipelines = $true; pipeline_lists = $true; skip_pending_draws = $true; framegen = 1; render_scale = 100; streamline = ''; log = 'off'; extra_args = ''; environment = '' }
+	skip_notice_screen = $false; redzone = $false; precompile_pipelines = $true; pipeline_lists = $true; shader_pairs = $true; skip_pending_draws = $true; framegen = 1; render_scale = 100; streamline = ''; log = 'off'; extra_args = ''; environment = '' }
 if (Test-Path -LiteralPath $settingsPath) {
 	# (A file that cannot be read leaves the defaults.)
 	try {
@@ -242,6 +242,7 @@ function Get-RunArguments {
 	# The shared pipeline lists next to the launcher (pipeline-lists\<title id>.pipelinelist) are run-windows.ps1's
 	# default; off: none.
 	if (!$settings.pipeline_lists) { $arguments += @('-PipelineList', 'none') }
+	if (!$settings.shader_pairs) { $arguments += @('-ShaderPairs', 'none') }
 	# A graphics pipeline nothing has built yet: built in the background with its draws left out meanwhile (on), or
 	# the game waits for it (off).
 	$arguments += @('-SkipPendingDraws', $(if ($settings.skip_pending_draws) { 'on' } else { 'off' }))
@@ -481,6 +482,12 @@ $tips.SetToolTip($pipelineLists, "A pipeline list (pipeline-lists\<title id>.pip
 	"soon as the emulator has their code (from the game, as it creates its shaders). Off: only what this data folder`n" +
 	"recorded itself.")
 Add-Row '' @($pipelineLists)
+$shaderPairs = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Also build likely shader pairs (about half of the first precompile)'; AutoSize = $true; Checked = [bool]$settings.shader_pairs }
+$tips.SetToolTip($shaderPairs, "Graphics shaders of the game's files that are likely drawn together, built into pipelines by 'Precompile shaders',`n" +
+	"so that a part of the game nobody has shown yet finds many of its pipelines ready (for Saros a third to a half).`n" +
+	"Off: the first precompile is about half as long, and those pipelines are built in the background the first time`n" +
+	"they are drawn. A precompile can be closed at any time: what it built is kept.")
+Add-Row '' @($shaderPairs)
 $skipPending = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Never wait for a new graphics shader: draw without it until it is built'; AutoSize = $true; Checked = [bool]$settings.skip_pending_draws }
 $tips.SetToolTip($skipPending, "A graphics shader combination the game uses for the first time, and that no earlier session or list prepared,`n" +
 	"has to be compiled. On: that happens in the background and what it draws appears a moment late (at most 2 s),`n" +
@@ -565,6 +572,7 @@ function Read-Form {
 	$settings.redzone              = $redzone.Checked
 	$settings.precompile_pipelines = $precompilePipelines.Checked
 	$settings.pipeline_lists       = $pipelineLists.Checked
+	$settings.shader_pairs         = $shaderPairs.Checked
 	$settings.skip_pending_draws   = $skipPending.Checked
 	# (An unavailable row keeps the saved choice for when the runtime is there.)
 	if ($frameGenAvailable) { $settings.framegen = [Math]::Max(0, $frameGen.SelectedIndex) + 1 }

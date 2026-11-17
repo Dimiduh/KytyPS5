@@ -51,7 +51,7 @@ partial class MainWindow : Window {
 
 	TextBox gamePath, dataPath, resolutionText, extraArgs, environment;
 	ComboBox resolution, present, renderScale, frameGen, language, gpu, log, uiLanguage;
-	CheckBox fullscreen, stretch, hdr, overlay, sound, skipNotice, redzone, background, lists, noWait, ecores, reopenLauncher;
+	CheckBox fullscreen, stretch, hdr, overlay, sound, skipNotice, redzone, background, lists, pairs, noWait, ecores, reopenLauncher;
 	TextBlock resolutionNote, frameGenNote, streamlineText, bannerTitle, bannerLine, shaderLine, problemText;
 	Button precompilePageButton;
 	Image banner;
@@ -544,6 +544,7 @@ partial class MainWindow : Window {
 		ecores = Switch(S.Bool("ecores") && context.EfficiencyMask != 0, context.EfficiencyMask != 0);
 		background = Switch(S.Bool("precompile_pipelines"));
 		lists = Switch(S.Bool("pipeline_lists"));
+		pairs = Switch(S.Bool("shader_pairs"));
 		noWait = Switch(S.Bool("skip_pending_draws"));
 		return Page("shaders.title",
 			shaderLine,
@@ -553,6 +554,7 @@ partial class MainWindow : Window {
 			Section("shaders.playing"),
 			Row("background", background, Desc(T("background.desc"))),
 			Row("lists", lists, Desc(T("lists.desc"))),
+			Row("pairs", pairs, Desc(T("pairs.desc"))),
 			Row("nowait", noWait, Desc(T("nowait.desc"))));
 	}
 
@@ -639,6 +641,7 @@ partial class MainWindow : Window {
 		S.Set("redzone", redzone.IsChecked == true);
 		S.Set("precompile_pipelines", background.IsChecked == true);
 		S.Set("pipeline_lists", lists.IsChecked == true);
+		S.Set("shader_pairs", pairs.IsChecked == true);
 		S.Set("skip_pending_draws", noWait.IsChecked == true);
 		// (An unavailable row keeps the saved choice for when the runtime is there.)
 		if (context.FrameGenAvailable) S.Set("framegen", Math.Max(0, frameGen.SelectedIndex) + 1);
@@ -663,6 +666,7 @@ partial class MainWindow : Window {
 		var shaders = new List<string>();
 		if (S.Bool("precompile_pipelines")) shaders.Add(T("summary.background"));
 		if (S.Bool("pipeline_lists")) shaders.Add(T("summary.lists"));
+		if (S.Bool("shader_pairs")) shaders.Add(T("summary.pairs"));
 		if (S.Bool("skip_pending_draws")) shaders.Add(T("summary.noWait"));
 		if (S.Bool("ecores") && context.EfficiencyMask != 0) shaders.Add(T("summary.ecores"));
 		var options = new List<string>();
