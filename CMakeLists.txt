@@ -1371,6 +1371,13 @@ if(APPLE)
 endif()
 
 install(TARGETS kyty_emulator DESTINATION .)
+if(TARGET ooz_decode)
+	# The precompile pass starts it from next to the emulator (3rdparty/CMakeLists.txt).
+	add_dependencies(kyty_emulator ooz_decode)
+	install(TARGETS ooz_decode DESTINATION .)
+	install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/tools/ooz-decode/README.md"
+		"${CMAKE_CURRENT_SOURCE_DIR}/LICENSES/GPL-3.0-or-later.txt" DESTINATION "licenses/ooz")
+endif()
 if(KYTY_BUILD_LAUNCHER)
 	add_subdirectory("${KYTY_SOURCE_DIR}/launcher" "${CMAKE_CURRENT_BINARY_DIR}/launcher")
 

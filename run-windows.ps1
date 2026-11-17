@@ -28,8 +28,9 @@
 #   .\run-windows.ps1 -ImportShaders <file>  with -Precompile: also build the compute shaders of this file, which
 #                                            holds the shaders taken out of the game's own files, so that they are
 #                                            ready before the game first uses them. A folder stands for its
-#                                            <title id>.seeds. Default: the shader-seeds folder next to this script,
-#                                            if there is one; none: no file
+#                                            <title id>.seeds, which the pass writes itself from an Unreal Engine 5
+#                                            game's files when it is missing (shader-seeds\README.md). Default: the
+#                                            shader-seeds folder next to this script, if there is one; none: no file
 #   .\run-windows.ps1 -SkipPendingDraws on   a graphics pipeline the game needs and nothing has built yet is built
 #                                            in the background, and the draws that use it are left out until it is
 #                                            ready (at most 2 s) instead of the game waiting for it: no stall, the
@@ -250,7 +251,8 @@ if ($PrecompilePipelines) {
 # game does not start.
 if ($Precompile) { Add-Flag '--precompile-only' }
 # -ImportShaders: the shaders of the game's own files (--import-shaders, taken by the precompile pass only): a file,
-# or a folder with <title id>.seeds. Without it the shader-seeds folder next to this script, when there is one.
+# or a folder with <title id>.seeds (written there by the pass from the game's files when it is missing or the game
+# has changed). Without it the shader-seeds folder next to this script, when there is one.
 if ($Precompile) {
 	if ($ImportShaders -eq 'none') {
 		$at = $options.IndexOf('--import-shaders')

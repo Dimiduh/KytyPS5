@@ -17,3 +17,4 @@ _Trophies/
 logs/
 # The game's own shaders, for the precompile pass (shader-seeds/README.md): never part of the repository
 /shader-seeds/*.seeds
+/shader-seeds/*.seeds.*

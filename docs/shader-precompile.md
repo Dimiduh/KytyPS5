@@ -27,7 +27,9 @@ graphics stages and 85 graphics pipelines.
 2. **A pipeline list** (`pipeline-lists/<title>.pipelinelist`): somebody else's recordings,
    without any game code. See `pipeline-lists/README.md`.
 3. **Every compute shader of the game** (`shader-seeds/<title>.seeds`, see
-   `shader-seeds/README.md`): the precompile pass builds a module from each shader's code alone.
+   `shader-seeds/README.md`): the precompile pass reads the shaders out of the game's own files
+   (Unreal Engine 5 games; it writes the seeds file the first time, in a few seconds) and builds
+   a module from each shader's code alone.
    Such a module reads at run time what the code does not say (buffer formats and strides,
    texture channel orders, level counts), so one module serves whatever the game binds. The same
    modules are translated again in the background at every start (about 45 s on 8 threads,

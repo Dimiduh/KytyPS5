@@ -123,7 +123,7 @@ static class Strings {
 		{"data.desc", "Where the emulator keeps its data: the saves (_SaveData), the shader and pipeline caches (_PipelineCache), downloads, temporary data, trophies and the logs. Empty: the emulator's folder ({0}). Each folder has its own saves and shader caches: a precompile is for the folder it ran with."},
 
 		{"shaders.title", "Shaders"}, {"shaders.precompile", "Precompile"}, {"shaders.playing", "While playing"},
-		{"precompile.desc", "Builds every shader and pipeline that earlier sessions of the game recorded into the graphics driver's cache, with the current settings, then exits: the game finds them there instead of compiling them while playing. Worth running after a new emulator build or a graphics driver update. Its summary and the time it took show here when it ends."},
+		{"precompile.desc", "Builds every shader and pipeline that earlier sessions of the game recorded into the graphics driver's cache, with the current settings, then exits: the game finds them there instead of compiling them while playing. For an Unreal Engine 5 game it also reads the game's own shader files (a few seconds, the first time) and builds all of its compute shaders; that first pass takes long. Worth running after a new emulator build or a graphics driver update. Its summary and the time it took show here when it ends."},
 		{"ecores", "Precompile on the efficiency cores only (slower, the PC stays responsive)"},
 		{"ecores.none", "This processor has one kind of core."},
 		{"background", "Prepare shaders in the background"},
@@ -245,7 +245,7 @@ static class Strings {
 		{"data.desc", "模拟器保存数据的位置：存档（_SaveData）、着色器与管线缓存（_PipelineCache）、下载内容、临时数据、奖杯和日志。留空：模拟器所在的文件夹（{0}）。每个文件夹有各自的存档和着色器缓存：预编译只对运行它时所用的文件夹有效。"},
 
 		{"shaders.title", "着色器"}, {"shaders.precompile", "预编译"}, {"shaders.playing", "游戏运行时"},
-		{"precompile.desc", "按当前设置，把之前游玩时记录的所有着色器和管线编译进显卡驱动的缓存，然后退出：游戏运行时直接使用，不必边玩边编译。更新模拟器或显卡驱动后值得再运行一次。完成后这里会显示它的摘要和用时。"},
+		{"precompile.desc", "按当前设置，把之前游玩时记录的所有着色器和管线编译进显卡驱动的缓存，然后退出：游戏运行时直接使用，不必边玩边编译。对于虚幻引擎 5 游戏，还会读取游戏自身的着色器文件（首次需要几秒），并编译其全部计算着色器；首次运行耗时较长。更新模拟器或显卡驱动后值得再运行一次。完成后这里会显示它的摘要和用时。"},
 		{"ecores", "仅在能效核上预编译（较慢，但电脑仍保持流畅）"},
 		{"ecores.none", "此处理器只有一种核心。"},
 		{"background", "在后台准备着色器"},

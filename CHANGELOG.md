@@ -45,7 +45,11 @@ with them; other places and machines will differ.
 - **Precompile pass** (`run-windows.ps1 -Precompile`, or the launcher's button): builds everything
   known for the game into the driver's cache and exits.
 - **The whole game's compute shaders**, taken from the game's own files (`--import-shaders`,
-  `shader-seeds/`), not only the ones an earlier session met.
+  `shader-seeds/`), not only the ones an earlier session met. The precompile pass reads them out
+  of an Unreal Engine 5 game by itself the first time it runs (a few seconds for Saros: 37,545
+  shaders from six shader libraries), and again after a game update. The test build of
+  2026-11-16 could not do this yet: without a seeds file made by hand, its pass built only what
+  sessions had recorded and the Saros lists.
 - **Pipeline lists** (`pipeline-lists/`): recordings shared without any game code; a list for Saros
   is included.
 - **Shader pairs** (`shader-pairs/`): vertex and pixel shaders likely to be drawn together are
@@ -141,4 +145,8 @@ environment variable `KYTY_<NAME>` at start.
   built at first use in each part of the game and cached from then on.
 - CPU writes into memory that a rendered image also uses still cause whole-image uploads (about
   75 MiB a frame at 100% on Saros).
-- Frame generation, the launcher app and the run scripts are Windows only.
+- Frame generation, the launcher app and the run scripts are Windows only, and so is reading the
+  shaders out of a game's files: `ooz_decode`, the program that unpacks Unreal's shader
+  libraries for it, is built for Windows only. It is a separate program under GPL-3.0-or-later
+  (the ooz decompressor by Powzix), started by the precompile pass and never linked with the
+  emulator (`tools/ooz-decode/README.md`).

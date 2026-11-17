@@ -26,6 +26,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
+#include "graphics/shader/gameShaderSeeds.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "libs/agc.h"
@@ -3968,6 +3969,217 @@ void TestShaderSeedImport() {
         "with the input of its header");
   Check(!ShaderImportSeeds(path).read,
         "a missing seed file must not count as read");
+}
+
+// Shader seeds from a game's files: the shader libraries of an IoStore
+// container are found under the game's folder and read through the table of
+// contents, each distinct shader binary is written once in the order of its
+// group's offsets, the file is kept while the containers do not change and
+// written again when they do, a file without a source note is never replaced,
+// and a packed group without the decoder writes nothing.
+void TestGameShaderSeeds() {
+  using Bytes = std::vector<uint8_t>;
+  using State = GameShaderSeeds::State;
+  const auto root =
+      std::filesystem::temp_directory_path() / "kyty_game_shader_seeds_test";
+  std::error_code ignored;
+  std::filesystem::remove_all(root, ignored);
+  const auto put = [](Bytes &out, uint64_t value, int bytes, bool big = false) {
+    for (int i = 0; i < bytes; i++) {
+      out.push_back(
+          static_cast<uint8_t>(value >> (8 * (big ? bytes - 1 - i : i))));
+    }
+  };
+  const auto append = [](Bytes &out, const Bytes &more) {
+    out.insert(out.end(), more.begin(), more.end());
+  };
+  // An AGC shader binary: the signature, the sizes at 0x40, two dwords of
+  // code.
+  const auto shader = [](uint8_t fill) {
+    Bytes binary(0x60 + 8, fill);
+    const uint8_t signature[8] = {'1', '2', '3', '4', 0x18, 0, 0, 0};
+    std::copy(std::begin(signature), std::end(signature), binary.begin());
+    const uint32_t sizes[2] = {0x60, 8};
+    std::memcpy(&binary[0x40], sizes, sizeof(sizes));
+    return binary;
+  };
+  const Bytes a = shader(0xa1);
+  const Bytes b = shader(0xb2);
+  // Group 0: four bytes of wrapping, A, then B. Group 1: A again, then bytes
+  // that hold no shader.
+  Bytes group0(4, 0x77);
+  append(group0, a);
+  const auto b_at = static_cast<uint32_t>(group0.size());
+  append(group0, b);
+  Bytes group1 = a;
+  const auto none_at = static_cast<uint32_t>(group1.size());
+  group1.insert(group1.end(), 40, 0x55);
+  const auto id = [](uint8_t first, uint8_t type) {
+    Bytes bytes(12, 0);
+    bytes[0] = first;
+    bytes[11] = type;
+    return bytes;
+  };
+  // packed1: the size the library gives group 1 in its container.
+  const auto build = [&](const std::filesystem::path &game, uint32_t packed1) {
+    const auto paks = game / "Content" / "Paks";
+    std::filesystem::create_directories(paks);
+    Bytes library;
+    put(library, 1, 4);
+    put(library, 1, 4);
+    library.insert(library.end(), 20, 0);
+    put(library, 4, 4);
+    library.insert(library.end(), 80, 0);
+    put(library, 2, 4);
+    append(library, id(1, 9));
+    append(library, id(2, 9));
+    put(library, 1, 4);
+    put(library, 0, 4);
+    put(library, 4, 4);
+    // Frequency : 4, group : 30, offset in the group : 30. The shader with the
+    // higher index lies first in group 0.
+    const auto entry = [](uint64_t group, uint64_t offset) {
+      return 3u | (group << 4u) | (offset << 34u);
+    };
+    put(library, 4, 4);
+    put(library, entry(0, b_at), 8);
+    put(library, entry(0, 0), 8);
+    put(library, entry(1, 0), 8);
+    put(library, entry(1, none_at), 8);
+    put(library, 2, 4);
+    for (const auto &[first, raw, packed] :
+         {std::tuple<uint32_t, size_t, size_t>{0, group0.size(), group0.size()},
+          std::tuple<uint32_t, size_t, size_t>{2, group1.size(), packed1}}) {
+      put(library, first, 4);
+      put(library, 2, 4);
+      put(library, raw, 4);
+      put(library, packed, 4);
+    }
+    put(library, 4, 4);
+    for (uint32_t i = 0; i < 4; i++) {
+      put(library, i, 4);
+    }
+    // The data file: the library, then the two groups, in blocks of 256
+    // bytes.
+    Bytes cas = library;
+    append(cas, group0);
+    cas.insert(cas.end(), group1.begin(), group1.begin() + packed1);
+    constexpr uint32_t BlockSize = 256;
+    const auto blocks =
+        static_cast<uint32_t>((cas.size() + BlockSize - 1) / BlockSize);
+    Bytes toc;
+    for (const char c : std::string_view("-==--==--==--==-")) {
+      toc.push_back(static_cast<uint8_t>(c));
+    }
+    put(toc, 5, 4);         // version, reserved
+    put(toc, 144, 4);       // header size
+    put(toc, 4, 4);         // chunks
+    put(toc, blocks, 4);    // blocks
+    put(toc, 12, 4);        // block entry size
+    put(toc, 0, 4);         // compression methods
+    put(toc, 32, 4);        // method name length
+    put(toc, BlockSize, 4); // block size
+    put(toc, 0, 4);         // directory index size
+    put(toc, 1, 4);         // partitions
+    toc.resize(144, 0);
+    append(toc, id(9, 2)); // bulk data: not a shader chunk
+    append(toc, id(8, 8));
+    append(toc, id(1, 9));
+    append(toc, id(2, 9));
+    const auto range = [&](uint64_t offset, uint64_t length) {
+      put(toc, offset, 5, true);
+      put(toc, length, 5, true);
+    };
+    range(0, 16);
+    range(0, library.size());
+    range(library.size(), group0.size());
+    range(library.size() + group0.size(), packed1);
+    for (uint32_t i = 0; i < blocks; i++) {
+      const auto size =
+          std::min<uint64_t>(BlockSize, cas.size() - uint64_t{i} * BlockSize);
+      put(toc, uint64_t{i} * BlockSize, 5);
+      put(toc, size, 3);
+      put(toc, size, 3);
+      put(toc, 0, 1);
+    }
+    const auto write = [](const std::filesystem::path &path,
+                          const Bytes &bytes) {
+      std::ofstream file(path, std::ios::binary | std::ios::trunc);
+      file.write(reinterpret_cast<const char *>(bytes.data()),
+                 static_cast<std::streamsize>(bytes.size()));
+    };
+    write(paks / "pakchunk0-test.utoc", toc);
+    write(paks / "pakchunk0-test.ucas", cas);
+    return paks / "pakchunk0-test.ucas";
+  };
+  const auto read = [](const std::filesystem::path &path) {
+    std::ifstream file(path, std::ios::binary);
+    return Bytes{std::istreambuf_iterator<char>(file),
+                 std::istreambuf_iterator<char>()};
+  };
+  Bytes expected;
+  for (const char c : std::string_view("KytyShaderSeeds1")) {
+    expected.push_back(static_cast<uint8_t>(c));
+  }
+  put(expected, 2, 4);
+  for (const Bytes *binary : {&a, &b}) {
+    put(expected, 0x60, 4);
+    put(expected, 8, 4);
+    append(expected, *binary);
+  }
+
+  const auto game = root / "game";
+  const auto cas =
+      build(game, static_cast<uint32_t>(group1.size()));
+  const auto seeds = root / "seeds" / "TEST00000.seeds";
+  const auto note = root / "seeds" / "TEST00000.seeds.source";
+  auto made = ShaderWriteGameSeeds(game, seeds, {});
+  Check(made.state == State::Written && made.libraries == 1 &&
+            made.shaders == 2 && made.no_shader == 1 &&
+            made.bytes == expected.size() && read(seeds) == expected,
+        "the shaders of a game's shader library were not written as seeds");
+  Check(std::filesystem::exists(note) &&
+            ShaderWriteGameSeeds(game, seeds, {}).state == State::Kept,
+        "a seed file made from unchanged containers must be kept");
+  {
+    std::ofstream file(cas, std::ios::binary | std::ios::app);
+    file.put('\0');
+  }
+  std::filesystem::remove(seeds, ignored);
+  {
+    std::ofstream file(seeds, std::ios::binary | std::ios::trunc);
+    file << "old";
+  }
+  made = ShaderWriteGameSeeds(game, seeds, {});
+  Check(made.state == State::Written && read(seeds) == expected,
+        "a seed file must be written again when a container has changed");
+  std::filesystem::remove(note, ignored);
+  {
+    std::ofstream file(seeds, std::ios::binary | std::ios::trunc);
+    file << "someone else's";
+  }
+  Check(ShaderWriteGameSeeds(game, seeds, {}).state == State::Kept &&
+            read(seeds).size() == 14,
+        "a seed file without a source note must not be replaced");
+
+  // A packed group and no decoder.
+  const auto packed_game = root / "packed";
+  build(packed_game, static_cast<uint32_t>(group1.size() - 1));
+  const auto packed_seeds = root / "packed-seeds" / "TEST00000.seeds";
+  made = ShaderWriteGameSeeds(packed_game, packed_seeds, {});
+  size_t left = 0;
+  for (const auto &entry : std::filesystem::directory_iterator(
+           root / "packed-seeds", ignored)) {
+    (void)entry;
+    left++;
+  }
+  Check(made.state == State::Failed && !made.reason.empty() && left == 0,
+        "a packed shader group without the decoder must write nothing");
+
+  std::filesystem::create_directories(root / "empty" / "sce_sys");
+  Check(ShaderWriteGameSeeds(root / "empty", seeds, {}).state == State::None,
+        "a game without containers has no shader library");
+  std::filesystem::remove_all(root, ignored);
 }
 
 void SetImageTestType(std::array<uint32_t, 64> *data, uint32_t srsrc,
@@ -15223,6 +15435,7 @@ int main() {
   TestRecoverableFatalScope();
   TestCreatedComputeShaderInput();
   TestShaderSeedImport();
+  TestGameShaderSeeds();
   TestCodeOnlySpecializationMatchesPlainDescriptors();
   TestPortableBufferFormats();
   TestPortableImageSwizzle();

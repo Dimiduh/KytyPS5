@@ -523,7 +523,8 @@ $precompile = New-Object System.Windows.Forms.Button -Property @{ Text = 'Precom
 $tips.SetToolTip($precompile, "Builds every shader and pipeline that earlier sessions of the game recorded into the graphics driver's cache,`n" +
 	"with the settings above, then exits: the game finds them there instead of compiling them while playing.`n" +
 	"Worth running after a new emulator build or a graphics driver update. Its summary and the time it took show`n" +
-	"here when it ends.")
+	"here when it ends. For an Unreal Engine 5 game it also reads the game's own shader files (a few seconds,`n" +
+	"the first time) and builds all of its compute shaders; that first pass takes long.")
 $logs = New-Object System.Windows.Forms.Button -Property @{ Text = 'Logs folder'; AutoSize = $true }
 $readme = New-Object System.Windows.Forms.Button -Property @{ Text = 'README'; AutoSize = $true }
 $buttons.Controls.AddRange(@($play, $precompile, $logs, $readme))

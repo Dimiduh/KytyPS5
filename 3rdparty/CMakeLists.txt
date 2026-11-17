@@ -135,6 +135,37 @@ else()
 	target_compile_options(zarchive PRIVATE -w)
 endif()
 
+# ooz_decode (tools/ooz-decode): a program of its own that unpacks Oodle streams with the ooz
+# decompressor. The precompile pass starts it to read the shader libraries of an Unreal Engine
+# game (src/graphics/shader/gameShaderSeeds.h). ooz is GPL-3.0-or-later and the emulator is
+# GPL-2.0, so the two are never linked: they exchange files. The ooz sources are built as they
+# are published, and they are written for the Microsoft compiler's dialect.
+option(KYTY_OOZ_DECODE "Build ooz_decode, which unpacks a game's shader libraries for the precompile pass" ON)
+if(KYTY_OOZ_DECODE AND WIN32 AND MSVC)
+	FetchContent_Declare(ooz
+		GIT_REPOSITORY https://github.com/powzix/ooz.git
+		GIT_TAG 05038060aa68f9187ae9923b2388ca8db40e58d1
+		GIT_SHALLOW FALSE)
+	FetchContent_MakeAvailable(ooz)
+	set(kyty_ooz_sources
+		"${ooz_SOURCE_DIR}/kraken.cpp"
+		"${ooz_SOURCE_DIR}/lzna.cpp"
+		"${ooz_SOURCE_DIR}/bitknit.cpp")
+	add_executable(ooz_decode
+		"${CMAKE_CURRENT_SOURCE_DIR}/../tools/ooz-decode/main.cpp"
+		${kyty_ooz_sources})
+	set_source_files_properties(${kyty_ooz_sources} PROPERTIES COMPILE_OPTIONS "/W0")
+	# kraken.cpp also holds ooz's command line tool: its main gets another name, and the header
+	# its file checks need is included for it.
+	set_source_files_properties("${ooz_SOURCE_DIR}/kraken.cpp" PROPERTIES
+		COMPILE_OPTIONS "/W0;/Dmain=ooz_cli_main;/FIsys/stat.h")
+	target_compile_definitions(ooz_decode PRIVATE _CRT_SECURE_NO_WARNINGS)
+	# Next to the emulator, which looks for it there.
+	set_target_properties(ooz_decode PROPERTIES
+		RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+		INTERPROCEDURAL_OPTIMIZATION OFF)
+endif()
+
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 if(APPLE)
 	# SDL's built-in iconv fallback does not support CP932.

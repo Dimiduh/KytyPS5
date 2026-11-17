@@ -14,6 +14,7 @@
 #include "common/threads.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window.h"
+#include "graphics/shader/gameShaderSeeds.h"
 #include "graphics/shader/shader.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
@@ -29,6 +30,7 @@
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fmt/format.h>
@@ -190,7 +192,29 @@ static std::string TitleId() {
 	return title_id;
 }
 
-static void Execute(const std::filesystem::path& game_patch) {
+// The shaders of the game's own files, read into the seed file the precompile imports: the first
+// time, and again when the game's files have changed since (graphics/shader/gameShaderSeeds.h).
+static void WriteGameSeeds(const std::filesystem::path& game, const std::filesystem::path& seeds) {
+	using State      = Libs::Graphics::GameShaderSeeds::State;
+	const auto start = std::chrono::steady_clock::now();
+	const auto made  =
+	    Libs::Graphics::ShaderWriteGameSeeds(game, seeds, Libs::Graphics::ShaderSeedDecoderPath());
+	const std::chrono::duration<double> seconds = std::chrono::steady_clock::now() - start;
+	if (made.state == State::Written) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Shader seeds: {} shaders from {} shader libraries of the game's files ({:.1f} MiB) "
+		    "written to {} in {:.1f} s{}\n",
+		    made.shaders, made.libraries, static_cast<double>(made.bytes) / (1024.0 * 1024.0),
+		    Common::PathToString(seeds), seconds.count(),
+		    made.no_shader != 0 ? fmt::format("; {} library entries hold no shader binary", made.no_shader)
+		                        : std::string {}));
+	} else if (made.state == State::Failed) {
+		Log::WriteToConsoleAndLog(
+		    fmt::format("Shader seeds: the game's shaders were not read from its files: {}\n", made.reason));
+	}
+}
+
+static void Execute(const std::filesystem::path& game, const std::filesystem::path& game_patch) {
 	if (const auto list = Config::ExportPipelineListPath(); !list.empty()) {
 		// The renderer is up; the guest never starts.
 		Common::QuickExit(Libs::Graphics::WindowExportPipelineList(list) ? 0 : 1);
@@ -204,6 +228,9 @@ static void Execute(const std::filesystem::path& game_patch) {
 		if (std::filesystem::is_directory(seeds, seeds_error)) {
 			const auto title_id = TitleId();
 			seeds /= title_id + ".seeds";
+			if (!title_id.empty()) {
+				WriteGameSeeds(game, seeds);
+			}
 			if (title_id.empty() || !std::filesystem::exists(seeds, seeds_error)) {
 				seeds.clear();
 			}
@@ -274,7 +301,7 @@ void Run(const RunOptions& options) {
 
 	LoadElf(options.elf);
 
-	Execute(options.game_patch);
+	Execute(options.app0_dir, options.game_patch);
 }
 
 } // namespace Emulator
