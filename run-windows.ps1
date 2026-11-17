@@ -408,11 +408,18 @@ function Get-PrecompileStamp {
 	}
 	& $about 'emulator' $Exe
 	& $about 'game' $Game
-	foreach ($name in '--import-pipeline-list', '--shader-pairs', '--import-shaders', '--gpu') {
+	foreach ($name in '--import-pipeline-list', '--shader-pairs', '--gpu') {
 		$at = $options.IndexOf($name)
 		if ($at -lt 0) { continue }
 		if ($name -eq '--gpu') { $lines.Add("gpu $($options[$at + 1])") } else { & $about $name.TrimStart('-') $options[$at + 1] }
 	}
+	# (The shaders of the game's files: an option of the pass only, so a start of the game works out the same path.)
+	$at = $options.IndexOf('--import-shaders')
+	$seeds = if ($at -ge 0) { $options[$at + 1] }
+		elseif ($ImportShaders -and $ImportShaders -ne 'none') { $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ImportShaders) }
+		elseif (!$ImportShaders -and (Test-Path -LiteralPath "$PSScriptRoot\shader-seeds" -PathType Container)) { "$PSScriptRoot\shader-seeds" }
+		else { '' }
+	& $about 'import-shaders' $seeds
 	# (A new graphics driver starts its pipeline cache over.)
 	try {
 		foreach ($card in @(Get-CimInstance Win32_VideoController -ErrorAction Stop | Sort-Object Name)) { $lines.Add("driver $($card.Name) $($card.DriverVersion)") }
