@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <chrono>
 #include <fstream>
 #include <functional>
@@ -191,7 +192,8 @@ Snapshot Take() {
 	return snapshot;
 }
 
-void Measure(uint64_t id, double seconds, const std::string& label) {
+// One window of measurement as a line: "<head> seconds=... flips=... fps=... | ..." (Measure).
+std::string MeasureLine(const std::string& head, double seconds) {
 	// The counters are collected only while something reads them (the overlay, or this).
 	const bool counters_were_on = DebugCounters::Enabled();
 	DebugCounters::SetEnabled(true);
@@ -250,10 +252,11 @@ void Measure(uint64_t id, double seconds, const std::string& label) {
 	        ? static_cast<double>(end.gpu.busy_ns - begin.gpu.busy_ns) / 1e9 / gpu_window_s
 	        : -1.0;
 
-	std::string line = Format("LIVE measure id=%" PRIu64 " label=%s seconds=%.2f flips=%" PRIu64
-	                          " fps=%.2f low1=%.2f frame_ms p50=%.2f p95=%.2f p99=%.2f max=%.2f",
-	                          id, label.c_str(), elapsed, flips, fps, low, quantile(0.50),
-	                          quantile(0.95), quantile(0.99), frame_ms.empty() ? 0.0 : frame_ms.back());
+	std::string line =
+	    head + Format(" seconds=%.2f flips=%" PRIu64
+	                  " fps=%.2f low1=%.2f frame_ms p50=%.2f p95=%.2f p99=%.2f max=%.2f",
+	                  elapsed, flips, fps, low, quantile(0.50), quantile(0.95), quantile(0.99),
+	                  frame_ms.empty() ? 0.0 : frame_ms.back());
 	// The GPU thread per frame: wall time inside commands and submissions (waits included), its
 	// waits on the GPU, and its time without guest work (starved) or with every stream suspended.
 	line += Format(" | gpu_thread_ms busy=%.2f gpu_waits=%.2f starved=%.2f blocked=%.2f",
@@ -304,7 +307,34 @@ void Measure(uint64_t id, double seconds, const std::string& label) {
 		const double base  = earlier != begin.thread_cpu.end() ? earlier->second : 0.0;
 		line += Format(" %s=%.2f", name.c_str(), 1000.0 * (cpu - base) / frames);
 	}
-	Answer(line);
+	return line;
+}
+
+void Measure(uint64_t id, double seconds, const std::string& label) {
+	Answer(MeasureLine(Format("LIVE measure id=%" PRIu64 " label=%s", id, label.c_str()), seconds));
+}
+
+// KYTY_PERF_LOG=<seconds>: a measurement of every such window goes to the log while the game
+// runs, so that a session played anywhere in the game says afterwards where it was slow and
+// what the frame was made of there (the numbers of `measure`). Windows without a flip
+// (loading, a menu that does not render) are left out.
+void PerfLog(double seconds) {
+	for (;;) {
+		// The time of day the window ends at: what a player remembers a place by.
+		auto line = MeasureLine("Perf", seconds);
+		const auto now = std::time(nullptr);
+		std::tm    local {};
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		localtime_s(&local, &now);
+#else
+		localtime_r(&now, &local);
+#endif
+		line.insert(4, Format(" %02d:%02d:%02d", local.tm_hour, local.tm_min, local.tm_sec));
+		if (line.find(" flips=0 ") != std::string::npos) {
+			continue;
+		}
+		Log::WriteToConsoleAndLog(line + "\n");
+	}
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -902,6 +932,14 @@ void RegisterThread(const char* name) noexcept {
 }
 
 void Start() {
+	if (const char* text = std::getenv("KYTY_PERF_LOG"); text != nullptr) {
+		if (const double seconds = std::strtod(text, nullptr); seconds >= 1.0) {
+			Detail::g_active.store(true, std::memory_order_relaxed);
+			// (On for the whole session: a window's end leaves them as it found them.)
+			DebugCounters::SetEnabled(true);
+			std::thread(PerfLog, std::min(seconds, 600.0)).detach();
+		}
+	}
 	const char* path = std::getenv("KYTY_LIVE_FILE");
 	if (path == nullptr || *path == '\0') {
 		return;
