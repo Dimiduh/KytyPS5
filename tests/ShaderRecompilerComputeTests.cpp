@@ -16309,7 +16309,8 @@ public:
     constexpr uint64_t slice_size = 0x10000;
     constexpr uint64_t color_size = 0x200000;
     constexpr uint64_t metadata_size = 0x20000;
-    constexpr uint64_t allocation_size = 56 * slice_size;
+    constexpr uint64_t expanded_size = 56 * slice_size;
+    constexpr uint64_t allocation_size = 64 * slice_size;
     constexpr uint64_t allocation_alignment = 0x10000;
     EnsureRuntimeContext();
 
@@ -16584,7 +16585,7 @@ public:
           {vk::ImageAspectFlagBits::eColor, 0, 1, 31, 1}, painted);
       auto expanded = storage_desc;
       expanded.info.extent.depth = 56;
-      expanded.info.data.size = allocation_size;
+      expanded.info.data.size = expanded_size;
       expanded.info.UpdateSize();
       const auto expanded_id = texture_cache.FindImage(expanded);
       Require(name, "3D storage depth expansion",
@@ -16599,6 +16600,29 @@ public:
                   ReadCachedTexel(name, context, expanded_id, {0, 0, 55}) ==
                       std::vector<u32>{0x5a5a5a5a},
               "volume expansion lost GPU writes or copied beyond the old depth");
+
+      // Saros: the title's pool places a deeper volume of another width where a smaller one
+      // was, with the same pitch and rows. The larger image takes over what the smaller holds.
+      auto wider = expanded;
+      wider.info.extent.width = 24;
+      wider.info.extent.depth = 64;
+      wider.info.data.size = 0;
+      wider.info.UpdateSize();
+      const auto wider_id = texture_cache.FindImage(wider);
+      Require(name, "3D volume of another width and more depth",
+              wider.info.pitch == expanded.info.pitch &&
+                  wider.info.data.size == allocation_size && wider_id != expanded_id &&
+                  !TextureCacheTestAccess::Contains(texture_cache, expanded_id) &&
+                  texture_cache.GetImage(wider_id).backing.extent.width == 24 &&
+                  texture_cache.GetImage(wider_id).backing.extent.depth == 64 &&
+                  texture_cache.GetImage(wider_id).IsGpuModified(),
+              "a deeper volume of another width did not replace the smaller one");
+      Require(name, "3D volume of another width keeps the contents",
+              ReadCachedTexel(name, context, wider_id, {0, 0, 31}) ==
+                  std::vector<u32>{0x3fffffffu} &&
+                  ReadCachedTexel(name, context, wider_id, {0, 0, 63}) ==
+                      std::vector<u32>{0x5a5a5a5a},
+              "the larger volume lost GPU writes or copied beyond the old depth");
 
       RenderExecutorTestAccess::ResetBindings(executor);
       resources.UnmapMemory(base, allocation_size);

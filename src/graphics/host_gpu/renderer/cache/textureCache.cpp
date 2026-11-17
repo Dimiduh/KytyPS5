@@ -969,15 +969,26 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			            ? result_id
 			            : ImageId {}};
 		}
+		// A deeper volume of another width in the same pitch (Saros: a render-target volume of 12
+		// slices, then one of 16 at the same address, where the title's pool placed a new
+		// texture): as the deeper volume of the same width above, the larger image takes over
+		// what the smaller one holds (CopyImage copies the extent both have).
+		if (requested.IsVolume() && requested.resources == cached.info.resources &&
+		    requested.extent.depth > cached.info.extent.depth) {
+			return {ExpandImage(requested, cached_id)};
+		}
 		EXIT("TextureCache: unresolvable equal-address image overlap, address=0x%016" PRIx64
 		     " requested=%ux%u "
 		     "cached=%ux%u requested_size=0x%016" PRIx64 " cached_size=0x%016" PRIx64
-		     " type=%u/%u tile=%u/%u\n",
+		     " type=%u/%u tile=%u/%u extent=%ux%ux%u/%ux%ux%u pitch=%u/%u\n",
 		     requested.data.address, requested.resources.levels, requested.resources.layers,
 		     cached.info.resources.levels, cached.info.resources.layers, requested.data.size,
 		     cached.info.data.size, static_cast<uint32_t>(requested.type),
 		     static_cast<uint32_t>(cached.info.type), static_cast<uint32_t>(requested.tile_mode),
-		     static_cast<uint32_t>(cached.info.tile_mode));
+		     static_cast<uint32_t>(cached.info.tile_mode), requested.extent.width,
+		     requested.extent.height, requested.extent.depth, cached.info.extent.width,
+		     cached.info.extent.height, cached.info.extent.depth, requested.pitch,
+		     cached.info.pitch);
 	}
 
 	const int32_t requested_mip = requested.MipOf(cached.info);
