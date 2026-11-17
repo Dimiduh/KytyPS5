@@ -314,6 +314,21 @@ void Measure(uint64_t id, double seconds, const std::string& label) {
 	Answer(MeasureLine(Format("LIVE measure id=%" PRIu64 " label=%s", id, label.c_str()), seconds));
 }
 
+// A window's frame rate alone. The counters stay as they are (off unless the performance panel
+// is shown), where `measure` switches them on for its window: this is the rate of a session
+// played without the panel.
+void Fps(uint64_t id, double seconds, const std::string& label) {
+	const auto begin_flips = Detail::g_flips.load(std::memory_order_acquire);
+	const auto begin_ns    = NowNs();
+	std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
+	const auto   flips   = Detail::g_flips.load(std::memory_order_acquire) - begin_flips;
+	const double elapsed = static_cast<double>(NowNs() - begin_ns) / 1e9;
+	Answer(Format("LIVE fps id=%" PRIu64 " label=%s seconds=%.2f flips=%" PRIu64
+	              " fps=%.2f counters=%s",
+	              id, label.c_str(), elapsed, flips, static_cast<double>(flips) / elapsed,
+	              DebugCounters::Enabled() ? "on" : "off"));
+}
+
 // KYTY_PERF_LOG=<seconds>: a measurement of every such window goes to the log while the game
 // runs, so that a session played anywhere in the game says afterwards where it was slow and
 // what the frame was made of there (the numbers of `measure`). Windows without a flip
@@ -781,6 +796,8 @@ void Execute(uint64_t id, const std::string& line) {
 	};
 	if (command == "measure" && words.size() >= 2) {
 		Measure(id, std::clamp(number(1, 10.0), 0.1, 3600.0), words.size() > 2 ? words[2] : "-");
+	} else if (command == "fps" && words.size() >= 2) {
+		Fps(id, std::clamp(number(1, 10.0), 0.1, 3600.0), words.size() > 2 ? words[2] : "-");
 	} else if (command == "prof" && words.size() >= 2) {
 		Profile(id, std::clamp(number(1, 10.0), 0.1, 600.0), words.size() > 2 ? words[2] : "gpu",
 		        static_cast<size_t>(std::clamp(number(3, 40.0), 1.0, 500.0)),

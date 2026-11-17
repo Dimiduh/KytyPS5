@@ -11,6 +11,7 @@
 // to a command file, a side thread reads the file every 100 ms and runs its commands once per new
 // "id <n>" first line, one command per following line, in order:
 //   measure <seconds> [label]      frames, frame times and per-frame work of the render threads
+//   fps <seconds> [label]          the frame rate alone, without switching the counters on
 //   prof <seconds> [thread] [top]  wall-time samples of a registered thread (default gpu), by function
 //   prof <seconds> <thread> <top> <text>   the callers of the functions whose name contains <text>
 //   set <switch> <value>           a live switch (Switch below); `switches` lists them
