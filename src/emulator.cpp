@@ -60,6 +60,10 @@ static void PrintSystemInfo() {
 	     "  threads: %u\n\n",
 	     KYTY_BUILD_LABEL, platform_name, info.ProcessorName.c_str(),
 	     std::thread::hardware_concurrency());
+	// In every log, whatever its level: what a report of a crash or of a slow pass is read with.
+	Log::WriteToConsoleAndLog(fmt::format("Host: {}, {} threads; {}\n", info.ProcessorName,
+	                                      std::thread::hardware_concurrency(),
+	                                      Common::HostMemoryText()));
 }
 
 static void KytyClose() {

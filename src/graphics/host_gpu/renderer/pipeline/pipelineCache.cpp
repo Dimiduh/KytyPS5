@@ -2858,6 +2858,7 @@ void PipelineCache::InitializeDriverCache() {
 		m_driver_cache = nullptr;
 		return;
 	}
+	m_driver_cache_stored_size.store(initial_data.size(), std::memory_order_relaxed);
 	if (!initial_data.empty()) {
 		PipelineCacheLog("Vulkan pipeline cache: loaded {:.2f} MB from {}",
 		                 static_cast<double>(initial_data.size()) / 1'000'000.0, path);
@@ -3303,9 +3304,15 @@ void PipelineCache::ReleaseWarmPipelinesUnderPressure() {
 	m_warm_released.store(true, std::memory_order_relaxed);
 	const auto counts = m_warm_pipelines.GetCounts();
 	m_warm_pipelines.Clear();
-	PipelineCacheLog("Pipelines the precompile kept ready: {} released and no more kept, device "
-	                 "memory is near its limit ({} of {} MiB used)",
-	                 counts.kept - counts.taken, heaps.device.usage >> 20u,
+	// The builds the precompile beside the game has not started stay undone as well: a pipeline
+	// created through the cache leaves device memory behind in the driver even when it is
+	// destroyed at once (about 0.9 GB after 3,700 of them, 2.6 GB after 15,000). What they
+	// would have put in the driver cache is compiled at its first use, or by the next pass.
+	const auto dropped = m_precompile_queue != nullptr ? m_precompile_queue->DropQueued() : 0;
+	PipelineCacheLog("Pipelines the precompile kept ready: {} released and no more kept, and {} "
+	                 "builds of the precompile beside the game left undone: device memory is near "
+	                 "its limit ({} of {} MiB used)",
+	                 counts.kept - counts.taken, dropped, heaps.device.usage >> 20u,
 	                 heaps.device.budget >> 20u);
 }
 
@@ -4037,6 +4044,7 @@ bool PipelineCache::StartEmptyDriverCache() {
 	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	m_driver_cache         = empty;
 	m_driver_cache_rebuild = true;
+	m_driver_cache_stored_size.store(0, std::memory_order_relaxed);
 	m_driver_cache_dirty.store(false);
 	m_driver_history->Clear();
 	if (m_finished_created != nullptr) {
@@ -4154,6 +4162,16 @@ bool PipelineCache::WriteDriverCache() {
 		if (result != vk::Result::eSuccess || size == 0) {
 			break;
 		}
+		// The cache holds what its file holds: a pipeline it was given makes it larger, and a
+		// build it only provided does not. A session after a precompile pass provides thousands
+		// and adds none, and wrote the whole file again twice (2 GB for Saros, and as much
+		// memory for the copy while it did).
+		if (attempt == 0 && size == m_driver_cache_stored_size.load(std::memory_order_relaxed)) {
+			if (m_finished_created != nullptr) {
+				m_finished_created->Commit(ended);
+			}
+			return true;
+		}
 		size += (size / 16u + (size_t {16} << 20u)) * (size_t {1} << std::min(attempt, 4u));
 		payload.resize(size);
 		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, payload.data());
@@ -4177,6 +4195,7 @@ bool PipelineCache::WriteDriverCache() {
 		give_back();
 		return false;
 	}
+	m_driver_cache_stored_size.store(payload.size(), std::memory_order_relaxed);
 	if (m_driver_history != nullptr) {
 		WriteDriverHistory(built, hash, stale);
 	}

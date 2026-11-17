@@ -449,6 +449,8 @@ private:
 	// What the precompile of this session built for recorded programs and pipelines, for their
 	// first use (CreatePipelineInternal takes from it). Not with --precompile-only.
 	WarmPipelines m_warm_pipelines;
+	// The size of the driver cache's data when it was loaded or last written (WriteDriverCache).
+	std::atomic<uint64_t> m_driver_cache_stored_size {0};
 	// Device memory came near its limit: the kept pipelines were released and none is kept any
 	// more (ReleaseWarmPipelinesUnderPressure).
 	std::atomic<bool> m_warm_released {false};

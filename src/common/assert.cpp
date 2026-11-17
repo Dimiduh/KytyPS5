@@ -1,6 +1,7 @@
 #include "common/assert.h"
 
 #include "common/subsystems.h"
+#include "common/systemInfo.h"
 #include "kytyGitVersion.h"
 
 #include <atomic>
@@ -66,6 +67,10 @@ RecoverableFatalScope::~RecoverableFatalScope() {
 	}
 	Log::WriteToConsoleAndLog(fmt::format("--- Build ---\n{}\n{}\n{} in {}:{}\n", KYTY_BUILD_LABEL,
 	                                      title, text, file, line));
+	// Out of memory shows as many things (a lost graphics device, a null pointer in the guest).
+	if (const auto memory = HostMemoryText(); !memory.empty()) {
+		Log::WriteToConsoleAndLog(fmt::format("--- Memory ---\n{}\n", memory));
+	}
 	Subsystems::EmergencyShutdownActive();
 	std::fflush(nullptr);
 	FatalExit(321);
