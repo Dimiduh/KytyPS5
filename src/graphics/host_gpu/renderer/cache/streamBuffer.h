@@ -104,6 +104,8 @@ public:
 	// The buffer has not taken the guest memory it was created over yet: its first
 	// synchronization uploads it whatever bda_use says (BufferCache::SynchronizeBda).
 	bool     bda_new      = true;
+	// The scheduler tick whose commands wrote the buffer's page table entries (registration).
+	uint64_t registered_tick = 0;
 	// The scheduler tick that holds the latest GPU write of the buffer, valid while no write is
 	// open (marked by a command still being prepared; BufferCache::NoteCommandBoundary).
 	uint64_t gpu_write_tick = 0;

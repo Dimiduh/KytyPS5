@@ -200,6 +200,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		m_total_used_memory += buffer.Size();
 		buffer.lru_id         = m_lru_cache.Insert(id, m_gc_tick);
 		buffer.bda_watch_tick = 0;
+		buffer.registered_tick = m_scheduler.CurrentTick();
 		WriteBdaEntries(buffer);
 		QueueBdaSync(buffer.CpuAddress(), buffer.Size());
 	} else {
@@ -213,6 +214,11 @@ void BufferCache::ChangeRegister(BufferId id) {
 }
 
 void BufferCache::TouchBuffer(Buffer& buffer) {
+	// A deleted buffer waits only for its slot to be freed: its LRU item is free and its page
+	// table entries are cleared, and neither may come back.
+	if (buffer.is_deleted) {
+		return;
+	}
 	m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
 	if (buffer.bda_watch_tick != 0) {
 		buffer.bda_watch_tick = 0;
@@ -238,14 +244,23 @@ void BufferCache::WriteBdaEntries(const Buffer& buffer) {
 	                addresses.size() * sizeof(vk::DeviceAddress));
 }
 
-bool BufferCache::NoteBdaAccess(uint64_t address) {
+bool BufferCache::NoteBdaAccess(uint64_t address, uint64_t window_start) {
 	const auto* owner = m_page_table.Find(address >> PageTable::kPageBits);
 	if (owner == nullptr || !*owner) {
 		return false;
 	}
+	auto& buffer = m_slot_buffers[*owner];
+	// A resident page reports only through a watched entry (or a cleared one). A buffer that is
+	// no longer watched but was registered before the reporting dispatches ran was watched when
+	// they accessed it: a report processed earlier unwatched it, and the access was made. One
+	// registered since had no entry then, and the access was lost. (Where unread buffers stay
+	// watched, g_bda_lazy, a buffer is registered watched and loses the watch only by a report:
+	// an unwatched one was watched then.)
+	if (!m_bda_lazy && buffer.bda_watch_tick == 0 && buffer.registered_tick >= window_start) {
+		return false;
+	}
 	// The page is resident, so the access was made. Its watch may have ended since the shader
 	// ran: the report still shows the use, and the page needs no other buffer.
-	auto& buffer = m_slot_buffers[*owner];
 	MarkBdaRead(buffer);
 	if (buffer.bda_watch_tick != 0) {
 		m_bda_accessed.push_back(address);
@@ -321,10 +336,13 @@ void BufferCache::KeepAccessedBdaBuffers() {
 			return true;
 		}
 		auto& buffer = m_slot_buffers[id];
+		if (buffer.is_deleted) {
+			return true;
+		}
 		if (m_bda_reports_lost) {
 			TouchBuffer(buffer);
 		}
-		return buffer.is_deleted || buffer.bda_watch_tick == 0;
+		return buffer.bda_watch_tick == 0;
 	});
 	m_bda_reports_lost = false;
 }
@@ -502,18 +520,20 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	SetVulkanObjectNameF(m_graphics.device, GetBuffer(null_id).Handle(), "Kyty.NullBuffer");
 	// Bindings of empty buffers read this one, so it must hold zeros, not leftover memory.
 	GetBuffer(null_id).Fill(0, 16, 0);
-	if (!m_graphics.CanReportMemoryUsage()) {
+	UpdateGcMarks();
+}
+
+void BufferCache::UpdateGcMarks() {
+	if (m_gc_marks_pinned || !m_graphics.CanReportMemoryUsage()) {
 		return;
 	}
-	constexpr int64_t GiB              = 1024ll * 1024 * 1024;
-	constexpr int64_t target_threshold = 8 * GiB;
-	const auto        budget =
-	    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
-	const auto threshold = std::min(budget, target_threshold);
-	const auto expected  = std::min(budget - 6 * threshold / 10, budget - GiB);
-	const auto critical  = std::min(budget - 2 * threshold / 10, budget - GiB / 2);
-	m_trigger_gc_memory  = static_cast<uint64_t>(std::max<int64_t>(expected, GiB));
-	m_critical_gc_memory = static_cast<uint64_t>(std::max<int64_t>(critical, 2 * GiB));
+	const auto live = m_graphics.UpdateCacheMarks();
+	if (live.Generation() == m_gc_marks_generation) {
+		return;
+	}
+	m_gc_marks_generation = live.Generation();
+	m_trigger_gc_memory   = live.Buffer().trigger;
+	m_critical_gc_memory  = live.Buffer().critical;
 }
 
 BufferCache::~BufferCache() {
@@ -1553,7 +1573,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		return;
 	}
 
-	m_texture_cache.PrepareGpuBufferWrite(vaddr, size);
+	m_texture_cache.PrepareGpuBufferWrite(vaddr, size, TextureCache::BufferWriteExtent::Exact);
 	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
 	dst->Fill(dst_offset, size, value);
@@ -1594,7 +1614,8 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	}
 
 	if (dst_memory) {
-		m_texture_cache.PrepareGpuBufferWrite(dst_vaddr, size);
+		m_texture_cache.PrepareGpuBufferWrite(dst_vaddr, size,
+		                                      TextureCache::BufferWriteExtent::Exact);
 	}
 	auto& command = m_scheduler.Current();
 	if (dst_memory) {
@@ -1777,6 +1798,7 @@ void BufferCache::RunGarbageCollector() {
 	KeepAccessedBdaBuffers();
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
+		UpdateGcMarks();
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
 	// Below the memory trigger a cached buffer costs nothing but memory, unless BDA accesses are in

@@ -12,9 +12,11 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cinttypes>
 #include <cstring>
 #include <limits>
+#include <utility>
 
 namespace Libs::Graphics {
 
@@ -121,8 +123,9 @@ void FaultManager::ProcessFaultBuffer() {
 	dependency.pBufferMemoryBarriers = &post_barrier;
 	command.pipelineBarrier2(dependency);
 
-	const auto area = m_current_area;
-	m_scheduler.DeferOperation([this, mapped, offset, area] {
+	const auto area         = m_current_area;
+	const auto window_start = std::exchange(m_last_scan_tick, m_scheduler.CurrentTick());
+	m_scheduler.DeferOperation([this, mapped, offset, area, window_start] {
 		m_download_buffer.Invalidate(offset, PageFaultAreaSize);
 		RangeSet    fault_ranges;
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
@@ -132,10 +135,11 @@ void FaultManager::ProcessFaultBuffer() {
 		const auto count    = std::min<uint64_t>(reported, MaxPageFaults - 1);
 		if (reported != count) {
 			m_buffer_cache.NoteLostBdaReports();
+			m_lost_accesses.NoteOverflow();
 		}
 		for (uint32_t index = 1; index <= count; ++index) {
 			const auto address = BufferCache::GuestAddress(faults[index]);
-			if (m_buffer_cache.NoteBdaAccess(address)) {
+			if (m_buffer_cache.NoteBdaAccess(address, window_start)) {
 				// A resident page, watched (BufferCache::BdaWatchBit) when the shader ran: the
 				// access was made.
 				continue;
@@ -149,7 +153,19 @@ void FaultManager::ProcessFaultBuffer() {
 			    Libs::LibKernel::Memory::MappedRangeSize(address, block_end - address);
 			fault_ranges.Add(address,
 			                 mapped_size != 0 ? mapped_size : BufferCache::CACHING_PAGESIZE);
-			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
+			if (m_lost_accesses.Note()) {
+				LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
+			}
+		}
+		const auto now_ms =
+		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+		                              std::chrono::steady_clock::now().time_since_epoch())
+		                              .count());
+		if (const auto due = m_lost_accesses.Summary(now_ms)) {
+			LOGF("Accessed non-GPU cached memory %" PRIu64 " more times (%" PRIu64
+			     " in total); each access was lost for its dispatch. The fault report area "
+			     "overflowed %" PRIu64 " times (%" PRIu64 " in total)\n",
+			     due.accesses, m_lost_accesses.Total(), due.overflows, m_lost_accesses.Overflows());
 		}
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());

@@ -9,6 +9,7 @@
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/bdaSyncQueue.h"
 #include "graphics/host_gpu/filteredRangeSet.h"
+#include "graphics/host_gpu/memoryBudget.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
@@ -164,13 +165,18 @@ public:
 	// since the last boundary take the current tick as the tick of their latest write.
 	void               NoteCommandBoundary();
 	void               ProcessFaultBuffer();
-	// A fault report of a resident page (its buffer is watched, or was when the shader ran):
-	// shaders read the buffer through the page table, and the collector keeps it; returns true.
-	// False when the page needs a buffer.
-	[[nodiscard]] bool NoteBdaAccess(uint64_t address);
+	// A fault report of a resident page whose buffer is watched (BdaWatchBit), or was watched
+	// when the reporting dispatches ran (they ran after the scheduler tick `window_start`):
+	// shaders read the buffer through the page table, the collector keeps it, and the access
+	// was made; returns true. False when the page needs a buffer (the access was lost).
+	[[nodiscard]] bool NoteBdaAccess(uint64_t address, uint64_t window_start);
 	// Fault reports were dropped (the report area was full): every watched buffer counts as
 	// accessed at the next collection.
 	void               NoteLostBdaReports() noexcept { m_bda_reports_lost = true; }
+	// Shader accesses through the page table that found no buffer (lost for their dispatch).
+	[[nodiscard]] uint64_t LostBdaAccesses() const noexcept {
+		return m_fault_manager.LostAccesses();
+	}
 	void               SynchronizeBda(const RangeSet& mapped);
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
 	void QueueBdaSync(uint64_t vaddr, uint64_t size, bool at_ordering_point = false);
@@ -188,6 +194,8 @@ public:
 	void                   NoteBdaOrderingPoint(uint64_t epoch = BdaSyncQueue::AllEpochs);
 	void                   TakeBdaSync(BdaSyncDue& due);
 	void               RunGarbageCollector();
+	// Derives the collection marks from the current device memory budget.
+	void UpdateGcMarks();
 	// Called before every submission on the GPU thread: records downloads of the hot read-back
 	// pages the GPU wrote since the last submission, published into guest memory when the
 	// submission completes, so the guest finds them clean instead of faulting into a
@@ -254,6 +262,11 @@ private:
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// Runs `download` (an image copied into `buffer` over `copied`) and keeps the buffer's bytes
+	// in `written`, the part of the image's memory later buffer writes may have produced.
+	template <typename Download>
+	void KeepBufferWrittenBytes(Buffer& buffer, GuestRange written, GuestRange copied,
+	                            Download&& download);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse. A
 	// synchronous download given a batch only records its copies and appends its publication:
 	// the caller submits once for the whole batch, waits, and runs the publications in order.
@@ -464,6 +477,10 @@ private:
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;
 	uint64_t                                          m_total_used_memory  = 0;
+	// GraphicContext::UpdateCacheMarks generation the marks were taken from.
+	uint64_t m_gc_marks_generation = 0;
+	// Set by tests that configure the marks themselves.
+	bool     m_gc_marks_pinned    = false;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;

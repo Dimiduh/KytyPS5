@@ -6,6 +6,7 @@
 #include "common/lruCache.h"
 #include "common/slotVector.h"
 #include "common/smallVector.h"
+#include "graphics/host_gpu/memoryBudget.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/cache/layoutChangeLog.h"
@@ -113,7 +114,11 @@ public:
 	// Called before a GPU buffer write of guest memory is recorded. The write refreshes images
 	// from guest memory (InvalidateMemoryFromGPU); one it covers only partly keeps its other
 	// GPU-written contents, which move into the buffer cache ahead of the write.
-	void               PrepareGpuBufferWrite(uint64_t address, uint64_t size);
+	// A conservative range bounds the write (a written V#'s extent); an exact one is written
+	// whole (fills and copies).
+	enum class BufferWriteExtent : uint8_t { Conservative, Exact };
+	void PrepareGpuBufferWrite(uint64_t address, uint64_t size,
+	                           BufferWriteExtent extent = BufferWriteExtent::Conservative);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	// Writes a copy into whole levels of one layer of a GPU-written image straight into it, and
 	// returns false for any other copy.
@@ -272,6 +277,11 @@ private:
 	[[nodiscard]] uint64_t FramesUnused(const Image& image) const noexcept;
 	// Under memory pressure, frees displaced images oldest first until the pressure mark.
 	void                             ReleaseDisplaced(bool pressured);
+	// Derives the collection marks from the current device memory budget.
+	void UpdateGcMarks();
+	// Above the device memory usage limit (MemoryBudget::UsageLimit): deletes images unused for a
+	// few frames, oldest first, until usage is back under it. Returns the images deleted.
+	size_t                           CollectOverLimit(uint64_t tick, uint64_t limit);
 	void                      TrackImage(ImageId id);
 	void                      TrackImageHead(ImageId id);
 	void                      TrackImageTail(ImageId id);
@@ -363,8 +373,17 @@ private:
 	LayoutChangeLog                                   m_layout_log;
 	uint64_t                                          m_deletion_epoch     = 0;
 	uint64_t                                          m_total_used_memory  = 0;
+	// GPU-written images deleted over the limit are written back to guest memory first (a GPU copy
+	// each, landing when it completes); at most this many bytes per collection.
+	uint64_t m_over_limit_write_back_bytes = 256ull << 20u;
+	// Accounted bytes of deleted images whose backing waits for its deferred release.
+	std::atomic<uint64_t> m_release_pending {0};
 	// Displaced images in the order they were displaced, with their serial (ids are reused).
 	std::vector<std::pair<ImageId, uint64_t>>         m_displaced_images;
+	// GraphicContext::UpdateCacheMarks generation the marks were taken from.
+	uint64_t m_gc_marks_generation = 0;
+	// Set by tests that configure the marks themselves.
+	bool                                              m_gc_marks_pinned    = false;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t m_critical_gc_memory      = 3ull * 1024 * 1024 * 1024;

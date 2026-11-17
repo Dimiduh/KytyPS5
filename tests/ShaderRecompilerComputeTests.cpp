@@ -226,6 +226,10 @@ struct BufferCacheTestAccess {
 
   static uint64_t GcTick(const BufferCache &cache) { return cache.m_gc_tick; }
 
+  static bool LruConsistent(const BufferCache &cache) {
+    return cache.m_lru_cache.IsConsistent();
+  }
+
   // Serves a readback on the calling thread, as the GPU thread would.
   static void ReadBack(BufferCache &cache, uint64_t address, uint64_t size) {
     const BufferCache::GuestReadback request{
@@ -237,6 +241,7 @@ struct BufferCacheTestAccess {
   static void SetGarbageCollectionThresholds(BufferCache &cache,
                                              uint64_t trigger,
                                              uint64_t critical) {
+    cache.m_gc_marks_pinned = true;
     cache.m_trigger_gc_memory = trigger;
     cache.m_critical_gc_memory = critical;
   }
@@ -430,6 +435,7 @@ struct TextureCacheTestAccess {
   static void ConfigureGarbageCollection(TextureCache &cache,
                                          std::span<const ImageId> oldest,
                                          uint64_t tick, uint64_t pressure) {
+    cache.m_gc_marks_pinned = true;
     cache.m_trigger_gc_memory = 0;
     cache.m_pressure_gc_memory = pressure;
     cache.m_critical_gc_memory = UINT64_MAX;
@@ -461,8 +467,39 @@ struct TextureCacheTestAccess {
     return owner != nullptr && owner->registered;
   }
 
+  // Runs the over-limit collection with the cache's device usage set to `used`.
+  static size_t CollectOverLimit(TextureCache &cache, uint64_t used,
+                                 uint64_t limit) {
+    std::scoped_lock lock{cache.m_lock};
+    cache.m_total_used_memory = used;
+    return cache.CollectOverLimit(cache.m_gc_tick, limit);
+  }
+
+  static uint64_t UsedMemory(const TextureCache &cache) {
+    return cache.m_total_used_memory;
+  }
+
+  static void SetOverLimitWriteBackBytes(TextureCache &cache, uint64_t bytes) {
+    cache.m_over_limit_write_back_bytes = bytes;
+  }
+
+  static void MarkDisplaced(TextureCache &cache, ImageId id) {
+    std::scoped_lock lock{cache.m_lock};
+    cache.MarkDisplaced(id);
+  }
+
+  // The frame of the image's last lookup, without touching it in the LRU.
+  static void SetLastAccess(TextureCache &cache, ImageId id, uint64_t tick) {
+    cache.m_slot_images[id].tick_accessed_last = tick;
+  }
+
+  static uint64_t AccountedSize(TextureCache &cache, ImageId id) {
+    return cache.m_slot_images[id].AccountedSize();
+  }
+
   // Returns the previous pressure mark.
   static uint64_t SetPressureMark(TextureCache &cache, uint64_t pressure) {
+    cache.m_gc_marks_pinned = true;
     return std::exchange(cache.m_pressure_gc_memory, pressure);
   }
 
@@ -7614,6 +7651,21 @@ public:
             "a reported access of a watched page did not keep and unwatch its "
             "buffer");
 
+    // A later scan reports the page again for a dispatch that ran while the
+    // buffer was still watched: the access was made, not lost.
+    const auto lost_before = cache.LostBdaAccesses();
+    cache.GetFaultBuffer()->Fill((reported_page >> 5u) * sizeof(u32),
+                                 sizeof(u32), 1u << (reported_page & 31u));
+    cache.ProcessFaultBuffer();
+    scheduler.Finish();
+    collect(1);
+    Require(name, "late report",
+            cache.LostBdaAccesses() == lost_before &&
+                cache.FindBuffer(base, 2 * page) == id &&
+                read_entries() == watched_entries(false),
+            "a report of a page whose buffer was watched when the access ran "
+            "counted as a lost access");
+
     // A dropped report keeps every watched buffer too.
     collect(static_cast<uint32_t>(BufferCache::BdaCollectionAge) + 1u);
     Require(name, "watched again", read_entries() == watched_entries(true),
@@ -7638,6 +7690,49 @@ public:
     Require(name, "page table cleared",
             read_entries() == std::array<uint64_t, 2>{0u, 0u},
             "an evicted buffer left page table entries behind");
+    // A dropped report made before the evicted buffer's slot is freed (the
+    // erase waits for the submission) neither brings the buffer's page table
+    // entries back nor links its freed LRU item again: the next buffer would
+    // take that item, link it twice and leave the collection walking a cycle.
+    {
+      (void)cache.FindBuffer(base, 2 * page);
+      context.PrepareBda();
+      collect(static_cast<uint32_t>(BufferCache::BdaCollectionAge) + 1u);
+      collect(static_cast<uint32_t>(BufferCache::BdaWatchTicks));
+      Require(name, "evicted again", !cache.IsRegionRegistered(base, 2 * page),
+              "an unreported watched buffer was kept");
+      cache.NoteLostBdaReports();
+      collect(1);
+      Require(name, "lost reports after eviction",
+              BufferCacheTestAccess::LruConsistent(cache),
+              "dropped reports linked the freed LRU item of an evicted buffer "
+              "again");
+      Require(name, "no entries after eviction",
+              read_entries() == std::array<uint64_t, 2>{0u, 0u},
+              "dropped reports wrote the page table entries of an evicted "
+              "buffer back");
+      // The next buffers take the freed items; the collection still ends.
+      (void)cache.FindBuffer(base, 2 * page);
+      context.PrepareBda();
+      collect(static_cast<uint32_t>(BufferCache::BdaCollectionAge) +
+              static_cast<uint32_t>(BufferCache::BdaWatchTicks) + 2u);
+      Require(name, "collection after reuse",
+              BufferCacheTestAccess::LruConsistent(cache) &&
+                  !cache.IsRegionRegistered(base, 2 * page),
+              "the LRU list of the buffer collection is broken");
+    }
+
+    // An access after the eviction found no buffer: it is lost.
+    {
+      const auto lost_evicted = cache.LostBdaAccesses();
+      cache.GetFaultBuffer()->Fill((reported_page >> 5u) * sizeof(u32),
+                                   sizeof(u32), 1u << (reported_page & 31u));
+      cache.ProcessFaultBuffer();
+      scheduler.Finish();
+      Require(name, "lost after eviction",
+              cache.LostBdaAccesses() == lost_evicted + 1,
+              "an access of an evicted page was not counted as lost");
+    }
 
     context.UnmapMemory(base, 2 * page);
     scheduler.Finish();
@@ -10824,6 +10919,170 @@ public:
                     read(ordered) == third_value,
                 "a use after an emulator store or an ordering point read the "
                 "copy taken before it, or one before the point did not share");
+        // A texel-buffer read at an image's base synchronizes its buffer from
+        // the image, but bytes a buffer write produced inside the image since
+        // its last native write (Saros keeps a culling queue's state in
+        // transient memory a GPU-written image also covers) must survive the
+        // read, and the image's texels must still reach the rest.
+        constexpr uint32_t newer_value = 0x5eed1234u;
+        vk::ClearValue painted{};
+        painted.color.uint32 = std::array{buffer_alias_image_value, 0u, 0u, 0u};
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), buffer_alias_image,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
+        const auto image_address = buffer_alias_desc.info.data.address;
+        constexpr uint64_t inner_offset = 12;
+        texture_cache.PrepareGpuBufferWrite(image_address + inner_offset,
+                                            sizeof(uint32_t));
+        auto writable = resources.GetBufferCache().ObtainBuffer(
+            image_address + inner_offset, sizeof(uint32_t), true, false);
+        Require(name, "image alias buffer allocation",
+                writable.first != nullptr,
+                "failed to allocate the image alias write buffer");
+        writable.first->Fill(writable.second, sizeof(uint32_t), newer_value);
+        texture_cache.InvalidateMemoryFromGPU(image_address + inner_offset,
+                                              sizeof(uint32_t));
+        auto texel = resources.GetBufferCache().ObtainBuffer(
+            image_address, 4 * sizeof(uint32_t), false, true);
+        Require(name, "image alias texel buffer", texel.first != nullptr,
+                "failed to obtain the texel buffer over the image");
+        auto readback = CreateHostBuffer(name, 4 * sizeof(uint32_t),
+                                         vk::BufferUsageFlagBits::eTransferDst,
+                                         {0, 0, 0, 0});
+        vk::MemoryBarrier to_copy{};
+        to_copy.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+        to_copy.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+        scheduler.Current().Handle().pipelineBarrier(
+            vk::PipelineStageFlagBits::eAllCommands,
+            vk::PipelineStageFlagBits::eTransfer, {}, 1, &to_copy, 0, nullptr,
+            0, nullptr);
+        const vk::BufferCopy copy{texel.second, 0, 4 * sizeof(uint32_t)};
+        scheduler.Current().Handle().copyBuffer(texel.first->Handle(),
+                                                readback.buffer, 1, &copy);
+        HostReadBarrier(readback.buffer, readback.size,
+                        vk::PipelineStageFlagBits::eTransfer,
+                        vk::AccessFlagBits::eTransferWrite);
+        scheduler.Finish();
+        const auto texels = ReadBuffer(name, readback, 4);
+        Require(
+            name, "newer buffer bytes survive a texel read of the image",
+            texels.size() == 4 && texels[3] == newer_value,
+            "a texel-buffer read synchronized the buffer from an image a later "
+            "buffer write had overlapped, undoing that write");
+        Require(name, "the texel read gets the image around the write",
+                texels[0] == buffer_alias_image_value &&
+                    texels[1] == buffer_alias_image_value &&
+                    texels[2] == buffer_alias_image_value,
+                "a texel-buffer read of an image a buffer write had overlapped "
+                "got stale memory instead of the image's texels outside that "
+                "write");
+        DestroyBuffer(&readback);
+      }
+      {
+        // The same holds for a fill or copy that covers the whole image without
+        // starting at its base: the image is then entirely older than its
+        // memory, and a texel read at its base must not copy it back. A
+        // conservative range (a written V#'s extent) that covers the image
+        // tells nothing about the image's bytes and leaves it current.
+        constexpr uint32_t newer_value = 0x600d5eedu;
+        vk::ClearValue painted{};
+        painted.color.uint32 = std::array{buffer_alias_image_value, 0u, 0u, 0u};
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), buffer_alias_image,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
+        const auto image_address = buffer_alias_desc.info.data.address;
+        const auto write_address = image_address - 16;
+        constexpr uint64_t write_size = 48;
+        texture_cache.PrepareGpuBufferWrite(write_address, write_size);
+        Require(
+            name, "a conservative covering range keeps the image current",
+            texture_cache.GetImage(buffer_alias_image).HoldsCurrentContents(),
+            "a conservative write range that covers a GPU-written image "
+            "made the image older than its memory");
+        texture_cache.PrepareGpuBufferWrite(
+            write_address, write_size, TextureCache::BufferWriteExtent::Exact);
+        auto writable = resources.GetBufferCache().ObtainBuffer(
+            write_address, write_size, true, false);
+        Require(name, "covering write buffer allocation",
+                writable.first != nullptr,
+                "failed to allocate the covering write buffer");
+        writable.first->Fill(writable.second, write_size, newer_value);
+        texture_cache.InvalidateMemoryFromGPU(write_address, write_size);
+        auto texel = resources.GetBufferCache().ObtainBuffer(
+            image_address, 4 * sizeof(uint32_t), false, true);
+        Require(name, "covered image texel buffer", texel.first != nullptr,
+                "failed to obtain the texel buffer over the covered image");
+        auto readback = CreateHostBuffer(name, 4 * sizeof(uint32_t),
+                                         vk::BufferUsageFlagBits::eTransferDst,
+                                         {0, 0, 0, 0});
+        vk::MemoryBarrier to_copy{};
+        to_copy.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+        to_copy.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+        scheduler.Current().Handle().pipelineBarrier(
+            vk::PipelineStageFlagBits::eAllCommands,
+            vk::PipelineStageFlagBits::eTransfer, {}, 1, &to_copy, 0, nullptr,
+            0, nullptr);
+        const vk::BufferCopy copy{texel.second, 0, 4 * sizeof(uint32_t)};
+        scheduler.Current().Handle().copyBuffer(texel.first->Handle(),
+                                                readback.buffer, 1, &copy);
+        HostReadBarrier(readback.buffer, readback.size,
+                        vk::PipelineStageFlagBits::eTransfer,
+                        vk::AccessFlagBits::eTransferWrite);
+        scheduler.Finish();
+        Require(name, "a covering write survives a texel read of the image",
+                ReadBuffer(name, readback, 4) ==
+                    std::vector<u32>(4, newer_value),
+                "a texel-buffer read copied an image over a buffer write that "
+                "covered it without starting at its base");
+        DestroyBuffer(&readback);
+      }
+      {
+        // Writing an image back into guest memory skips the bytes buffer writes
+        // produced since its last native write: the image's older texels would
+        // replace them there.
+        constexpr uint32_t newer_value = 0x0dd5eed0u;
+        vk::ClearValue painted{};
+        painted.color.uint32 = std::array{buffer_alias_image_value, 0u, 0u, 0u};
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), buffer_alias_image,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
+        const auto image_address = buffer_alias_desc.info.data.address;
+        constexpr uint64_t inner_offset = 12;
+        uint32_t guest_before = 0;
+        Require(name, "image alias guest word",
+                Libs::LibKernel::Memory::TryReadBacking(
+                    image_address + inner_offset, &guest_before,
+                    sizeof(guest_before)) &&
+                    guest_before != buffer_alias_image_value,
+                "the guest word under the image alias write is unreadable or "
+                "already holds the image's texel");
+        texture_cache.PrepareGpuBufferWrite(image_address + inner_offset,
+                                            sizeof(uint32_t));
+        auto writable = resources.GetBufferCache().ObtainBuffer(
+            image_address + inner_offset, sizeof(uint32_t), true, false);
+        Require(name, "image alias buffer allocation",
+                writable.first != nullptr,
+                "failed to allocate the image alias write buffer");
+        writable.first->Fill(writable.second, sizeof(uint32_t), newer_value);
+        texture_cache.InvalidateMemoryFromGPU(image_address + inner_offset,
+                                              sizeof(uint32_t));
+        Require(name, "an overlapped image is written back",
+                TextureCacheTestAccess::TryDownload(texture_cache,
+                                                    buffer_alias_image),
+                "an image a buffer write had overlapped was not written back");
+        scheduler.Finish();
+        scheduler.DrainPriorityOperations();
+        std::array<uint32_t, 4> guest{};
+        Require(name, "the write-back skips the buffer write",
+                Libs::LibKernel::Memory::TryReadBacking(
+                    image_address, guest.data(), sizeof(guest)) &&
+                    guest[0] == buffer_alias_image_value &&
+                    guest[1] == buffer_alias_image_value &&
+                    guest[2] == buffer_alias_image_value &&
+                    guest[3] == guest_before,
+                "writing an image back replaced the bytes a buffer write had "
+                "produced in its memory with older texels, or left out the "
+                "rest of the image");
       }
       {
         // Transient resources share heap memory: a large target bound later
@@ -13917,6 +14176,244 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // Over the device memory limit the collector deletes images unused for a few
+  // frames, oldest first, until usage is back under the limit: those guest
+  // memory holds first, then GPU-written ones after writing them back. Images
+  // the last frames used stay even while usage remains over the limit.
+  void CheckOverLimitCollection() {
+    constexpr const char *name = "OverLimitCollection";
+    constexpr uintptr_t base = 0x000000020c800000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t stride = 0x10000;
+    constexpr uint32_t width = 64;
+    constexpr uint32_t height = 16;
+    constexpr uint64_t image_size = uint64_t{width} * height * 4u;
+    constexpr uint32_t written = 0x55667788u;
+    EnsureRuntimeContext();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "over-limit direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "over-limit fixed mapping failed");
+    std::memset(mapped, 0x5a, allocation_size);
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    {
+      context.MapMemory(base, allocation_size);
+      auto &cache = context.GetTextureCache();
+      // Recycled backings of earlier cases would count against the deficit.
+      context.GetGraphics().DestroyRecycledImages();
+      // Sampled images hold what guest memory holds; the GPU writes storage
+      // ones.
+      const auto describe = [&](uint64_t address, bool storage = false) {
+        auto desc = MakeLinearDesc(address, image_size, vk::Format::eR32Uint,
+                                   Prospero::BufferFormat::k32UInt,
+                                   Prospero::ImageType::kColor2D,
+                                   {width, height, 1}, 1, 4, 1);
+        desc.type = storage ? BindingType::Storage : BindingType::Texture;
+        desc.view_info.usage = storage ? vk::ImageUsageFlagBits::eStorage
+                                       : vk::ImageUsageFlagBits::eSampled;
+        return desc;
+      };
+      const auto create = [&](uint64_t address, bool storage = false) {
+        auto desc = describe(address, storage);
+        const auto id = cache.FindImage(desc);
+        (void)cache.FindTexture(id, desc);
+        return id;
+      };
+      const auto contains = [&](ImageId id) {
+        return TextureCacheTestAccess::Contains(cache, id);
+      };
+
+      // Three old images guest memory holds, an old GPU-written one and two
+      // the last frame used.
+      const std::array old_ids{create(base), create(base + stride),
+                               create(base + 2 * stride)};
+      auto gpu_desc = describe(base + 3 * stride, true);
+      const auto gpu_id = create(base + 3 * stride, true);
+      vk::ClearValue clear{};
+      clear.color.uint32[0] = written;
+      TextureCacheTestAccess::ClearImage(
+          cache, scheduler.Current(), gpu_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+      cache.MarkGpuWritten(gpu_id);
+      const std::array recent_ids{create(base + 4 * stride),
+                                  create(base + 5 * stride)};
+      TextureCacheTestAccess::ConfigureGarbageCollection(
+          cache, std::array{old_ids[0], old_ids[1], gpu_id, old_ids[2]}, 100,
+          UINT64_MAX);
+      const auto size =
+          TextureCacheTestAccess::AccountedSize(cache, old_ids[0]);
+      Require(name, "fixtures",
+              size != 0 && std::ranges::all_of(old_ids, contains) &&
+                  contains(gpu_id) &&
+                  std::ranges::all_of(recent_ids, contains) &&
+                  TextureCacheTestAccess::AccountedSize(cache, gpu_id) == size,
+              "the cached images were not created");
+
+      // 2.5 images over the limit: the three old images guest memory holds go
+      // (two do not suffice), the GPU-written one stays.
+      constexpr uint64_t used = 64ull << 20u;
+      const auto limit = used - 2 * size - size / 2;
+      const auto collected =
+          TextureCacheTestAccess::CollectOverLimit(cache, used, limit);
+      Require(name, "guest-held images first",
+              std::ranges::none_of(old_ids, contains) && contains(gpu_id),
+              "the collection did not free the oldest images guest memory "
+              "holds, or freed the GPU-written one with them");
+      Require(name, "only what the limit needs",
+              collected == 3 &&
+                  TextureCacheTestAccess::UsedMemory(cache) == used - 3 * size,
+              "the collection did not stop once usage was under the limit");
+      // The next collection samples the same usage: the deleted images'
+      // backings are released only when their deferred destruction runs, so
+      // they count as released and nothing more goes.
+      Require(name, "pending releases count",
+              TextureCacheTestAccess::CollectOverLimit(cache, used, limit) ==
+                      0 &&
+                  contains(gpu_id) && std::ranges::all_of(recent_ids, contains),
+              "the collection evicted again for memory whose release was "
+              "already pending");
+
+      // Still over the limit: the GPU-written image is written back and goes;
+      // the images the last frame used stay although usage remains over it.
+      Require(name, "write-back, recent images kept",
+              TextureCacheTestAccess::CollectOverLimit(cache, used, 0) == 1 &&
+                  !contains(gpu_id) &&
+                  std::ranges::all_of(recent_ids, contains),
+              "the collection kept the old GPU-written image or deleted "
+              "images the last frame used");
+      // The write-back lands in guest memory when its copy completes.
+      scheduler.Finish();
+      const auto again_id = cache.FindImage(gpu_desc);
+      (void)cache.FindTexture(again_id, gpu_desc);
+      Require(name, "written-back contents",
+              ReadCachedTexel(name, context, again_id) ==
+                      std::vector<u32>{written} &&
+                  ReadCachedTexel(name, context, again_id,
+                                  {static_cast<int32_t>(width) - 1,
+                                   static_cast<int32_t>(height) - 1, 0}) ==
+                      std::vector<u32>{written},
+              "the deleted GPU-written image was not written back");
+
+      // The deleted sampled images' backings are in the recycle pool now. A
+      // deficit of one byte destroys one of them, not the pool, and deletes no
+      // image.
+      auto &graphics = context.GetGraphics();
+      const auto pooled = [&] {
+        std::scoped_lock pool_lock{graphics.recycled_images_mutex};
+        return graphics.recycled_images.size();
+      };
+      const auto pooled_before = pooled();
+      Require(name, "recycled backings", pooled_before >= 2,
+              "the deleted images' backings were not recycled");
+      Require(name, "pool trimmed to the deficit",
+              TextureCacheTestAccess::CollectOverLimit(cache, used, used - 1) ==
+                      0 &&
+                  pooled() == pooled_before - 1,
+              "the collection emptied the recycle pool or deleted images for "
+              "a deficit the pool covered");
+
+      // A GPU-written image the collection cannot write back (displaced: an
+      // overlapping image superseded it; looked up in the last frames, so not
+      // yet aged out) in front of one it can: only the completed write-back
+      // costs the quota, so the second image goes. A displaced image unused
+      // for longer goes without a write-back.
+      const auto written_image = [&](uint64_t address) {
+        const auto id = create(address, true);
+        TextureCacheTestAccess::ClearImage(
+            cache, scheduler.Current(), id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+        cache.MarkGpuWritten(id);
+        return id;
+      };
+      const auto aged_id = written_image(base + 8 * stride);
+      const auto displaced_id = written_image(base + 6 * stride);
+      const auto downloadable_id = written_image(base + 7 * stride);
+      TextureCacheTestAccess::MarkDisplaced(cache, aged_id);
+      TextureCacheTestAccess::MarkDisplaced(cache, displaced_id);
+      TextureCacheTestAccess::ConfigureGarbageCollection(
+          cache, std::array{aged_id, displaced_id, downloadable_id}, 200,
+          UINT64_MAX);
+      TextureCacheTestAccess::SetLastAccess(cache, displaced_id, 199);
+      TextureCacheTestAccess::SetOverLimitWriteBackBytes(cache, size);
+      Require(name, "refused write-back costs no quota",
+              TextureCacheTestAccess::CollectOverLimit(cache, used, 0) == 2 &&
+                  contains(displaced_id) && !contains(downloadable_id),
+              "an image the collection could not write back used up the "
+              "write-back quota");
+      Require(name, "aged displaced image freed", !contains(aged_id),
+              "a displaced image unused for longer than the overlap age was "
+              "kept above the limit");
+      TextureCacheTestAccess::SetOverLimitWriteBackBytes(cache, 256ull << 20u);
+      scheduler.Finish();
+      const auto *aged_bytes =
+          static_cast<const uint8_t *>(mapped) + 8 * stride;
+      Require(name, "aged displaced image not written back",
+              std::all_of(aged_bytes, aged_bytes + image_size,
+                          [](uint8_t value) { return value == 0x5a; }),
+              "the displaced image's superseded contents reached guest memory");
+      // An image a buffer write overlapped since its last native write holds
+      // older bytes than its memory there: the collection writes back the rest
+      // of the image and frees it.
+      {
+        const auto overlapped_address = base + 12 * stride;
+        const auto overlapped_id = create(overlapped_address, true);
+        TextureCacheTestAccess::ClearImage(
+            cache, scheduler.Current(), overlapped_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+        cache.MarkGpuWritten(overlapped_id);
+        cache.PrepareGpuBufferWrite(overlapped_address + sizeof(uint32_t),
+                                    sizeof(uint32_t));
+        TextureCacheTestAccess::ConfigureGarbageCollection(
+            cache, std::array{overlapped_id}, 200, UINT64_MAX);
+        Require(name, "overlapped image freed",
+                TextureCacheTestAccess::CollectOverLimit(cache, used, 0) == 1 &&
+                    !contains(overlapped_id),
+                "the collection kept an image a buffer write had overlapped "
+                "or freed more than it");
+        scheduler.Finish();
+        scheduler.DrainPriorityOperations();
+        std::array<uint32_t, 2> guest_words{};
+        Require(name, "overlapped image written back around the write",
+                Libs::LibKernel::Memory::TryReadBacking(overlapped_address,
+                                                        guest_words.data(),
+                                                        sizeof(guest_words)) &&
+                    guest_words[0] == written && guest_words[1] == 0x5a5a5a5au,
+                "the collection wrote an image a buffer write had overlapped "
+                "back over that write, or not the rest of it");
+      }
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+    }
+    Require(name, "unmap",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "over-limit fixed mapping release failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "over-limit direct-memory release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   // A shader writes a linear R32 float image (Ghost of Yotei's hi-Z pyramid), a
   // later pass samples the same memory as D32 depth, and the guest CPU reads
   // the bytes after the frame. The format swap replaces the cached image; the
@@ -14963,6 +15460,55 @@ public:
       Require(name, "guest sees the second plane",
               read_guest(second_stencil_address) == second,
               "the second plane's values were lost when the first came back");
+
+      // A buffer write inside the bound stencil plane since its last GPU write
+      // left newer bytes there than the plane holds: a texel-buffer read of the
+      // plane keeps them. The plane's association carries that state, not the
+      // depth image.
+      {
+        cache.MarkGpuWritten(depth_id);
+        constexpr uint32_t inner_offset = 64;
+        uint32_t newer = 0;
+        for (uint32_t i = 0; i < sizeof(newer); i++) {
+          newer |= uint32_t{static_cast<uint8_t>(~expected[inner_offset + i])}
+                   << (8u * i);
+        }
+        const auto write_address = stencil_address + inner_offset;
+        cache.PrepareGpuBufferWrite(write_address, sizeof(newer));
+        auto writable = resources.GetBufferCache().ObtainBuffer(
+            write_address, sizeof(newer), true, false);
+        Require(name, "stencil plane write buffer", writable.first != nullptr,
+                "failed to allocate the stencil plane write buffer");
+        writable.first->Fill(writable.second, sizeof(newer), newer);
+        cache.InvalidateMemoryFromGPU(write_address, sizeof(newer));
+        auto texel = resources.GetBufferCache().ObtainBuffer(
+            stencil_address, texels, false, true);
+        Require(name, "stencil plane texel buffer", texel.first != nullptr,
+                "failed to obtain the texel buffer over the stencil plane");
+        auto readback = CreateHostBuffer(
+            name, sizeof(newer), vk::BufferUsageFlagBits::eTransferDst, {0});
+        vk::MemoryBarrier to_copy{};
+        to_copy.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+        to_copy.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+        command().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                                  vk::PipelineStageFlagBits::eTransfer, {}, 1,
+                                  &to_copy, 0, nullptr, 0, nullptr);
+        const vk::BufferCopy copy{texel.second + inner_offset, 0,
+                                  sizeof(newer)};
+        command().copyBuffer(texel.first->Handle(), readback.buffer, 1, &copy);
+        vk::MemoryBarrier to_host{};
+        to_host.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        to_host.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        command().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                  vk::PipelineStageFlagBits::eHost, {}, 1,
+                                  &to_host, 0, nullptr, 0, nullptr);
+        scheduler.Finish();
+        Require(name, "stencil plane write survives a texel read",
+                ReadBuffer(name, readback, 1) == std::vector<u32>{newer},
+                "a texel-buffer read copied the stencil plane over a buffer "
+                "write inside it");
+        DestroyBuffer(&readback);
+      }
 
       m_device.destroyPipeline(writer_pipeline, nullptr);
       m_device.destroyPipelineLayout(writer_layout, nullptr);
@@ -64719,12 +65265,14 @@ int main(int argc, char **argv) {
     vulkan.CheckBgra16Readback();
     vulkan.CheckTransientAliasReuse();
     vulkan.CheckPressureRetiredContents();
+    vulkan.CheckOverLimitCollection();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--transient-alias-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckTransientAliasReuse();
     vulkan.CheckPressureRetiredContents();
+    vulkan.CheckOverLimitCollection();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--draw-offset-only") == 0) {

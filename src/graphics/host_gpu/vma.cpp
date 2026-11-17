@@ -81,6 +81,22 @@ void GraphicContext::DestroyRecycledImages() {
 	recycled_image_bytes = 0;
 }
 
+uint64_t GraphicContext::TrimRecycledImages(uint64_t bytes) {
+	std::scoped_lock lock(recycled_images_mutex);
+	uint64_t         freed = 0;
+	size_t           count = 0;
+	for (; count < recycled_images.size() && freed < bytes; count++) {
+		const auto& recycled = recycled_images[count];
+		UntrackAllocation(recycled.memory, recycled.memory_class);
+		vmaDestroyImage(allocator, recycled.image, recycled.allocation);
+		freed += recycled.bytes;
+	}
+	recycled_images.erase(recycled_images.begin(),
+	                      recycled_images.begin() + static_cast<ptrdiff_t>(count));
+	recycled_image_bytes -= freed;
+	return freed;
+}
+
 void GraphicContext::PreparePriorityAllocation(VmaAllocationCreateInfo& info,
                                                MemoryPriority::Class    memory_class,
                                                uint32_t                 memory_type) {
@@ -251,7 +267,12 @@ void GraphicContext::MonitorMemoryBudget() {
 	LOGF("%sGPU memory: device %" PRIu64 " of %" PRIu64 " MiB budget, driver %" PRIu64
 	     " MiB, caches %" PRIu64 " MiB (limit %" PRIu64
 	     " MiB); driver memory in the host heap %" PRIu64 " MiB\n",
-	     report == MemoryBudget::Monitor::Report::Demoted
+	     report == MemoryBudget::Monitor::Report::OverBudget
+	         ? "Warning: device memory over budget (the OS pages it over the bus; expect low frame "
+	           "rates). "
+	     : report == MemoryBudget::Monitor::Report::WithinBudget
+	         ? "Device memory back within budget. "
+	     : report == MemoryBudget::Monitor::Report::Demoted
 	         ? "Warning: driver memory grew in the host heap (demoted from device memory?). "
 	         : "",
 	     device.usage / MiB, device.budget / MiB, MemoryBudget::DriverUsage(device) / MiB,
@@ -295,6 +316,20 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	constexpr uint64_t system_reserve = 8ull * 1024 * 1024 * 1024;
 	const auto         available      = budget > usage ? budget - usage : uint64_t {0};
 	return std::max(local, available > system_reserve ? available - system_reserve : uint64_t {0});
+}
+
+MemoryBudget::LiveMarks GraphicContext::UpdateCacheMarks() {
+	const auto budget = GetTotalMemoryBudget();
+	const auto now_ms =
+	    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+	                              std::chrono::steady_clock::now().time_since_epoch())
+	                              .count());
+	std::scoped_lock lock(cache_marks_mutex);
+	// No budget before the allocator exists: the caches keep their initial marks.
+	if (budget != 0) {
+		(void)cache_marks.Update(budget, now_ms);
+	}
+	return cache_marks;
 }
 
 bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image,

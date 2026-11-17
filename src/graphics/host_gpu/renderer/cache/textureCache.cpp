@@ -44,6 +44,11 @@ constexpr uint64_t NumFramesBeforeRemoval = 16;
 // above the pressure mark, and its transient targets were deleted and created ~1,300 times a
 // second).
 constexpr uint64_t NumFramesBeforePressureRemoval = 1;
+// Above the device memory usage limit (MemoryBudget::UsageLimit) the OS pages device memory over
+// the bus around each submission once the budget is passed, which costs far more than creating
+// images again: images unused for this many frames are deleted, oldest first, until usage is
+// back under the limit (the age-based passes above wait 80 to 160 frames for an image).
+constexpr uint64_t NumFramesBeforeOverLimitRemoval = 16;
 // Submissions an image an overlapping image displaces must go unused before it is marked as
 // displaced (ResolveOverlap); titles submit hundreds of times per frame.
 constexpr uint64_t NumSubmissionsBeforeDisplacement = 32;
@@ -175,17 +180,26 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_buffer_cache(buffer_cache), m_readback_linear_images(Config::ReadbackLinearImagesEnabled()),
       m_readback_tiled_images(Config::ReadbackTiledImagesEnabled()),
       m_readback_storage_images(Config::ReadbackStorageImagesEnabled()) {
-	if (m_graphics.CanReportMemoryUsage()) {
-		constexpr int64_t GiB = 1024ll * 1024 * 1024;
-		const auto        budget =
-		    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
-		const auto threshold = std::min<int64_t>(budget, 8 * GiB);
-		m_pressure_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
-		m_critical_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
-		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
+	UpdateGcMarks();
+}
+
+void TextureCache::UpdateGcMarks() {
+	if (m_gc_marks_pinned || !m_graphics.CanReportMemoryUsage()) {
+		return;
 	}
+	const auto live = m_graphics.UpdateCacheMarks();
+	if (live.Generation() == m_gc_marks_generation) {
+		return;
+	}
+	m_gc_marks_generation = live.Generation();
+	const auto marks      = live.Texture();
+	m_trigger_gc_memory  = marks.trigger;
+	m_pressure_gc_memory = marks.pressure;
+	m_critical_gc_memory = marks.critical;
+	using MemoryBudget::MiB;
+	LOGF("TextureCache: device memory budget %" PRIu64 " MiB, collection marks %" PRIu64 "/%" PRIu64
+	     "/%" PRIu64 " MiB (trigger/pressure/critical)\n",
+	     live.Budget() / MiB, marks.trigger / MiB, marks.pressure / MiB, marks.critical / MiB);
 }
 
 TextureCache::~TextureCache() {
@@ -326,9 +340,15 @@ void TextureCache::DeleteImage(ImageId id) {
 			m_surface_metas.erase(metadata);
 		}
 	}
+	const auto released = image.AccountedSize();
 	UnregisterImage(id);
 	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { m_slot_images.erase(id); });
+		// The backing is released by the erase, once the commands that use it completed.
+		m_release_pending.fetch_add(released, std::memory_order_relaxed);
+		m_scheduler.DeferOperation([this, id, released] {
+			m_release_pending.fetch_sub(released, std::memory_order_relaxed);
+			m_slot_images.erase(id);
+		});
 	} else {
 		m_slot_images.erase(id);
 	}
@@ -815,8 +835,8 @@ void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
 	auto* merged = merged_id ? &cache.m_slot_images[merged_id] : nullptr;
 	// PS5 raw block images can span several packed BC mips. Transfer their complete
 	// guest bytes, including tail padding, before retiring the incompatible backing.
-	if (cached.SafeToDownload()) {
-		if (merged && merged->SafeToDownload() && !Publish(cache, *merged)) {
+	if (cached.HoldsCurrentContents()) {
+		if (merged && merged->HoldsCurrentContents() && !Publish(cache, *merged)) {
 			return;
 		}
 		if (!Publish(cache, cached)) {
@@ -1894,6 +1914,7 @@ void TextureCache::CommitGpuWrite(Image& image) {
 	image.MarkGpuModified();
 	image.buffer_written        = false;
 	image.native_kept           = false;
+	image.buffer_written_range  = {};
 	image.native_write_sequence = ++m_event_sequence;
 }
 
@@ -2168,8 +2189,12 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 			    !buffer.IsInBounds(association.info.data.address, association.info.data.size)) {
 				continue;
 			}
-			m_texture_cache.DownloadStencil(association, buffer,
-			                                buffer.Offset(association.info.data.address));
+			// A stencil plane is memory of its own: its association records the buffer writes.
+			KeepBufferWrittenBytes(
+			    buffer, association.BufferWrittenRange(), association.info.data, [&] {
+				    m_texture_cache.DownloadStencil(association, buffer,
+				                                    buffer.Offset(association.info.data.address));
+			    });
 			return true;
 		}
 		return false;
@@ -2205,8 +2230,57 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 		return false;
 	}
 	ForgetColorMetadataChecks(image.info.data.address, copy_size);
-	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, levels);
+	KeepBufferWrittenBytes(
+	    buffer, image.BufferWrittenRange(), {image.info.data.address, copy_size},
+	    [&] { m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, levels); });
 	return true;
+}
+
+template <typename Download>
+void BufferCache::KeepBufferWrittenBytes(Buffer& buffer, GuestRange written, GuestRange copied,
+                                         Download&& download) {
+	// Buffer writes since the image's last native write may have produced newer bytes than the
+	// image in `written` (Image::BufferWrittenRange; the Nanite culling queue state of Saros
+	// lives in transient memory a GPU-written image also covers). The image's texels land
+	// everywhere else, those bytes are put back over them.
+	const auto begin = std::max(written.address, copied.address);
+	const auto end   = std::min(written.End(), copied.End());
+	if (written.size == 0 || begin >= end) {
+		download();
+		return;
+	}
+	const auto size  = end - begin;
+	auto       saved = GetUtilityBuffer(MemoryUsage::Stream).MapDownload(size, 4);
+	m_scheduler.EndRendering();
+	auto&             command = m_scheduler.Current();
+	vk::MemoryBarrier to_transfer {};
+	to_transfer.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	to_transfer.dstAccessMask =
+	    vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                                 vk::PipelineStageFlagBits::eTransfer, {}, 1, &to_transfer, 0,
+	                                 nullptr, 0, nullptr);
+	const vk::BufferCopy save {buffer.Offset(begin), saved.offset, size};
+	command.Handle().copyBuffer(buffer.Handle(), saved.buffer->Handle(), 1, &save);
+	download();
+	m_scheduler.EndRendering();
+	auto& restore_command = m_scheduler.Current();
+	restore_command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                                         vk::PipelineStageFlagBits::eTransfer, {}, 1,
+	                                         &to_transfer, 0, nullptr, 0, nullptr);
+	const vk::BufferCopy restore {saved.offset, buffer.Offset(begin), size};
+	restore_command.Handle().copyBuffer(saved.buffer->Handle(), buffer.Handle(), 1, &restore);
+	vk::MemoryBarrier to_all {};
+	to_all.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	to_all.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	restore_command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                                         vk::PipelineStageFlagBits::eAllCommands, {}, 1,
+	                                         &to_all, 0, nullptr, 0, nullptr);
+	if (saved.owner) {
+		// A range larger than the stream ring got a buffer of its own: it lives until the copies
+		// complete.
+		m_scheduler.DeferOperation([owner = std::move(saved.owner)] {});
+	}
 }
 
 bool TextureCache::CanDownloadStencil(const Image& association) const {
@@ -2275,10 +2349,27 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 		}
 		m_page_manager.UpdatePageWatchers<true, true>(range.address, range.size);
 	}
+	// The bytes buffer writes produced since the image's last native write are newer than the
+	// image there (Image::buffer_written): only the rest of the image lands in guest memory.
+	const auto kept = image.BufferWrittenRange();
 	m_scheduler.DeferPriorityOperation(
-	    [this, download = std::move(download), range, trapped = m_readback_storage_images] {
+	    [this, download = std::move(download), range, kept, trapped = m_readback_storage_images] {
 		    download.buffer->Invalidate(download.offset, range.size);
-		    LibKernel::Memory::WriteBacking(range.address, download.mapped, range.size);
+		    const auto kept_begin = std::clamp(kept.address, range.address, range.End());
+		    const auto kept_end   = std::clamp(kept.End(), kept_begin, range.End());
+		    if (kept.size == 0) {
+			    LibKernel::Memory::WriteBacking(range.address, download.mapped, range.size);
+		    } else {
+			    if (kept_begin > range.address) {
+				    LibKernel::Memory::WriteBacking(range.address, download.mapped,
+				                                    kept_begin - range.address);
+			    }
+			    if (kept_end < range.End()) {
+				    LibKernel::Memory::WriteBacking(kept_end,
+				                                    download.mapped + (kept_end - range.address),
+				                                    range.End() - kept_end);
+			    }
+		    }
 		    if (trapped) {
 			    m_page_manager.UpdatePageWatchers<false, true>(range.address, range.size);
 			    // Priority operations run in queue order, so this write-back is the oldest.
@@ -2363,7 +2454,8 @@ bool TextureCache::MemorySharedWithOtherContents(ImageId id) {
 	return shared;
 }
 
-void TextureCache::PrepareGpuBufferWrite(uint64_t address, uint64_t size) {
+void TextureCache::PrepareGpuBufferWrite(uint64_t address, uint64_t size,
+                                         BufferWriteExtent extent) {
 	if (!GuestRange {address, size}.Valid()) {
 		return;
 	}
@@ -2375,13 +2467,21 @@ void TextureCache::PrepareGpuBufferWrite(uint64_t address, uint64_t size) {
 		auto&      image = m_slot_images[id];
 		const bool covered =
 		    address <= image.info.data.address && address + size >= image.info.data.End();
-		if (covered || !image.IsGpuModified()) {
+		// A conservative range (the extent of a written storage V#) that covers an image says
+		// nothing about which of its bytes the shader writes: written V#s of Saros cover
+		// GPU-written images 7,000-10,000 times a second, and they do not refresh the image.
+		if (!image.IsGpuModified() || (covered && extent == BufferWriteExtent::Conservative)) {
 			continue;
 		}
 		// The image holds its rendered contents only while no buffer write overlaps them; one
-		// that does (conservative write ranges included) leaves the image behind its memory.
+		// that does (conservative write ranges included) leaves the image behind its memory
+		// there: Image::buffer_written_range bounds the bytes such writes may have produced.
 		const bool current   = !image.buffer_written;
 		image.buffer_written = true;
+		image.NoteBufferWrite(address, size);
+		if (covered) {
+			continue;
+		}
 		// A displaced image's contents are superseded by the image that displaced it, and memory
 		// another image shares may hold that image's bytes instead.
 		if (!current || image.depth_id || image.displaced || !image.SafeToDownload() ||
@@ -2583,6 +2683,7 @@ void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
+		UpdateGcMarks();
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
 	ReleaseDisplaced(m_total_used_memory >= m_pressure_gc_memory);
@@ -2662,6 +2763,9 @@ void TextureCache::RunGarbageCollector() {
 	if (m_total_used_memory >= m_critical_gc_memory) {
 		collect(true);
 	}
+	if (const auto heaps = m_graphics.SampleMemoryHeaps(); heaps.device.budget != 0) {
+		evicted += CollectOverLimit(tick, MemoryBudget::UsageLimit(heaps.device.budget));
+	}
 	m_gc_evicted += evicted;
 	if (m_total_used_memory >= m_pressure_gc_memory) {
 		const auto now = std::chrono::steady_clock::now();
@@ -2676,6 +2780,78 @@ void TextureCache::RunGarbageCollector() {
 			m_gc_evicted = 0;
 		}
 	}
+}
+
+size_t TextureCache::CollectOverLimit(uint64_t tick, uint64_t limit) {
+	// Images deleted earlier release their memory only when their deferred destruction runs, about
+	// a frame later, and the sampled usage still holds them until then: without them in the
+	// deficit, each collection would evict the same bytes again. The images this collection frees
+	// leave m_total_used_memory at once.
+	const auto pending =
+	    std::min(m_release_pending.load(std::memory_order_relaxed), m_total_used_memory);
+	limit = limit > UINT64_MAX - pending ? UINT64_MAX : limit + pending;
+	if (m_total_used_memory <= limit) {
+		return 0;
+	}
+	// Backings kept for reuse go first, but only as many bytes as the deficit: the pool absorbs
+	// the transient targets deleted and created again each frame. Idle tiling scratch next.
+	m_total_used_memory -=
+	    std::min(m_total_used_memory, m_graphics.TrimRecycledImages(m_total_used_memory - limit));
+	m_tiler.ReleaseScratch();
+	std::vector<ImageId> candidates;
+	m_lru_cache.ForEachItemBelow(tick - std::min(NumFramesBeforeOverLimitRemoval, tick),
+	                             [&](ImageId id) { candidates.push_back(id); });
+	size_t               evicted = 0;
+	std::vector<ImageId> written_back;
+	for (const auto id: candidates) {
+		if (m_total_used_memory <= limit) {
+			break;
+		}
+		auto* owner = m_slot_images.try_get(id);
+		if (owner == nullptr || !owner->registered || owner->depth_id) {
+			continue;
+		}
+		if (owner->heap_refs.load(std::memory_order_relaxed) != 0u) {
+			TouchImage(*owner);
+			continue;
+		}
+		// A displaced image is never written back: an overlapping image superseded its contents.
+		// Once unused for NumFramesBeforeRemoval frames, ResolveOverlap deletes it without
+		// write-back the next time an overlapping image is looked up; over the limit it goes now
+		// (otherwise no collector frees it, and the old end of the LRU fills up with them).
+		const bool superseded = owner->displaced && FramesUnused(*owner) > NumFramesBeforeRemoval;
+		if (owner->SafeToDownload() && !superseded) {
+			if (!owner->info.HasStencil()) {
+				written_back.push_back(id);
+			}
+			continue;
+		}
+		FreeImage(id);
+		evicted++;
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
+	}
+	uint64_t written = 0;
+	for (const auto id: written_back) {
+		if (m_total_used_memory <= limit || written >= m_over_limit_write_back_bytes) {
+			break;
+		}
+		auto* owner = m_slot_images.try_get(id);
+		if (owner == nullptr || !owner->registered || !owner->SafeToDownload()) {
+			continue;
+		}
+		// Only a completed write-back costs the quota: an image DownloadImageMemory refuses
+		// (displaced, multisampled, compressed metadata, ...) stays at the old end of the LRU and
+		// would otherwise use it up before any image that can be written back is reached.
+		const auto size = owner->AccountedSize();
+		if (!DownloadImageMemory(id)) {
+			continue;
+		}
+		written += size;
+		FreeImage(id);
+		evicted++;
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
+	}
+	return evicted;
 }
 
 void TextureCache::ProcessDownloadImages() {
