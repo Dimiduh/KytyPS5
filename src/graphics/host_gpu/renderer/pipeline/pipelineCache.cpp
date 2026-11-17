@@ -8,6 +8,7 @@
 #include "common/liveControl.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/systemInfo.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -66,8 +67,13 @@ constexpr auto DriverCacheSaveInterval = std::chrono::minutes {5};
 Common::LiveControl::Switch g_warm_pipelines("warm_pipelines", 1);
 // 1: the code-only modules of the created compute shaders (those of the game's files among them)
 // are translated in the background from the boot and kept for their first use
-// (ProgramCache::StartPreparation); 0: such a shader is translated at its first use.
-Common::LiveControl::Switch g_prepare_created("prepare_created", 1);
+// (ProgramCache::StartPreparation); 0: such a shader is translated at its first use (about
+// 13 ms then, its pipeline comes from the driver cache either way). 2, the default: as 1 on a PC
+// with more than PrepareCreatedMemoryMiB of RAM, as 0 on one with less. The translations of a
+// whole game stay in memory until they are used: for the 12,700 of Saros a session holds 6.6 GB
+// more (23.1 GB against 16.5 GB at one spot), which a PC with 32 GB does not have to spare.
+Common::LiveControl::Switch g_prepare_created("prepare_created", 2);
+constexpr uint64_t          PrepareCreatedMemoryMiB = 40ull * 1024;
 // 1: a compute dispatch that a module reading its formats at run time serves (a shader's
 // code-only module, which the precompile built for every shader of the game) gets the module of
 // its own formats translated and its pipeline built in the background, and later dispatches
@@ -842,7 +848,17 @@ struct PipelineCache::ProgramCache {
 		// by the game, or imported from its files): their code-only module is translated too,
 		// after everything recorded, so that a first use it serves takes it instead of
 		// translating the shader then.
-		if (code_only_records && g_prepare_created.On()) {
+		const auto memory          = Common::PhysicalMemoryMiB();
+		const bool prepare_created = g_prepare_created.Get() == 2
+		                                 ? memory == 0 || memory > PrepareCreatedMemoryMiB
+		                                 : g_prepare_created.On();
+		if (code_only_records && !prepare_created && g_prepare_created.Get() == 2) {
+			PipelineCacheLog("Programs prepared ahead: the compute shaders no session has used are "
+			                 "translated at their first use on this PC ({} GB of RAM; "
+			                 "KYTY_PREPARE_CREATED=1 translates them all ahead)",
+			                 memory / 1024);
+		}
+		if (code_only_records && prepare_created) {
 			uint64_t position = uint64_t {1} << 32u;
 			for (auto& record: code_only_records()) {
 				ProgramKey             key;
@@ -2701,6 +2717,7 @@ void PipelineCache::InstallOptimizedPipelines() {
 		m_next_timeout_check = now + std::chrono::seconds {5};
 		CheckPrecompileTimeouts();
 		UpdatePrecompileThreads();
+		ReleaseWarmPipelinesUnderPressure();
 	}
 	// Sessions usually end without a save: the coverage is also logged once a minute.
 	if (m_pipeline_manifest != nullptr && now >= m_next_coverage_report) {
@@ -3115,7 +3132,8 @@ void PipelineCache::EnqueuePrecompileJob(uint64_t key, std::string label, Precom
 		}
 		// The optimized pipeline of a recorded or listed build is kept for its first use.
 		const bool   keep = mode == PipelineBuildMode::Precompile && !m_precompile_only &&
-		                    order < PrecompileCreatedOrder && g_warm_pipelines.On();
+		                    order < PrecompileCreatedOrder && g_warm_pipelines.On() &&
+		                    !m_warm_released.load(std::memory_order_relaxed);
 		KeptPipeline kept;
 		// A build that ends the process or never finishes leaves an unfinished attempt, so
 		// that later runs skip it (PrecompileAttempts).
@@ -3263,6 +3281,32 @@ void PipelineCache::UpdatePrecompileThreads() {
 		                 : m_game_rendering ? "the game renders"
 		                                    : "no recorded build is left");
 	}
+}
+
+// The pipelines kept for their first use (WarmPipelines) live in device memory: about 0.8 GB
+// for the 3,700 a Saros session keeps. A first use without one costs a few milliseconds (the
+// driver cache provides the pipeline); device memory over its usage limit costs the frame
+// rate, and past the budget it ends in a lost device. So they go, and no more are kept, once
+// usage comes within warm_headroom_mb of the limit (MemoryBudget::UsageLimit).
+static Common::LiveControl::Switch g_warm_headroom_mb("warm_headroom_mb", 768);
+
+void PipelineCache::ReleaseWarmPipelinesUnderPressure() {
+	if (m_warm_released.load(std::memory_order_relaxed)) {
+		return;
+	}
+	const auto headroom = uint64_t {g_warm_headroom_mb.Get()} << 20u;
+	const auto heaps    = m_graphics.SampleMemoryHeaps();
+	if (heaps.device.budget == 0 ||
+	    heaps.device.usage + headroom <= MemoryBudget::UsageLimit(heaps.device.budget)) {
+		return;
+	}
+	m_warm_released.store(true, std::memory_order_relaxed);
+	const auto counts = m_warm_pipelines.GetCounts();
+	m_warm_pipelines.Clear();
+	PipelineCacheLog("Pipelines the precompile kept ready: {} released and no more kept, device "
+	                 "memory is near its limit ({} of {} MiB used)",
+	                 counts.kept - counts.taken, heaps.device.usage >> 20u,
+	                 heaps.device.budget >> 20u);
 }
 
 void PipelineCache::EndPrecompileForExit() {

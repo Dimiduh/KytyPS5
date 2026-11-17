@@ -449,6 +449,9 @@ private:
 	// What the precompile of this session built for recorded programs and pipelines, for their
 	// first use (CreatePipelineInternal takes from it). Not with --precompile-only.
 	WarmPipelines m_warm_pipelines;
+	// Device memory came near its limit: the kept pipelines were released and none is kept any
+	// more (ReleaseWarmPipelinesUnderPressure).
+	std::atomic<bool> m_warm_released {false};
 	// The precompile run has finished: the driver cache is written at the next checkpoint
 	// instead of at the next save interval.
 	std::atomic<bool> m_precompile_save_due {false};
@@ -552,6 +555,7 @@ private:
 	// Boot threads while recorded or listed builds are left (or were queued less than a while
 	// ago) and the game is not rendering steadily, else the steady thread count.
 	void        UpdatePrecompileThreads();
+	void        ReleaseWarmPipelinesUnderPressure();
 	void        QueueResolved(PipelineListResolver::Resolved resolved);
 	void        ImportPipelineList();
 	void        SetCreatedCode(std::unique_ptr<ShaderCodeStore> store);

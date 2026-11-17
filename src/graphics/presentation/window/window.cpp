@@ -919,7 +919,8 @@ int WindowPrecompilePipelines() {
 	// builds), next to the few GB the pass and the rest of the PC hold anyway.
 	const auto asked     = Config::PrecompileThreads();
 	const auto cpus      = Common::Thread::AvailableProcessors();
-	const auto memory    = static_cast<uint32_t>(std::max(SDL_GetSystemRAM(), 0)); // MiB; 0: unknown
+	const auto memory    = static_cast<uint32_t>(
+	    std::min<uint64_t>(Common::PhysicalMemoryMiB(), UINT32_MAX)); // MiB; 0: unknown
 	const auto by_memory = memory == 0 ? 64u : memory > 7680u ? (memory - 6144u) / 700u : 2u;
 	const auto threads =
 	    asked != UINT32_MAX ? asked : std::clamp(std::min(cpus > 2u ? cpus - 2u : 1u, by_memory), 1u, 64u);
