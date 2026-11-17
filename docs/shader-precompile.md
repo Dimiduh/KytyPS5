@@ -24,6 +24,10 @@ graphics stages and 85 graphics pipelines.
    (`_PipelineCache/<title>.v5.programs`, `.v7.pipelines`). The next start translates the
    recorded programs on helper threads and builds the recorded pipelines into the driver cache
    before they are needed. A place you have been costs nothing the second time.
+   On a card with a video memory budget under 13 GiB (12 GB and less) a session leaves the
+   pipeline builds out, because they keep about 1.6 GB of video memory: run the precompile pass
+   before play, and a pipeline then comes from the driver cache at its first use.
+   `KYTY_SESSION_PRECOMPILE=1` builds them beside the game all the same.
 2. **A pipeline list** (`pipeline-lists/<title>.pipelinelist`): somebody else's recordings,
    without any game code. See `pipeline-lists/README.md`.
 3. **Every compute shader of the game** (`shader-seeds/<title>.seeds`, see

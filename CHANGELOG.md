@@ -96,6 +96,23 @@ with them; other places and machines will differ.
   video memory, and the background builds at the start of a session leave 0.9 to 2.6 GB
   behind in the driver: when video memory comes near its limit the kept pipelines are
   released and the builds not started yet are left undone.
+- **The table that tells shaders where a buffer lives takes the video memory it needs** (after
+  the DS fork). It has an entry for every 16 KiB of the game's address space and was made whole:
+  768 MiB of video memory on every card, nearly all of it zeros. It now starts at 64 MiB and
+  grows to the highest buffer the game registers, 336 MiB in Saros: video memory in use at a
+  test spot went from 8.1 to 7.7 GB. `KYTY_BDA_TABLE_GIB=0` keeps it whole.
+- **A card short of video memory does not build pipelines beside the game.** Those builds keep
+  about 1.6 GB of video memory at a heavy spot (the pipelines held ready, and what the driver
+  keeps of each pipeline it made), and giving them up later does not give the memory back. With
+  a video memory budget under 13 GiB (cards of 12 GB and less) a session leaves them out: what a
+  precompile pass built comes from the driver cache at its first use, anything else is compiled
+  then. `KYTY_SESSION_PRECOMPILE=1` builds them on any card, `=0` on none.
+- **A buffer is made in video memory even when the budget is used up**, and in system memory
+  only when the card has none left. Before, the allocator put it in system memory without a
+  word once the budget was reached, where the GPU reads it over the bus at every draw until the
+  game is restarted (seen on the DS fork). The log warns when it happens all the same.
+- The allocator takes video memory in blocks of 64 MiB instead of 256 MiB on cards with less
+  than 13 GiB (from the DS fork, where it gave 2 to 6% on a card of 8 GB; not measured here).
 - **A session no longer writes the shader cache again when nothing was added to it.** After a
   precompile pass every session wrote the whole file twice (2 GB for Saros, and as much memory
   for the copy while it did).
@@ -135,6 +152,10 @@ unmodified `saros` branch gave 37 fps and the first batch of changes below 47.9.
 - **No barrier between storage writes that draws repeat** (from the DS fork): 30.2 to 31.1 fps.
 - **A read that no pending label can touch skips the label list's lock**: about 1 ms less CPU a
   frame.
+- **Address ranges are kept in blocks of sorted intervals instead of a tree** (from the DS fork):
+  the sets of GPU-written, pending and mapped ranges took 3.3% of the GPU thread at the heavy
+  spot and take 1.1%; 24.3 to 23.6–24.0 ms of that thread a frame at 50%. The frame rate moved
+  within what two runs differ by (40.4–40.7 before, 40.1–41.6 after).
 - The GPU thread runs above the game's own threads.
 
 ### Readbacks (the game reading what the GPU wrote)
@@ -173,6 +194,14 @@ environment variable `KYTY_<NAME>` at start.
   `measure <seconds>` reports fps, frame times, GPU time and per-frame counters; `prof` samples a
   thread and can look inside one function; `set <switch> <value>` flips a switch; `mem` searches,
   reads and writes the game's memory; `pad` and `stick` send controller input.
+- **A performance log of a whole play session** (`KYTY_PERF_LOG=<seconds>`, for example
+  `KYTY_PERF_LOG=10` in the launcher's Environment field): every such window of play writes one
+  `Perf <time of day> ...` line with the numbers of `measure` into the log, so a session played
+  through any part of the game says afterwards where it was slow and whether the CPU or the GPU
+  was the limit there. Windows without a frame (loading) are left out.
+- **A card with less video memory, for tests on a bigger one** (`KYTY_SIMULATE_VRAM_MB=<n>`, from
+  the DS fork): the rest of the card's memory is taken at start and kept, so the driver and
+  Windows treat the game as on a card of n MiB.
 - **An upload worker** for buffer synchronization exists behind `async_upload` and is off: it did
   not pay on Saros.
 - `build-windows.cmd` can build with profiling symbols and with a locally trained PGO profile.
@@ -181,6 +210,12 @@ environment variable `KYTY_<NAME>` at start.
 
 - Table mode of the DS fork is not ported: as written it takes only draws without bound vertex
   buffers, which is 3% of Saros's draws. Its ideas that carry over are in the list above.
+- The DS fork's merged page protections are not ported: they join protections of adjacent
+  pages that follow each other, of which Demon's Souls has about 110 a frame and Saros one.
+- Cards of 12 GB and less are not confirmed. With the rest of a 24 GB card taken away
+  (`KYTY_SIMULATE_VRAM_MB=12288`, on a desktop whose other programs held 5 GB of it) Saros ran
+  at 20 fps at 100% 3D resolution and at 52 fps at 50%, where the whole card gives 53 and 60:
+  Windows kept 1.3 to 2 GB of the game's video memory in system memory.
 - DLSS Super Resolution is not included; the game's own upscaler makes the picture.
 - A shader that reads the resident texture table is another compiled variant than before. It is
   built at first use in each part of the game and cached from then on.
