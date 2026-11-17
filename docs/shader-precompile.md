@@ -53,8 +53,15 @@ graphics stages and 85 graphics pipelines.
    pipelines have one, and each new one used to stop the game for 0.1 to 0.9 s); what it would
    have written is missing for those frames, like the draw's picture.
 
-Run the pass once after installing, after an emulator update that changes shaders, and after a
-graphics driver update:
+The pass has to run once after installing, after an emulator update, after a new list of
+shaders and after a graphics driver update. The launcher does that by itself before the game
+starts ("Before playing" on its Shaders page, on by default; `run-windows.ps1 -PrecompileFirst
+on`): a finished pass leaves a stamp in the data folder (`_PipelineCache\precompile-stamp.txt`:
+the emulator, the game, the shader lists and the graphics driver it was for), and a start that
+finds another stamp, or none, runs the pass in its window first and then starts the game. A
+data folder is one such unit: a new one, or a cache copied in from elsewhere, has no finished
+pass. Closing the pass's window starts the game at once, with the rest built as it runs; the
+next start goes on with the pass. By hand:
 
 ```
 .\run-windows.ps1 -Precompile -Game <game>

@@ -80,6 +80,13 @@ with them; other places and machines will differ.
 
 - **Precompile pass** (`run-windows.ps1 -Precompile`, or the launcher's button): builds everything
   known for the game into the driver's cache and exits.
+- **The pass runs by itself before the game starts when it has to** (launcher switch "Before
+  playing", on by default; `run-windows.ps1 -PrecompileFirst on`). A data folder keeps a stamp
+  of its last finished pass: the emulator, the game, the shader lists and the graphics driver
+  it was for. A start that finds another stamp, or none, builds first and then starts the
+  game. Before this, a game started in a folder whose shaders were not built compiled them
+  while it ran: one such session stalled for 9.3 s in its first seven minutes, a second at the
+  longest. Closing the pass's window starts the game at once.
 - **The whole game's compute shaders**, taken from the game's own files (`--import-shaders`,
   `shader-seeds/`), not only the ones an earlier session met. The precompile pass reads them out
   of an Unreal Engine 5 game by itself the first time it runs (a few seconds for Saros: 37,545
@@ -87,7 +94,10 @@ with them; other places and machines will differ.
   2026-11-16 could not do this yet: without a seeds file made by hand, its pass built only what
   sessions had recorded and the Saros lists.
 - **Pipeline lists** (`pipeline-lists/`): recordings shared without any game code; a list for Saros
-  is included.
+  is included. The list of 2026-11-17 has 13,970 compute programs and 961 graphics pipelines
+  (12,655 and 610 before): the recordings of every session since, three starts of a new game
+  among them. `-ExportPipelineList` now adds a data folder's recordings to the list instead of
+  writing them alone.
 - **Shader pairs** (`shader-pairs/`): vertex and pixel shaders likely to be drawn together are
   built ahead; a list for Saros is included.
 - **At every start**, the recorded programs are translated on helper threads and recorded
