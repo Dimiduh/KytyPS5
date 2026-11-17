@@ -119,6 +119,16 @@ with them; other places and machines will differ.
 - **The log names the PC's memory**: RAM, free RAM and what can still be committed, at the
   start and again with a fatal error. Running out of memory shows as many things (a lost
   graphics device, a crash inside the game); a report can now be checked for it.
+- **A fatal error where the game reuses the address of a 3D render target is fixed** (from a
+  player's report, `unresolvable equal-address image overlap`). Saros places a deeper 3D render
+  target of another width where a smaller one was, with the same row length; the emulator knew
+  the deeper one only when the width was the same. The larger image now takes over what the
+  smaller one holds. The message of the cases still not handled names both images' sizes.
+- **A lost graphics device leaves a record.** With the driver's `VK_EXT_device_fault` the log,
+  and the launcher's log, say how full video memory was and what the driver recorded: the
+  address the GPU faulted on, or none (the GPU stopped answering and Windows reset it).
+  `KYTY_DEVICE_FAULT=0` leaves the extension off. Not seen at work yet: no device was lost
+  here.
 - With 12 GB of video memory or 16 GB of RAM Saros is still at the edge; a lower 3D resolution
   and no frame generation leave more room.
 
@@ -230,6 +240,12 @@ environment variable `KYTY_<NAME>` at start.
   (`KYTY_SIMULATE_VRAM_MB=12288`, on a desktop whose other programs held 5 GB of it) Saros ran
   at 20 fps at 100% 3D resolution and at 52 fps at 50%, where the whole card gives 53 and 60:
   Windows kept 1.3 to 2 GB of the game's video memory in system memory.
+- Three reports of a lost graphics device are not explained: one on the first test build, two on
+  the build of 2026-11-17c (an RTX 4070 with frame generation, less than a minute into a
+  session, with 8.4 GB of its 11.8 GB video memory budget in use; another PC without frame
+  generation about ten minutes in, whose log names neither the card nor its memory). Not
+  reproduced here: two boots with frame generation on a 24 GB card with 8 to 9 GB of it taken
+  away ran without one. The next report will carry the driver's fault record (see above).
 - DLSS Super Resolution is not included; the game's own upscaler makes the picture.
 - A shader that reads the resident texture table is another compiled variant than before. It is
   built at first use in each part of the game and cached from then on.
