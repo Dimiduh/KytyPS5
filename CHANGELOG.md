@@ -93,8 +93,15 @@ with them; other places and machines will differ.
   against 16.5 GB at one spot): it is done on a PC with more than 40 GB of RAM, and left to
   the first use (about 13 ms each) on one with less; `KYTY_PREPARE_CREATED=1` or `=0` decides
   it by hand. The pipelines a session keeps ready for their first use take about 0.7 GB of
-  video memory: they are released, and no more are kept, when video memory comes near its
-  limit.
+  video memory, and the background builds at the start of a session leave 0.9 to 2.6 GB
+  behind in the driver: when video memory comes near its limit the kept pipelines are
+  released and the builds not started yet are left undone.
+- **A session no longer writes the shader cache again when nothing was added to it.** After a
+  precompile pass every session wrote the whole file twice (2 GB for Saros, and as much memory
+  for the copy while it did).
+- **The log names the PC's memory**: RAM, free RAM and what can still be committed, at the
+  start and again with a fatal error. Running out of memory shows as many things (a lost
+  graphics device, a crash inside the game); a report can now be checked for it.
 - With 12 GB of video memory or 16 GB of RAM Saros is still at the edge; a lower 3D resolution
   and no frame generation leave more room.
 
