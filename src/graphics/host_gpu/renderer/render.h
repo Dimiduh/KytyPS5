@@ -32,6 +32,10 @@ class UserConfig;
 class Shader;
 } // namespace HW
 
+namespace FrameGen {
+struct UpscalerPass;
+} // namespace FrameGen
+
 struct GraphicContext;
 struct DrawCallInfo;
 struct DrawEmitInfo;
@@ -461,8 +465,20 @@ private:
 	[[nodiscard]] bool TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	                                        CommandBuffer& command, uint32_t group_x,
 	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
+	// `any_size`: Dlss::Choose.
 	[[nodiscard]] bool        Upscale(vk::CommandBuffer command, const Pssr::Request& request,
-	                                  Dlss::Inputs& inputs);
+	                                  Dlss::Inputs& inputs, bool any_size = false);
+	// The last pass of the game's own temporal upscaler: whether it is left out of this frame
+	// (SkipsGamePass), and, in its place or right after it, the emulator's upscaler making the
+	// frame's picture (`skipped`: the pass was left out).
+	[[nodiscard]] bool SkipsGamePass(const FrameGen::UpscalerPass& pass) const;
+	void UpscaleGameFrame(CommandBuffer& buffer, const PreparedBindings& bindings,
+	                      const FrameGen::UpscalerPass& pass, uint64_t shader_hash, bool skipped);
+	// `source` scaled linearly into `destination` (both in GENERAL); binds its own pipeline.
+	// `channels`: for each of the destination's first three, the source's (4: none).
+	void ScaleLinear(vk::CommandBuffer command, vk::ImageView source, vk::Extent2D source_size,
+	                 vk::ImageView destination, vk::Extent2D destination_size,
+	                 const std::array<uint32_t, 4>& channels);
 
 	// A null feature is one the upscaler refused or failed.
 	struct UpscalerContext {
@@ -492,6 +508,9 @@ private:
 	vk::PipelineLayout                    m_pssr_pipeline_layout   = nullptr;
 	vk::Pipeline                          m_pssr_pipeline          = nullptr;
 	std::vector<UpscalerContext>          m_upscaler_contexts;
+	uint64_t                              m_game_upscaler_logged = 0; // UpscaleGameFrame's last log line
+	// The render size (width << 32 | height) of the last frame the upscaler took; 0: none.
+	uint64_t m_game_upscaler_taken = 0;
 	std::array<MipStatsCounter, 256>      m_mip_stats {};
 	// Bindless state: whether the placeholder slot (every unresolved key) holds the null
 	// descriptor, the image resource each heap's T#s are decoded as, and the texture cache

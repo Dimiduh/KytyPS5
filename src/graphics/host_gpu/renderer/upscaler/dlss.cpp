@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/upscaler/dlss.h"
 
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "graphics/guest_gpu/pssr.h"
@@ -10,9 +11,12 @@
 #include <SDL3/SDL_loadso.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <filesystem>
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h>
@@ -66,13 +70,49 @@ Api               g_api {};
 VkDevice          g_device       = nullptr;
 Parameter*        g_capabilities = nullptr;
 Parameter*        g_parameters   = nullptr;
+// The pictures an upscaler made, and the submission the last one was recorded for (Evaluations).
+std::atomic<uint64_t> g_evaluations {0};
+std::atomic<uint64_t> g_evaluation_tick {0};
 
 bool Succeeded(Result result) {
 	return (static_cast<uint32_t>(result) & 0xfff00000u) != 0xbad00000u;
 }
 
 void Warn(std::string_view text) {
-	Log::WriteToConsoleAndLog(fmt::format("WARNING: DLSS: {}; PSSR scales linearly.\n", text));
+	Log::WriteToConsoleAndLog(
+	    fmt::format("WARNING: DLSS: {}; {}.\n", text,
+	                Config::Ps5ProEnabled() ? "PSSR scales linearly"
+	                                        : "the game's own upscaler makes the picture"));
+}
+
+// The folder with the model (nvngx_dlss.dll, NVIDIA's own file, which the emulator does not
+// ship): --dlss-folder, else where frame generation finds NVIDIA's Streamline runtime, which has
+// it too (KYTY_STREAMLINE_DIR, a "streamline" folder next to the emulator, the SDK unpacked
+// beside a local build; a folder may be the SDK's own, its bin\x64 is taken). Empty: none.
+std::filesystem::path ModelFolder() {
+	std::filesystem::path found = Config::GetDlssFolder();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (found.empty()) {
+		std::vector<std::filesystem::path> candidates;
+		wchar_t                            exe[MAX_PATH] {};
+		GetModuleFileNameW(nullptr, exe, MAX_PATH);
+		const auto exe_dir = std::filesystem::path(exe).parent_path();
+		if (const wchar_t* env = _wgetenv(L"KYTY_STREAMLINE_DIR"); env != nullptr && *env != L'\0') {
+			candidates.emplace_back(env);
+		}
+		candidates.push_back(exe_dir / "streamline");
+		candidates.push_back(exe_dir.parent_path() / "deps" / "streamline" / "sdk");
+		for (const auto& candidate: candidates) {
+			for (const auto& tried: {candidate, candidate / "bin" / "x64"}) {
+				std::error_code error;
+				if (found.empty() && std::filesystem::exists(tried / "nvngx_dlss.dll", error)) {
+					found = tried;
+				}
+			}
+		}
+	}
+#endif
+	return found;
 }
 
 void OpenCore() {
@@ -120,7 +160,7 @@ bool Takes(const Creation& creation, const Pssr::Request& request, const Inputs&
 }
 
 std::optional<Creation> Choose(Parameter& capabilities, const Pssr::Request& request,
-                               const Inputs& inputs) {
+                               const Inputs& inputs, bool any_size) {
 	void* callback = nullptr;
 	if (!Succeeded(capabilities.Get("DLSSOptimalSettingsCallback", &callback)) ||
 	    callback == nullptr) {
@@ -136,6 +176,9 @@ std::optional<Creation> Choose(Parameter& capabilities, const Pssr::Request& req
 	std::optional<Creation> best;
 	uint32_t                best_distance = 0;
 	const uint32_t          flags         = request.flags & FIXED_FLAGS;
+	// (By its optimal size, whether it takes the request or not.)
+	int      nearest_mode     = -1;
+	uint32_t nearest_distance = 0;
 	for (int mode = 0; mode <= DLAA; ++mode) {
 		capabilities.Set("Width", inputs.output.width);
 		capabilities.Set("Height", inputs.output.height);
@@ -170,6 +213,20 @@ std::optional<Creation> Choose(Parameter& capabilities, const Pssr::Request& req
 			best          = creation;
 			best_distance = distance;
 		}
+		if (mode != DLAA && (nearest_mode < 0 || distance < nearest_distance)) {
+			nearest_mode     = mode;
+			nearest_distance = distance;
+		}
+	}
+	// A size no mode takes as it is (the modes take half the output's and more, the smallest one
+	// a third only): a feature of that one size, with the nearest mode's model. The library
+	// makes features of other sizes too (800x450 to 3840x2160 gave a picture); a sixth of the
+	// output is where this stops asking.
+	if (!best && any_size && nearest_mode >= 0 && request.width <= inputs.output.width &&
+	    request.height <= inputs.output.height && request.width * 6u >= inputs.output.width &&
+	    request.height * 6u >= inputs.output.height) {
+		best = Creation {inputs.output.width, inputs.output.height, flags,         nearest_mode,
+		                 request.width,       request.height,       request.width, request.height};
 	}
 	return best;
 }
@@ -222,11 +279,13 @@ void SetEvaluation(Parameter& parameters, const Pssr::Request& request, Inputs& 
 }
 
 void Load() {
-	if (!Config::Ps5ProEnabled() || Config::GetPssrUpscaler() != Config::PssrUpscaler::DLSS) {
+	// (PSSR's with --trinity; without, in place of the game's own upscaler:
+	// RenderExecutor::UpscaleGameFrame.)
+	if (Config::GetPssrUpscaler() != Config::PssrUpscaler::DLSS) {
 		return;
 	}
-	if (Config::GetDlssFolder().empty()) {
-		Warn("no model folder is set");
+	if (ModelFolder().empty()) {
+		Warn("no model folder is set (--dlss-folder: the folder of nvngx_dlss.dll)");
 		return;
 	}
 	OpenCore();
@@ -274,10 +333,10 @@ void Init(const GraphicContext& graphics, PFN_vkGetInstanceProcAddr get_instance
 		return;
 	}
 	// Static, since NGX may keep these pointers.
-	static const std::wstring      path = Config::GetDlssFolder().wstring();
+	static const std::wstring      path = ModelFolder().wstring();
 	static const wchar_t* const    paths[] {path.c_str()};
 	static const FeatureCommonInfo info {.paths = paths, .path_count = 1};
-	const auto                     folder = Common::PathToString(Config::GetDlssFolder());
+	const auto                     folder = Common::PathToString(ModelFolder());
 	if (const auto result = g_api.init(
 	        PROJECT_ID, ENGINE_CUSTOM, "1.0", paths[0], static_cast<VkInstance>(graphics.instance),
 	        static_cast<VkPhysicalDevice>(graphics.physical_device),
@@ -306,7 +365,10 @@ void Init(const GraphicContext& graphics, PFN_vkGetInstanceProcAddr get_instance
 		Shutdown();
 		return;
 	}
-	Log::WriteToConsoleAndLog(fmt::format("DLSS: upscaling PSSR with the model in {}\n", folder));
+	Log::WriteToConsoleAndLog(
+	    fmt::format("DLSS: upscaling {} with the model in {}\n",
+	                Config::Ps5ProEnabled() ? "PSSR" : "in place of the game's own upscaler",
+	                folder));
 }
 
 void Shutdown() {
@@ -330,7 +392,19 @@ Parameter* Capabilities() {
 	return g_capabilities;
 }
 
+void NoteEvaluation(uint64_t tick) {
+	g_evaluations.fetch_add(1, std::memory_order_relaxed);
+	g_evaluation_tick.store(tick, std::memory_order_relaxed);
+}
+
+std::pair<uint64_t, uint64_t> Evaluations() {
+	return {g_evaluations.load(std::memory_order_relaxed),
+	        g_evaluation_tick.load(std::memory_order_relaxed)};
+}
+
 Feature* CreateFeature(vk::CommandBuffer command, const Creation& creation) {
+	// (The library records into `command` itself, as in Evaluate.)
+	VulkanRecording::Drain();
 	SetCreation(*g_parameters, creation, Config::GetDlssPreset());
 	Feature* feature = nullptr;
 	if (const auto result = g_api.create(g_device, static_cast<VkCommandBuffer>(command),

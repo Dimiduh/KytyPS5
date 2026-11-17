@@ -556,9 +556,11 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	FindGpuWords(m_context, input_info.stage);
 	RebindBuffers(bindings);
 	FillGpuWords(m_context, buffer, input_info.stage, bindings);
-	if (FrameGen::Enabled()) {
+	std::optional<FrameGen::UpscalerPass> upscaler_pass;
+	if (FrameGen::CapturesInputs()) {
 		const uint32_t groups[] {thread_group_x, thread_group_y, thread_group_z};
 		FrameGen::FindInputs(program.shader_hash, resources, bindings, groups);
+		upscaler_pass = FrameGen::FindUpscalerPass(resources, program.info.images, bindings);
 	}
 
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
@@ -634,8 +636,12 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
 	                                   std::max(input_info.threads_num[1], 1u) *
 	                                   std::max(input_info.threads_num[2], 1u);
-	if ((mode & DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE) != 0 && program.info.uses_gds &&
-	    group_threads <= input_info.wave_size && !input_info.lds_storage) {
+	// The emulator's upscaler makes the picture in this pass' place (UpscaleGameFrame below):
+	// everything of the dispatch but its work.
+	const bool upscaler_instead = upscaler_pass && SkipsGamePass(*upscaler_pass);
+	if (upscaler_instead) {
+	} else if ((mode & DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE) != 0 && program.info.uses_gds &&
+	           group_threads <= input_info.wave_size && !input_info.lds_storage) {
 		// A single guest wave per group can run in launch order without a device-wide
 		// spinlock. Keep the guest workgroup IDs when splitting the dispatch.
 		for (uint32_t z = 0; z < thread_group_z; ++z) {
@@ -659,8 +665,12 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	} else {
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 	}
-	if (FrameGen::Enabled()) {
+	if (FrameGen::CapturesInputs()) {
 		FrameGen::CaptureInputs(m_context.GetGraphics(), m_context.GetTextureCache(), buffer);
+		if (upscaler_pass) {
+			UpscaleGameFrame(buffer, bindings, *upscaler_pass, program.shader_hash,
+			                 upscaler_instead);
+		}
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	// The guest clears color metadata with compute; the texture cache reads the clear code

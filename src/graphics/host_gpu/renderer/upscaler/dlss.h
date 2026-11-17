@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -80,8 +81,11 @@ inline constexpr uint32_t FIXED_FLAGS = Pssr::kReverseDepth | Pssr::kAutoExposur
 [[nodiscard]] bool                    Accepts(const Pssr::Request& request);
 [[nodiscard]] bool                    Takes(const Creation& creation, const Pssr::Request& request,
                                             const Inputs& inputs);
+// `any_size`: a render size no mode takes gets a feature of that one size (up to three times
+// smaller than the output); a title whose size changed from frame to frame would make a feature
+// each time.
 [[nodiscard]] std::optional<Creation> Choose(Parameter& capabilities, const Pssr::Request& request,
-                                             const Inputs& inputs);
+                                             const Inputs& inputs, bool any_size = false);
 void SetCreation(Parameter& parameters, const Creation& creation, uint32_t preset);
 void SetEvaluation(Parameter& parameters, const Pssr::Request& request, Inputs& inputs, bool reset);
 
@@ -100,6 +104,12 @@ void                     Shutdown();
 [[nodiscard]] bool     Evaluate(vk::CommandBuffer command, const Feature* feature,
                                 const Pssr::Request& request, Inputs& inputs, bool reset);
 void                   ReleaseFeature(Feature* feature);
+
+// For the record of a lost device (GraphicContext::LogLostDevice): an upscaler (DLSS or FSR)
+// recorded a picture for the submission `tick`; and how many it made and that last tick. A
+// device lost in another submission was not lost in the upscaler's commands.
+void                                        NoteEvaluation(uint64_t tick);
+[[nodiscard]] std::pair<uint64_t, uint64_t> Evaluations();
 
 } // namespace Libs::Graphics::Dlss
 

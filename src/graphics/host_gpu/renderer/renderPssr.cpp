@@ -1,4 +1,6 @@
 #include "common/assert.h"
+#include "common/liveControl.h"
+#include "common/logging/log.h"
 #include "common/threads.h"
 #include "gpu_blit_shaders/gpu_pssr_linear_spv.h"
 #include "graphics/guest_gpu/pssr.h"
@@ -7,11 +9,13 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/upscaler/frameGeneration.h"
 #include "graphics/host_gpu/renderer/upscaler/fsr.h"
 #include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
 #include <array>
+#include <cinttypes>
 #include <optional>
 
 namespace Libs::Graphics {
@@ -34,6 +38,11 @@ void MemoryBarrier(vk::CommandBuffer command) {
 	    vk::DependencyInfo {.memoryBarrierCount = 1, .pMemoryBarriers = &barrier});
 }
 
+// 0: the game's own upscaler makes the picture although the emulator's is loaded (a comparison).
+Common::LiveControl::Switch g_game_upscaler("game_upscaler", 1);
+// 0: the game's last pass runs although the emulator's upscaler makes the picture over it.
+Common::LiveControl::Switch g_game_upscaler_skip("game_upscaler_skip", 1);
+
 } // namespace
 
 RenderExecutor::~RenderExecutor() {
@@ -44,7 +53,7 @@ RenderExecutor::~RenderExecutor() {
 }
 
 bool RenderExecutor::Upscale(vk::CommandBuffer command, const Pssr::Request& request,
-                             Dlss::Inputs& inputs) {
+                             Dlss::Inputs& inputs, bool any_size) {
 	const auto release = [&](std::unique_ptr<Upscaler::Feature>& feature) {
 		if (feature != nullptr) {
 			m_context.GetCommandScheduler().DeferOperation(
@@ -56,7 +65,7 @@ bool RenderExecutor::Upscale(vk::CommandBuffer command, const Pssr::Request& req
 	bool reset = (request.flags & Pssr::kReset) != 0;
 	if (context == m_upscaler_contexts.end() || !Dlss::Takes(context->creation, request, inputs)) {
 		// A render size the upscaler can't take scales linearly.
-		const auto creation = Upscaler::Choose(request, inputs);
+		const auto creation = Upscaler::Choose(request, inputs, any_size);
 		if (!creation) {
 			return false;
 		}
@@ -84,7 +93,212 @@ bool RenderExecutor::Upscale(vk::CommandBuffer command, const Pssr::Request& req
 		return false;
 	}
 	MemoryBarrier(command);
+	Dlss::NoteEvaluation(m_context.GetCommandScheduler().CurrentTick());
 	return true;
+}
+
+void RenderExecutor::ScaleLinear(vk::CommandBuffer command, vk::ImageView source,
+                                 vk::Extent2D source_size, vk::ImageView destination,
+                                 vk::Extent2D destination_size,
+                                 const std::array<uint32_t, 4>& channels) {
+	auto& graphics = m_context.GetGraphics();
+	if (m_pssr_pipeline == nullptr) {
+		const std::array bindings {
+		    vk::DescriptorSetLayoutBinding {0, vk::DescriptorType::eSampledImage, 1,
+		                                    vk::ShaderStageFlagBits::eCompute},
+		    vk::DescriptorSetLayoutBinding {1, vk::DescriptorType::eStorageImage, 1,
+		                                    vk::ShaderStageFlagBits::eCompute}};
+		vk::DescriptorSetLayoutCreateInfo descriptor_info {};
+		descriptor_info.flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+		descriptor_info.bindingCount = bindings.size();
+		descriptor_info.pBindings = bindings.data();
+		RequireVulkanSuccess(graphics.device.createDescriptorSetLayout(
+		                         &descriptor_info, nullptr, &m_pssr_descriptor_layout),
+		                     "create upscaling descriptor layout");
+		const vk::PushConstantRange push {vk::ShaderStageFlagBits::eCompute, 0,
+		                                  sizeof(PssrParameters)};
+		vk::PipelineLayoutCreateInfo layout_info {};
+		layout_info.setLayoutCount = 1;
+		layout_info.pSetLayouts = &m_pssr_descriptor_layout;
+		layout_info.pushConstantRangeCount = 1;
+		layout_info.pPushConstantRanges = &push;
+		RequireVulkanSuccess(graphics.device.createPipelineLayout(
+		                         &layout_info, nullptr, &m_pssr_pipeline_layout),
+		                     "create upscaling pipeline layout");
+		m_pssr_pipeline =
+		    CreateComputePipeline(graphics.device, GPU_PSSR_LINEAR_SPV, m_pssr_pipeline_layout,
+			                      "create upscaling pipeline");
+	}
+	const PssrParameters parameters {{source_size.width, source_size.height},
+	                                 {destination_size.width, destination_size.height},
+	                                 {channels[0], channels[1], channels[2], channels[3]}};
+	const std::array images {
+	    vk::DescriptorImageInfo {nullptr, source, vk::ImageLayout::eGeneral},
+	    vk::DescriptorImageInfo {nullptr, destination, vk::ImageLayout::eGeneral}};
+	std::array<vk::WriteDescriptorSet, 2> writes {};
+	for (uint32_t i = 0; i < writes.size(); ++i) {
+		writes[i].dstBinding = i;
+		writes[i].descriptorCount = 1;
+		writes[i].descriptorType = i == 0 ? vk::DescriptorType::eSampledImage
+		                                 : vk::DescriptorType::eStorageImage;
+		writes[i].pImageInfo = &images[i];
+	}
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pssr_pipeline_layout,
+	                             0, writes.size(), writes.data());
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_pssr_pipeline);
+	command.pushConstants(m_pssr_pipeline_layout, vk::ShaderStageFlagBits::eCompute,
+	                      0, sizeof(parameters), &parameters);
+	command.dispatch((parameters.output_size[0] + 7) / 8,
+	                 (parameters.output_size[1] + 7) / 8, 1);
+	ShaderWriteBarrier(command, vk::PipelineStageFlagBits::eComputeShader);
+}
+
+// Whether the game's last upscaler pass is left out of this frame: the emulator's upscaler took
+// the frame before at this render size, so it takes this one, and it makes all the pass makes
+// that anything reads (the picture, and the small copy of it by ScaleLinear).
+bool RenderExecutor::SkipsGamePass(const FrameGen::UpscalerPass& pass) const {
+	return Upscaler::Enabled() && g_game_upscaler.On() && g_game_upscaler_skip.On() &&
+	       pass.reduced != FrameGen::UpscalerPass::NoImage && pass.width != 0 &&
+	       m_game_upscaler_taken == (uint64_t {pass.width} << 32u | pass.height);
+}
+
+// The game has no PSSR (base mode), but its engine's own temporal upscaler takes the same inputs:
+// the frame's color, depth and motion vectors at the render size, the sample's jitter, and makes
+// the picture at the output size. Its passes run as they are but the last one, which makes the
+// picture: that is made here instead, into the layer of the game's history that pass writes, so
+// the game's next frame and everything after the upscaler read it as the game's own. The first
+// frame of a render size runs the game's pass too (`skipped` false: whether the upscaler takes
+// the size is known only once it did); a frame the upscaler does not take keeps the game's
+// picture. What the last pass writes besides: a small copy of the picture, made here from the
+// picture, and its history's weights, which only that pass reads.
+void RenderExecutor::UpscaleGameFrame(CommandBuffer& buffer, const PreparedBindings& bindings,
+                                      const FrameGen::UpscalerPass& pass, uint64_t shader_hash,
+                                      bool skipped) {
+	auto* capture = FrameGen::TakeCaptured();
+	if (capture == nullptr || !Upscaler::Enabled() || !g_game_upscaler.On()) {
+		m_game_upscaler_taken = 0;
+		return;
+	}
+	constexpr uint64_t CONTEXT = 0x52535455'454d4147; // "GAMEUTSR": the one history there is
+	auto&              cache   = m_context.GetTextureCache();
+	auto&              color   = cache.GetImage(bindings.images[pass.color].image_id);
+	auto&              output  = cache.GetImage(bindings.images[pass.output].image_id);
+	auto&              images  = *capture->images;
+	const auto&        view    = capture->view;
+	// One level and one layer of each, as a 2D image: the layer of the history the pass writes.
+	const auto single = [](ImageViewInfo info, vk::ImageUsageFlags usage) {
+		info.type        = vk::ImageViewType::e2D;
+		info.level_count = 1;
+		info.layer_count = 1;
+		info.min_lod     = 0;
+		info.usage       = usage;
+		return info;
+	};
+	const auto color_info  = single(bindings.images[pass.color].desc.view_info,
+	                                vk::ImageUsageFlagBits::eSampled);
+	const auto output_info = single(bindings.images[pass.output].desc.view_info,
+	                                vk::ImageUsageFlagBits::eStorage);
+	const auto color_extent  = color.info.MipExtent(color_info.base_level);
+	const auto output_extent = output.info.MipExtent(output_info.base_level);
+	if (!color.registered || !output.registered || color.backing.image == nullptr ||
+	    output.backing.image == nullptr || color.backing.samples != 1 ||
+	    output.backing.samples != 1 || color.info.IsDepth() || output.info.IsDepth() ||
+	    view.width > color_extent.width || view.height > color_extent.height ||
+	    view.width > images.depth.extent.width || view.height > images.depth.extent.height ||
+	    output_extent.width < view.width || output_extent.height < view.height) {
+		m_game_upscaler_taken = 0;
+		return;
+	}
+	const auto resource = [](Image& image, const ImageViewInfo& info, vk::Extent3D extent,
+	                         bool write) {
+		return Dlss::Resource {
+		    .view       = static_cast<VkImageView>(image.FindView(info)),
+		    .image      = static_cast<VkImage>(image.backing.image),
+		    .range      = {static_cast<VkImageAspectFlags>(info.aspect), info.base_level, 1,
+		                   info.base_layer, 1},
+		    .format     = static_cast<VkFormat>(info.format),
+		    .width      = extent.width,
+		    .height     = extent.height,
+		    .read_write = write};
+	};
+	const auto captured = [](const VulkanImage& image, vk::ImageView image_view,
+	                         vk::ImageAspectFlags aspect) {
+		return Dlss::Resource {.view   = static_cast<VkImageView>(image_view),
+		                       .image  = static_cast<VkImage>(image.image),
+		                       .range  = {static_cast<VkImageAspectFlags>(aspect), 0, 1, 0, 1},
+		                       .format = static_cast<VkFormat>(image.format),
+		                       .width  = image.extent.width,
+		                       .height = image.extent.height};
+	};
+	Pssr::Request request {};
+	request.context = CONTEXT;
+	request.width   = view.width;
+	request.height  = view.height;
+	// (The engine's offset is the upscaler's as it is: negated in x the picture blurs, in y its
+	// edges come out as stairs.)
+	request.jitter[0] = view.jitter[0];
+	request.jitter[1] = view.jitter[1];
+	// (The captured vectors are in parts of the frame.)
+	request.motion_scale[0] = view.motion_scale[0] * static_cast<float>(view.width);
+	request.motion_scale[1] = view.motion_scale[1] * static_cast<float>(view.height);
+	request.pre_exposure    = view.pre_exposure;
+	request.flags = Pssr::kReverseDepth | Pssr::kAutoExposure | (view.cut ? Pssr::kReset : 0u);
+
+	buffer.EndRendering();
+	// (The upscaler binds its own pipeline: the next guest dispatch or draw binds its own again.)
+	const auto command = buffer.PipelineHandle();
+	color.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderRead,
+	              ImageSubresourceRange {color_info.base_level, 1, color_info.base_layer, 1},
+	              command);
+	output.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite,
+	               ImageSubresourceRange {output_info.base_level, 1, output_info.base_layer, 1},
+	               command);
+	FrameGen::SetUpscalerLayout(command, images, true);
+	Dlss::Inputs inputs {resource(color, color_info, color_extent, false),
+	                     captured(images.depth, images.depth_view,
+	                              vk::ImageAspectFlagBits::eDepth),
+	                     captured(images.motion, images.motion_view,
+	                              vk::ImageAspectFlagBits::eColor),
+	                     nullptr, resource(output, output_info, output_extent, true)};
+	// (FidelityFX views an image from its first layer: not this one.)
+	const bool upscaled = !Fsr::Enabled() && Upscale(command, request, inputs, true);
+	FrameGen::SetUpscalerLayout(command, images, false);
+	m_game_upscaler_taken = upscaled ? uint64_t {view.width} << 32u | view.height : 0;
+	if (upscaled && skipped) {
+		// The small copy the game's pass would have written.
+		auto&      reduced        = cache.GetImage(bindings.images[pass.reduced].image_id);
+		const auto reduced_info   = single(bindings.images[pass.reduced].desc.view_info,
+		                                   vk::ImageUsageFlagBits::eStorage);
+		const auto reduced_extent = reduced.info.MipExtent(reduced_info.base_level);
+		if (reduced.registered && reduced.backing.image != nullptr &&
+		    reduced.backing.samples == 1) {
+			reduced.Transit(
+			    vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite,
+			    ImageSubresourceRange {reduced_info.base_level, 1, reduced_info.base_layer, 1},
+			    command);
+			ScaleLinear(command,
+			            output.FindView(single(bindings.images[pass.output].desc.view_info,
+			                                   vk::ImageUsageFlagBits::eSampled)),
+			            {output_extent.width, output_extent.height}, reduced.FindView(reduced_info),
+			            {reduced_extent.width, reduced_extent.height}, {0, 1, 2, 4});
+		}
+	}
+	// (Once per shader, sizes and outcome: what was done.)
+	const uint64_t state = shader_hash ^ (uint64_t {view.width} << 48u) ^
+	                       (uint64_t {view.height} << 32u) ^ (uint64_t {output_extent.width} << 16u) ^
+	                       (uint64_t {skipped} << 1u) ^ uint64_t {upscaled};
+	if (m_game_upscaler_logged != state) {
+		m_game_upscaler_logged = state;
+		LOGF("game upscaler: the picture of CS 0x%016" PRIx64 " %s: %ux%u of %ux%u to %ux%u "
+		     "(layer %u of %u, pre-exposure %g)\n",
+		     shader_hash,
+		     !upscaled ? (skipped ? "NOT MADE (the upscaler refused a size it took before)"
+		                          : "left as the game made it")
+		               : (skipped ? "made in the game's place" : "made again over the game's"),
+		     view.width, view.height, color_extent.width, color_extent.height, output_extent.width,
+		     output_extent.height, output_info.base_layer, output.backing.layers,
+		     static_cast<double>(view.pre_exposure));
+	}
 }
 
 void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& request) {
@@ -251,53 +465,10 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 			return;
 		}
 	}
-	auto& graphics = m_context.GetGraphics();
-	if (m_pssr_pipeline == nullptr) {
-		const std::array bindings {
-		    vk::DescriptorSetLayoutBinding {0, vk::DescriptorType::eSampledImage, 1,
-		                                    vk::ShaderStageFlagBits::eCompute},
-		    vk::DescriptorSetLayoutBinding {1, vk::DescriptorType::eStorageImage, 1,
-		                                    vk::ShaderStageFlagBits::eCompute}};
-		vk::DescriptorSetLayoutCreateInfo descriptor_info {};
-		descriptor_info.flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
-		descriptor_info.bindingCount = bindings.size();
-		descriptor_info.pBindings = bindings.data();
-		RequireVulkanSuccess(graphics.device.createDescriptorSetLayout(
-		                         &descriptor_info, nullptr, &m_pssr_descriptor_layout),
-		                     "create upscaling descriptor layout");
-		const vk::PushConstantRange push {vk::ShaderStageFlagBits::eCompute, 0,
-		                                  sizeof(PssrParameters)};
-		vk::PipelineLayoutCreateInfo layout_info {};
-		layout_info.setLayoutCount = 1;
-		layout_info.pSetLayouts = &m_pssr_descriptor_layout;
-		layout_info.pushConstantRangeCount = 1;
-		layout_info.pPushConstantRanges = &push;
-		RequireVulkanSuccess(graphics.device.createPipelineLayout(
-		                         &layout_info, nullptr, &m_pssr_pipeline_layout),
-		                     "create upscaling pipeline layout");
-		m_pssr_pipeline =
-		    CreateComputePipeline(graphics.device, GPU_PSSR_LINEAR_SPV, m_pssr_pipeline_layout,
-			                      "create upscaling pipeline");
-	}
-	const std::array images {
-	    vk::DescriptorImageInfo {nullptr, input.image_view, vk::ImageLayout::eGeneral},
-	    vk::DescriptorImageInfo {nullptr, output.image_view, vk::ImageLayout::eGeneral}};
-	std::array<vk::WriteDescriptorSet, 2> writes {};
-	for (uint32_t i = 0; i < writes.size(); ++i) {
-		writes[i].dstBinding = i;
-		writes[i].descriptorCount = 1;
-		writes[i].descriptorType = i == 0 ? vk::DescriptorType::eSampledImage
-		                                 : vk::DescriptorType::eStorageImage;
-		writes[i].pImageInfo = &images[i];
-	}
-	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pssr_pipeline_layout,
-	                             0, writes.size(), writes.data());
-	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_pssr_pipeline);
-	command.pushConstants(m_pssr_pipeline_layout, vk::ShaderStageFlagBits::eCompute,
-	                      0, sizeof(parameters), &parameters);
-	command.dispatch((parameters.output_size[0] + 7) / 8,
-	                 (parameters.output_size[1] + 7) / 8, 1);
-	ShaderWriteBarrier(command, vk::PipelineStageFlagBits::eComputeShader);
+	ScaleLinear(command, input.image_view, {parameters.input_size[0], parameters.input_size[1]},
+	            output.image_view, {parameters.output_size[0], parameters.output_size[1]},
+	            {parameters.output_channels[0], parameters.output_channels[1],
+	             parameters.output_channels[2], parameters.output_channels[3]});
 	ResetBindings();
 }
 

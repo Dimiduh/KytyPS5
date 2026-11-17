@@ -20,6 +20,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 
@@ -28,6 +29,7 @@ class CommandBuffer;
 class TextureCache;
 struct PreparedBindings;
 namespace ShaderRecompiler::IR {
+struct ImageResource;
 struct ResourceSnapshot;
 } // namespace ShaderRecompiler::IR
 
@@ -45,6 +47,8 @@ struct View {
 	std::array<float, 16> clip_to_prev_clip {};
 	std::array<float, 3>  position {}, right {}, up {}, forward {};
 	float                 near_plane = 0.1f, vertical_fov = 1.0f;
+	// What the frame's color is multiplied by where an upscaler reads it (1: unknown).
+	float pre_exposure = 1.0f;
 	bool                  camera = false; // the matrices and the camera's frame are the game's
 	bool                  cut    = false; // the game starts its history again in this frame
 };
@@ -69,7 +73,9 @@ struct FrameInputs {
 // of the 16 GB up to 2^40 is left and the driver refuses (VK_ERROR_INITIALIZATION_FAILED). With
 // KYTY_FRAMEGEN set they are kept aside from the process' first moment (HoldDriverAddressSpace,
 // before anything maps memory) until right before vkCreateDevice (ReleaseDriverAddressSpace).
-void HoldDriverAddressSpace();
+// The device DLSS asks for (NGX's extensions, without Streamline) is refused the same way:
+// `upscaler` keeps them aside for it too.
+void HoldDriverAddressSpace(bool upscaler);
 void ReleaseDriverAddressSpace();
 // Process start, before the window: loads Streamline when KYTY_FRAMEGEN is set.
 void Initialize();
@@ -117,6 +123,34 @@ void CaptureInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 // Renderer thread, at the guest flip: what was captured since the last flip goes to `inputs`.
 void PrepareInputs(FrameInputs& inputs);
 void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs);
+
+// The same inputs for the emulator's upscaler in place of the game's own (--upscaler,
+// RenderExecutor::UpscaleGameFrame). The last pass of the game's temporal upscaler ("update
+// history") makes the frame's picture at the output size from the frame's color at the render
+// size: `color` and `output` are those two among the dispatch's images, `reduced` the small copy
+// of the picture it writes besides (NoImage: none), `width` and `height` the frame's render size.
+struct UpscalerPass {
+	static constexpr uint32_t NoImage = UINT32_MAX;
+
+	uint32_t color   = 0;
+	uint32_t output  = 0;
+	uint32_t reduced = NoImage;
+	uint32_t width = 0, height = 0;
+};
+// Once, before anything is rendered: the inputs are captured without frame generation too.
+void CaptureForUpscaler();
+// Whether FindInputs and CaptureInputs have anything to do.
+[[nodiscard]] bool CapturesInputs();
+// Renderer thread, a compute dispatch with its bindings resolved (`images`: the program's): the
+// upscaler's last pass of a frame whose inputs were captured.
+[[nodiscard]] std::optional<UpscalerPass> FindUpscalerPass(const ShaderRecompiler::IR::ResourceSnapshot&         resources,
+                                                           std::span<const ShaderRecompiler::IR::ImageResource> images,
+                                                           const PreparedBindings&                               bindings);
+// Renderer thread: the inputs captured in the guest frame being rendered, once; null without any.
+[[nodiscard]] FrameInputs* TakeCaptured();
+// The captured images in the layout an upscaler reads them in (GENERAL), and back in the one
+// frame generation tags them with.
+void SetUpscalerLayout(vk::CommandBuffer command, Images& images, bool upscaling);
 
 } // namespace FrameGen
 } // namespace Libs::Graphics

@@ -3,6 +3,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/gpuTiming.h"
+#include "common/liveControl.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
@@ -835,6 +836,22 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		region.srcOffsets[1].x               = static_cast<int>(source->image.extent.width);
 		region.srcOffsets[1].y               = static_cast<int>(source->image.extent.height);
 		region.srcOffsets[1].z               = 1;
+		// 1..9: a part of the picture pixel for pixel instead of all of it scaled to the window
+		// (the parts lie as a phone's keys, 5 is the center): for looking at an upscaler's work
+		// in a window smaller than the picture.
+		static Common::LiveControl::Switch crop("present_crop", 0);
+		if (const auto part = crop.Get();
+		    part >= 1 && part <= 9 && source->image.extent.width > game_rect.extent.width &&
+		    source->image.extent.height > game_rect.extent.height) {
+			const int width  = static_cast<int>(game_rect.extent.width);
+			const int height = static_cast<int>(game_rect.extent.height);
+			const int x = (static_cast<int>(source->image.extent.width) - width) *
+			              static_cast<int>((part - 1u) % 3u) / 2;
+			const int y = (static_cast<int>(source->image.extent.height) - height) *
+			              static_cast<int>((part - 1u) / 3u) / 2;
+			region.srcOffsets[0] = vk::Offset3D {x, y, 0};
+			region.srcOffsets[1] = vk::Offset3D {x + width, y + height, 1};
+		}
 		region.dstSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
 		region.dstSubresource.mipLevel       = 0;
 		region.dstSubresource.baseArrayLayer = 0;

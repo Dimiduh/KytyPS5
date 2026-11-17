@@ -9,6 +9,11 @@
 #include <tuple>
 #include <upscalers/include/ffx_upscale.h>
 
+// (fsr.cpp has the recording thread replay its queue before the library records: none here.)
+namespace Libs::Graphics::VulkanRecording {
+void Drain() {}
+} // namespace Libs::Graphics::VulkanRecording
+
 namespace {
 
 using namespace Libs::Graphics;

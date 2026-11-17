@@ -24,6 +24,7 @@
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "kernel/memory.h"
+#include "kernel/unrealCvars.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
@@ -1167,6 +1168,11 @@ void WindowContext::CreateVulkan() {
 	Dlss::Init(graphic_ctx, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
 	           VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
 	Fsr::Init(graphic_ctx, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
+	// Without PSSR (base mode) the upscaler takes the place of the game's own.
+	if (!Config::Ps5ProEnabled() && Upscaler::Enabled()) {
+		FrameGen::CaptureForUpscaler();
+		LibKernel::UnrealCvars::WithUpscaler();
+	}
 	submitter             = std::make_unique<QueueSubmitter>(graphic_ctx);
 	graphic_ctx.submitter = submitter.get();
 

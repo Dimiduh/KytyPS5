@@ -18,7 +18,7 @@ public:
 
 [[nodiscard]] bool                          Enabled();
 [[nodiscard]] std::optional<Dlss::Creation> Choose(const Pssr::Request& request,
-                                                   const Dlss::Inputs&  inputs);
+                                                   const Dlss::Inputs& inputs, bool any_size);
 // Null when the upscaler refuses the creation.
 [[nodiscard]] std::unique_ptr<Feature> Create(vk::CommandBuffer     command,
                                               const Dlss::Creation& creation);

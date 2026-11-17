@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
@@ -23,17 +24,20 @@
 #include <string>
 #include <utility>
 
-#ifdef KYTY_FRAMEGEN_STREAMLINE
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
+#undef min
+#undef max
+#endif
+
+#ifdef KYTY_FRAMEGEN_STREAMLINE
 // (after windows.h)
 #include <softpub.h>
 #include <wincrypt.h>
 #include <wintrust.h>
-#undef min
-#undef max
 // NVIDIA Streamline SDK headers (_Build/deps/streamline/sdk/include, see CMakeLists.txt).
 #include <sl.h>
 #include <sl_consts.h>
@@ -68,6 +72,8 @@ struct Sources {
 
 int         g_generate = 0;     // frames to generate per rendered frame (0 = off)
 bool        g_ready    = false; // Streamline loaded and DLSS-G available on the device
+bool        g_for_upscaler = false; // the emulator's upscaler takes the inputs too (CaptureForUpscaler)
+bool        g_untaken      = false; // renderer thread: captured, and not taken by the upscaler yet
 Sources     g_sources;          // renderer thread: the dispatch FindInputs noted, until it is recorded
 FrameInputs g_capture;          // renderer thread: the current guest frame's inputs, until its flip
 uint64_t    g_guest_frame = 0;  // renderer thread
@@ -260,6 +266,7 @@ constexpr uint32_t Forward        = 73;  // float3 each: forward, up, right
 constexpr uint32_t ClipToPrevClip = 136; // 4 rows, without jitter
 constexpr uint32_t FieldOfView    = 146; // float2: horizontal and vertical, radians
 constexpr uint32_t ViewSize       = 148; // float4: the frame's size and the inverse
+constexpr uint32_t PreExposure    = 155; // an int, a float, then the pre-exposure and its inverse
 constexpr uint32_t Rows           = 149;
 } // namespace UeView
 
@@ -316,11 +323,22 @@ bool ReadView(const ShaderRecompiler::IR::ResourceSnapshot& resources, vk::Exten
 	// The camera, when the view constants are laid out as this build's: a projection without
 	// jitter (reversed depth, infinite far plane: w = view z, z = near plane) and the frame's size.
 	view.camera = false;
-	if (resources.buffers.size() < 2 || !g_use_camera.On()) {
+	if (resources.buffers.size() < 2) {
 		return true;
 	}
 	const auto ue = RowsOf(resources.buffers[1]);
 	if (ue.rows < UeView::Rows) {
+		return true;
+	}
+	// The factor the scene's color is stored with (the engine divides it out again when it tone
+	// maps): taken when its inverse stands next to it, as this build's constants have it.
+	if (ue.rows > UeView::PreExposure) {
+		const float factor = ue.At(UeView::PreExposure, 2), inverse = ue.At(UeView::PreExposure, 3);
+		if (std::isfinite(factor) && factor > 1e-6f && factor < 1e6f && NearlyEqual(factor * inverse, 1.0f)) {
+			view.pre_exposure = factor;
+		}
+	}
+	if (!g_use_camera.On()) {
 		return true;
 	}
 	const auto m = [&](uint32_t row, uint32_t column) { return ue.At(UeView::ViewToClipNoAA + row, column); };
@@ -600,24 +618,26 @@ void BypassCommandHooks(vk::Device device) {
 #endif
 }
 
-#ifdef KYTY_FRAMEGEN_STREAMLINE
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 static void* g_driver_space = nullptr;
 #endif
 
-void HoldDriverAddressSpace() {
-#ifdef KYTY_FRAMEGEN_STREAMLINE
+void HoldDriverAddressSpace(bool upscaler) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	const char* value = std::getenv("KYTY_FRAMEGEN");
-	if (value == nullptr || std::atoi(value) <= 0 || g_driver_space != nullptr) {
+	if (!(upscaler || (value != nullptr && std::atoi(value) > 0)) || g_driver_space != nullptr) {
 		return;
 	}
 	// From the guest's ceiling (kernel/memoryAddressSpace.inc, HOST_USER_MAX + 1) to 2^40.
 	constexpr uint64_t Base = 0xfc00000000ull, End = 0x10000000000ull;
 	g_driver_space = VirtualAlloc(reinterpret_cast<void*>(Base), End - Base, MEM_RESERVE, PAGE_NOACCESS);
+#else
+	(void)upscaler;
 #endif
 }
 
 void ReleaseDriverAddressSpace() {
-#ifdef KYTY_FRAMEGEN_STREAMLINE
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	if (g_driver_space != nullptr) {
 		VirtualFree(g_driver_space, 0, MEM_RELEASE);
 		g_driver_space = nullptr;
@@ -979,7 +999,8 @@ void NoteDroppedFrame() {
 void FindInputs(uint64_t shader_hash, const ShaderRecompiler::IR::ResourceSnapshot& resources,
                 const PreparedBindings& bindings, std::span<const uint32_t, 3> groups) {
 	constexpr uint32_t Velocity = 0, Depth = 1, Depths = 2, Motion = 4;
-	if (!g_ready || resources.images.size() <= Motion || bindings.images.size() <= Motion || resources.buffers.empty()) {
+	if (!CapturesInputs() || resources.images.size() <= Motion || bindings.images.size() <= Motion ||
+	    resources.buffers.empty()) {
 		return;
 	}
 	const auto velocity = DecodeNativeDescriptor<ShaderTextureResource>(resources.images[Velocity]);
@@ -1057,6 +1078,88 @@ void CaptureInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 	DecodeMotion(graphics, vk_command, motion_source, images.motion, images.motion_view, frame);
 	g_capture.view  = sources.view;
 	g_capture.valid = true;
+	g_untaken       = true;
+}
+
+void CaptureForUpscaler() {
+	g_for_upscaler = true;
+}
+
+bool CapturesInputs() {
+	return g_ready || g_for_upscaler;
+}
+
+// The last pass of Unreal Engine 5's Temporal Super Resolution ("update history"), as Saros runs
+// it: it samples the frame's color (11_11_10_FLOAT, the scene with its translucency, written by
+// the pass before at the render images' size) and its history, a 11_11_10_FLOAT array at the
+// output size whose layers are the last frames' pictures, and writes the frame's picture into
+// one layer of that same array. It is found by those images, not by the shader.
+std::optional<UpscalerPass> FindUpscalerPass(const ShaderRecompiler::IR::ResourceSnapshot&         resources,
+                                             std::span<const ShaderRecompiler::IR::ImageResource> images,
+                                             const PreparedBindings&                               bindings) {
+	if (!g_for_upscaler || !g_untaken || !g_capture.valid || g_capture.images == nullptr) {
+		return std::nullopt;
+	}
+	const auto     size  = g_capture.images->motion.extent;
+	const uint32_t count = static_cast<uint32_t>(std::min({resources.images.size(), images.size(), bindings.images.size()}));
+	uint32_t       color = count, output = count, reduced = UpscalerPass::NoImage;
+	bool           one_reduced = true;
+	for (uint32_t i = 0; i < count; ++i) {
+		const auto image = DecodeNativeDescriptor<ShaderTextureResource>(resources.images[i]);
+		if (image.IsNull() || image.Format() != Prospero::BufferFormat::k11_11_10Float) {
+			continue;
+		}
+		const uint32_t width = static_cast<uint32_t>(image.Width5()) + 1u, height = static_cast<uint32_t>(image.Height5()) + 1u;
+		if (images[i].written) {
+			if (width >= size.width && height >= size.height && (width > size.width || height > size.height)) {
+				if (output != count) {
+					return std::nullopt;
+				}
+				output = i;
+			} else {
+				// (A small copy of the picture, a quarter of its size in Saros, for the exposure.)
+				one_reduced = reduced == UpscalerPass::NoImage;
+				reduced     = i;
+			}
+		} else if (width == size.width && height == size.height) {
+			if (color != count) {
+				return std::nullopt;
+			}
+			color = i;
+		}
+	}
+	if (color == count || output == count) {
+		return std::nullopt;
+	}
+	// The history it reads is the array it writes.
+	const auto address = bindings.images[output].desc.info.data.address;
+	bool       history = false;
+	for (uint32_t i = 0; i < count; ++i) {
+		history = history || (i != output && !images[i].written && bindings.images[i].desc.info.data.address == address);
+	}
+	if (!history || bindings.images[color].desc.info.data.address == address) {
+		return std::nullopt;
+	}
+	return UpscalerPass {color, output, one_reduced ? reduced : UpscalerPass::NoImage, g_capture.view.width,
+	                     g_capture.view.height};
+}
+
+FrameInputs* TakeCaptured() {
+	if (!g_untaken || !g_capture.valid || g_capture.images == nullptr) {
+		return nullptr;
+	}
+	g_untaken = false;
+	return &g_capture;
+}
+
+void SetUpscalerLayout(vk::CommandBuffer command, Images& images, bool upscaling) {
+	const auto layout = upscaling ? vk::ImageLayout::eGeneral : vk::ImageLayout::eShaderReadOnlyOptimal;
+	const vk::ImageAspectFlags depth =
+	    HasStencil(images.depth.format) ? vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil
+	                                    : vk::ImageAspectFlags(vk::ImageAspectFlagBits::eDepth);
+	Transition(command, images.depth, depth, layout, vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);
+	Transition(command, images.motion, vk::ImageAspectFlagBits::eColor, layout, vk::AccessFlagBits2::eShaderRead,
+	           vk::PipelineStageFlagBits2::eAllCommands);
 }
 
 void PrepareInputs(FrameInputs& inputs) {

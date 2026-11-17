@@ -12,6 +12,11 @@
 #include <utility>
 #include <variant>
 
+// (dlss.cpp has the recording thread replay its queue before the library records: none here.)
+namespace Libs::Graphics::VulkanRecording {
+void Drain() {}
+} // namespace Libs::Graphics::VulkanRecording
+
 namespace {
 
 using namespace Libs::Graphics;
@@ -198,6 +203,23 @@ TEST(DlssTest, ModeRangesPickTheCreation) {
 	          Creation({3840, 2160, Pssr::kReverseDepth, 5, 3840, 2160, 3840, 2160}));
 	EXPECT_EQ(choose(3000, 1688), std::nullopt);
 
+	// Asked for any size, a size no mode takes gets a feature of that one size with the nearest
+	// mode's model, down to a sixth of the output; a size a mode takes is that mode's as before.
+	const auto choose_any = [&](uint32_t width, uint32_t height) {
+		auto request   = TemporalRequest();
+		request.width  = width;
+		request.height = height;
+		request.flags  = Pssr::kReset | Pssr::kReverseDepth;
+		return Dlss::Choose(capabilities, request, inputs, true);
+	};
+	EXPECT_EQ(choose_any(3000, 1688),
+	          Creation({3840, 2160, Pssr::kReverseDepth, 2, 3000, 1688, 3000, 1688}));
+	EXPECT_EQ(choose_any(800, 450),
+	          Creation({3840, 2160, Pssr::kReverseDepth, 3, 800, 450, 800, 450}));
+	EXPECT_EQ(choose_any(600, 338), std::nullopt);
+	EXPECT_EQ(choose_any(4000, 2250), std::nullopt);
+	EXPECT_EQ(choose_any(1920, 1080), choose(1920, 1080));
+
 	// Without dynamic ranges each mode takes its optimal size.
 	g_dynamic = false;
 	capabilities.values.clear();
@@ -299,7 +321,8 @@ TEST(DlssTest, EvaluationPassesTheRequest) {
 	EXPECT_EQ(values["Reset"], Value(0));
 }
 
-// DLSS loads NGX, which needs one instance extension, only when selected with a folder.
+// DLSS loads NGX, which needs one instance extension, only when selected with a folder; PS5 Pro
+// mode or not (without it DLSS stands in for a title's own upscaler).
 TEST(DlssTest, LoadsOnlyWhenSelectedWithAFolder) {
 	auto* ngx = SDL_LoadObject("libnvidia-ngx.so.1");
 	if (ngx == nullptr) {
@@ -321,7 +344,7 @@ TEST(DlssTest, LoadsOnlyWhenSelectedWithAFolder) {
 		Dlss::Load();
 		std::vector<const char*> extensions;
 		Dlss::AppendExtensions(extensions, {properties2}, false);
-		EXPECT_EQ(extensions.size(), pro && upscaler == DLSS && *folder != '\0' ? 1u : 0u)
+		EXPECT_EQ(extensions.size(), upscaler == DLSS && *folder != '\0' ? 1u : 0u)
 		    << pro << ' ' << static_cast<int>(upscaler) << ' ' << folder;
 		Dlss::Shutdown();
 	}

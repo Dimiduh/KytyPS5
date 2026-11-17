@@ -112,7 +112,12 @@ static void PrintUsage() {
 	         "                                       supported titles. Default: off.\n");
 	::printf("  --pssr-upscaler <value>              With --trinity, upscale PSSR with Linear,\n"
 	         "                                       DLSS, or FSR. Default: Linear.\n");
-	::printf("  --dlss-folder <folder>               DLSS model folder.\n");
+	::printf("  --upscaler <value>                   The same; without --trinity DLSS makes the\n"
+	         "                                       picture in place of the upscaler of an Unreal\n"
+	         "                                       Engine 5 title (Saros).\n");
+	::printf("  --dlss-folder <folder>               DLSS model folder (nvngx_dlss.dll). Default:\n"
+	         "                                       NVIDIA's Streamline runtime, where it is found\n"
+	         "                                       for frame generation.\n");
 	::printf("  --dlss-preset <A-O>                  DLSS preset. Default: the model's own.\n");
 	::printf("  --fsr-folder <folder>                FidelityFX DLL folder (Windows).\n");
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
@@ -230,7 +235,14 @@ static void PrintUsage() {
 	    "                                       at, in percent of the title's own (its screen\n"
 	    "                                       percentage and dynamic resolution bounds); the\n"
 	    "                                       title's upscaler still makes the output's picture.\n"
-	    "                                       Less GPU time for a softer picture.\n");
+	    "                                       Less GPU time for a softer picture.\n"
+	    "  --upscaler-render-percent <number>   With --upscaler DLSS in place of an Unreal Engine\n"
+	    "                                       title's upscaler: the 3D at this one size, in\n"
+	    "                                       percent of the output's (no dynamic resolution).\n"
+	    "                                       DLSS's modes: 33.3333 (ultra performance), 50, 58,\n"
+	    "                                       66.6667 (quality). Without the option the title's\n"
+	    "                                       own sizes are upscaled as they come. Not applied\n"
+	    "                                       when DLSS could not be loaded.\n");
 	::printf("  --serialize-dispatches               Order every guest compute dispatch after the\n"
 	         "                                       previous one, also where the guest sends no\n"
 	         "                                       flush between them.\n");
@@ -536,9 +548,9 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid maximal reconvergence: %s\n", value.c_str());
 				return false;
 			}
-		} else if (arg == "--pssr-upscaler") {
+		} else if (arg == "--pssr-upscaler" || arg == "--upscaler") {
 			if (!ParseEnum(value, options.config.pssr_upscaler)) {
-				::printf("invalid PSSR upscaler: %s\n", value.c_str());
+				::printf("invalid upscaler: %s\n", value.c_str());
 				return false;
 			}
 		} else if (arg == "--dlss-folder") {
@@ -623,6 +635,18 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 					options.config.unreal_cvars.push_back(std::string(name) + "=x" +
 					                                      std::to_string(static_cast<double>(percent) / 100.0));
 				}
+			}
+		} else if (arg == "--upscaler-render-percent") {
+			char*        end     = nullptr;
+			const double percent = std::strtod(value.c_str(), &end);
+			if (end == value.c_str() || *end != '\0' || !(percent >= 10.0 && percent <= 100.0)) {
+				::printf("invalid render percent (10-100): %s\n", value.c_str());
+				return false;
+			}
+			// (Set only while the upscaler makes the picture: kernel/unrealCvars.h.)
+			for (const char* name: {"r.DynamicRes.MinScreenPercentage", "r.DynamicRes.MaxScreenPercentage",
+			                        "r.ScreenPercentage"}) {
+				options.config.unreal_cvars.push_back(std::string("upscaler?") + name + "=" + value);
 			}
 		} else if (arg == "--command-buffer-dump-folder") {
 			options.config.command_buffer_dump_folder = Common::PathFromUtf8(value);
@@ -713,7 +737,13 @@ static void UsePrivateDriverDiskCache() {
 
 int wmain(int argc, wchar_t* argv[]) {
     Common::RegisterQuickExit();
-    Libs::Graphics::FrameGen::HoldDriverAddressSpace();
+    // (Before the options are read: nothing may map memory first.)
+    bool dlss = false;
+    for (int index = 1; index + 1 < argc; index++) {
+        dlss = dlss || ((wcscmp(argv[index], L"--upscaler") == 0 || wcscmp(argv[index], L"--pssr-upscaler") == 0) &&
+                        _wcsicmp(argv[index + 1], L"DLSS") == 0);
+    }
+    Libs::Graphics::FrameGen::HoldDriverAddressSpace(dlss);
     UsePrivateDriverDiskCache();
     std::vector<std::string> utf8_args;
     utf8_args.reserve(static_cast<size_t>(argc));

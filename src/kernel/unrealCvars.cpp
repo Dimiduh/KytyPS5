@@ -34,6 +34,8 @@ struct Wanted {
 	// the title sets another.
 	bool   relative = false;
 	double factor   = 1.0;
+	// "upscaler?<name>=...": only while the emulator's upscaler makes the picture (WithUpscaler).
+	bool with_upscaler = false;
 	// Once found: where the two copies of the value are, of which class, and what goes there.
 	uint64_t                value_address = 0;
 	bool                    is_float      = false;
@@ -65,6 +67,7 @@ std::thread             g_thread;
 std::mutex              g_mutex;
 std::condition_variable g_wake;
 bool                    g_stop = false;
+std::atomic<bool>       g_with_upscaler {false};
 
 void Say(const std::string& text) {
 	Log::WriteToConsoleAndLog(text);
@@ -238,7 +241,8 @@ bool Locate() {
 // Puts the wanted values where they are not; the first time, with what was there.
 void Apply(bool first) {
 	for (auto& wanted: g_wanted) {
-		if (wanted.value_address == 0) {
+		if (wanted.value_address == 0 ||
+		    (wanted.with_upscaler && !g_with_upscaler.load(std::memory_order_relaxed))) {
 			continue;
 		}
 		std::array<uint8_t, 8> now {};
@@ -314,9 +318,16 @@ void Run() {
 
 } // namespace
 
+void WithUpscaler() {
+	g_with_upscaler.store(true, std::memory_order_relaxed);
+}
+
 void Start(const std::vector<std::string>& assignments) {
-	for (const auto& assignment: assignments) {
-		const auto equals   = assignment.find('=');
+	for (const auto& whole: assignments) {
+		constexpr std::string_view Condition = "upscaler?";
+		const bool                 with_upscaler = whole.starts_with(Condition);
+		const auto assignment = with_upscaler ? whole.substr(Condition.size()) : whole;
+		const auto equals     = assignment.find('=');
 		const bool relative = equals != std::string::npos && equals + 1 < assignment.size() &&
 		                      (assignment[equals + 1] == 'x' || assignment[equals + 1] == '*');
 		const auto* text    = assignment.c_str() + (equals == std::string::npos ? 0 : equals + (relative ? 2 : 1));
@@ -330,7 +341,8 @@ void Start(const std::vector<std::string>& assignments) {
 		Wanted wanted;
 		wanted.name     = assignment.substr(0, equals);
 		wanted.lower    = Lower(wanted.name);
-		wanted.relative = relative;
+		wanted.relative      = relative;
+		wanted.with_upscaler = with_upscaler;
 		(relative ? wanted.factor : wanted.number) = number;
 		// The later one of a name wins.
 		std::erase_if(g_wanted, [&](const Wanted& other) { return other.lower == wanted.lower; });

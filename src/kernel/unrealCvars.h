@@ -41,8 +41,13 @@
 namespace Libs::LibKernel::UnrealCvars {
 
 // Starts the helper thread for the assignments ("name=number"); nothing without any.
+// "upscaler?name=number" is set only once WithUpscaler was called: the size the emulator's
+// upscaler wants the 3D at (--upscaler-render-percent) must not reach a title whose own upscaler
+// still makes the picture, because that upscaler could not be replaced on this PC.
 void Start(const std::vector<std::string>& assignments);
 void Stop();
+// Any thread: the emulator's upscaler makes the title's picture in place of the title's own.
+void WithUpscaler();
 
 } // namespace Libs::LibKernel::UnrealCvars
 

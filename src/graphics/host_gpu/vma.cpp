@@ -19,6 +19,7 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/upscaler/dlss.h"
 
 #include <algorithm>
 #include <chrono>
@@ -291,6 +292,13 @@ void GraphicContext::LogLostDevice() const {
 		    heaps.device.usage / MiB, heaps.device.budget / MiB,
 		    MemoryBudget::DriverUsage(heaps.device) / MiB, heaps.host.usage / MiB,
 		    heaps.host.budget / MiB));
+	}
+	// (The failing call names the submission that was lost: an upscaler's commands were in
+	// another one unless the ticks match.)
+	if (const auto [pictures, tick] = Dlss::Evaluations(); pictures != 0) {
+		Log::WriteToConsoleAndLog(
+		    fmt::format("Lost device: the upscaler made {} picture(s), the last for tick {}\n",
+		                pictures, tick));
 	}
 	vk::DeviceFaultCountsEXT counts {};
 	if (!device_fault_enabled ||

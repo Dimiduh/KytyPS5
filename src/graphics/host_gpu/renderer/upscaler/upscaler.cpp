@@ -39,9 +39,10 @@ bool Enabled() {
 	return Dlss::Capabilities() != nullptr || Fsr::Enabled();
 }
 
-std::optional<Dlss::Creation> Choose(const Pssr::Request& request, const Dlss::Inputs& inputs) {
+std::optional<Dlss::Creation> Choose(const Pssr::Request& request, const Dlss::Inputs& inputs,
+                                     bool any_size) {
 	return Fsr::Enabled() ? Fsr::Choose(request, inputs)
-	                      : Dlss::Choose(*Dlss::Capabilities(), request, inputs);
+	                      : Dlss::Choose(*Dlss::Capabilities(), request, inputs, any_size);
 }
 
 std::unique_ptr<Feature> Create(vk::CommandBuffer command, const Dlss::Creation& creation) {
