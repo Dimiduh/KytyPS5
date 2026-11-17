@@ -116,7 +116,10 @@ public:
 		EXIT("BufferCache: invalid utility-buffer usage\n");
 	}
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
-	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
+	// The buffer address table descriptor writes take: the newest (GrowBdaTable).
+	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept {
+		return m_bda_table.load(std::memory_order_acquire);
+	}
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
@@ -231,6 +234,14 @@ private:
 	}
 	// Writes the page table entries of a registered buffer (see IsBdaWatched).
 	void WriteBdaEntries(const Buffer& buffer);
+	// The entries [first, first + count) of the buffer address tables: written (`entries`) or
+	// cleared (null), in every table that holds them (m_bda_tables).
+	void WriteBdaTable(uint64_t first, uint64_t count, const vk::DeviceAddress* entries);
+	// A table with room for `entries` entries takes the newest one's place; the ones replaced
+	// go BdaTableKeepTicks collector ticks (frames) later.
+	void                      GrowBdaTable(uint64_t entries);
+	void                      RetireBdaTables();
+	static constexpr uint64_t BdaTableKeepTicks = 8;
 	// Shaders read the buffer through the page table: it is synchronized at ordering points
 	// from now on, starting with the guest's stores it has not taken.
 	void MarkBdaRead(Buffer& buffer);
@@ -345,7 +356,13 @@ private:
 	CommandScheduler&                                 m_scheduler;
 	FaultManager                                      m_fault_manager;
 	Buffer                                            m_gds_buffer;
-	Buffer                                            m_bda_pagetable_buffer;
+	// The buffer address tables (an entry per CACHING_PAGESIZE of guest addresses, read by the
+	// shaders): the newest last (m_bda_table). The ones it replaced stay for a few frames and
+	// are written alike, so a descriptor set written before the table grew reads right entries
+	// for what its table covers and zero past it, never a freed buffer's address (GrowBdaTable).
+	std::vector<std::unique_ptr<Buffer>>              m_bda_tables;
+	std::atomic<Buffer*>                              m_bda_table {nullptr};
+	uint64_t                                          m_bda_retire_tick = 0;
 	Common::SlotVector<Buffer>                        m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;

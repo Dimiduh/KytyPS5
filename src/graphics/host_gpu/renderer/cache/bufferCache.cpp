@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <cstring>
+#include <fmt/format.h>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -92,6 +93,25 @@ Common::LiveControl::Counter g_guest_copy_again("guest_copy_again");
 // every frame for nothing: 40.4 -> 47.9 fps in one process, write faults 3,770 -> 840 a frame,
 // uploads 16.8 -> 4.3 MiB, protection requests of the GPU thread 1,930 -> 590.
 Common::LiveControl::Switch g_bda_lazy("bda_lazy", 1);
+// The guest addresses the buffer address table covers at first, in GiB (0: all of them).
+// The table is read by the shaders with an entry of 8 bytes per 16 KiB of guest addresses:
+// whole it is 768 MiB of video memory on every card, nearly all of it zeros. 128 GiB are
+// 64 MiB; a buffer registered past the table grows it (GrowBdaTable). Saros registers buffers
+// up to 617 GiB at the start of a level (a table of 352 MiB).
+Common::LiveControl::Switch g_bda_table_gib("bda_table_gib", 128);
+
+uint64_t InitialBdaTableBytes(const GraphicContext& graphics) {
+	constexpr uint64_t Whole = BufferCache::BDA_PAGETABLE_SIZE;
+	const uint64_t     gib   = g_bda_table_gib.Get();
+	// A read past the end of a smaller table has to give zero, as an entry nobody wrote does:
+	// robustBufferAccess2 says so. Without it the table is whole.
+	if (gib == 0 || !graphics.robust_buffer_access_enabled) {
+		return Whole;
+	}
+	const uint64_t covered = std::min<uint64_t>(gib, 4096) << 30u;
+	return std::min(Whole,
+	                (covered >> BufferCache::CACHING_PAGEBITS) * sizeof(vk::DeviceAddress));
+}
 
 // 1: the uses of a small range the guest wrote share one stream copy of it (ObtainBuffer's
 // stream path) instead of copying it at every use. On the console a guest store reaches GPU
@@ -207,8 +227,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		m_buffers.erase(m_buffers.find(buffer.CpuAddress()));
 		m_total_used_memory -= buffer.Size();
 		m_lru_cache.Free(buffer.lru_id);
-		m_bda_pagetable_buffer.Fill(table_offset,
-		                            size_pages * sizeof(vk::DeviceAddress), 0);
+		WriteBdaTable(table_offset / sizeof(vk::DeviceAddress), size_pages, nullptr);
 		buffer.is_deleted = true;
 	}
 }
@@ -239,9 +258,93 @@ void BufferCache::WriteBdaEntries(const Buffer& buffer) {
 		EXIT_IF((address & BdaWatchBit) != 0);
 		addresses.push_back(address | flags);
 	}
-	WriteDataBuffer(m_bda_pagetable_buffer,
-	                PageIndex(buffer.CpuAddress()) * sizeof(vk::DeviceAddress), addresses.data(),
-	                addresses.size() * sizeof(vk::DeviceAddress));
+	const auto first = PageIndex(buffer.CpuAddress());
+	if ((first + addresses.size()) * sizeof(vk::DeviceAddress) > GetBdaPageTableBuffer()->Size()) {
+		GrowBdaTable(first + addresses.size());
+	}
+	WriteBdaTable(first, addresses.size(), addresses.data());
+}
+
+void BufferCache::WriteBdaTable(uint64_t first, uint64_t count, const vk::DeviceAddress* entries) {
+	for (const auto& table: m_bda_tables) {
+		const uint64_t held = table->Size() / sizeof(vk::DeviceAddress);
+		if (first >= held) {
+			continue;
+		}
+		const uint64_t part = std::min(count, held - first);
+		if (entries != nullptr) {
+			WriteDataBuffer(*table, first * sizeof(vk::DeviceAddress), entries,
+			                part * sizeof(vk::DeviceAddress));
+		} else {
+			table->Fill(first * sizeof(vk::DeviceAddress), part * sizeof(vk::DeviceAddress), 0);
+		}
+	}
+}
+
+// A buffer registered past the newest table: a table that reaches it, and an eighth further
+// (the game's heaps grow upwards), takes its place, with the old entries copied and the rest
+// zero. The old one stays for BdaTableKeepTicks frames and is written alike (WriteBdaTable): a
+// descriptor set written with it and still bound in a command buffer that is being recorded
+// reads right entries for what it covers and zero past it, as before. A command buffer binds
+// its sets again, so nothing reads the old table after that (RetireBdaTables).
+void BufferCache::GrowBdaTable(uint64_t entries) {
+	constexpr uint64_t Step = 16 * MiB;
+	auto*              old  = GetBdaPageTableBuffer();
+	const uint64_t     need = entries * sizeof(vk::DeviceAddress);
+	EXIT_IF(need > BDA_PAGETABLE_SIZE || need <= old->Size());
+	const uint64_t bytes = std::min(BDA_PAGETABLE_SIZE, Common::AlignUp(need + need / 8, Step));
+	auto table = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+	                                      AllFlags, bytes);
+	SetVulkanObjectNameF(m_graphics.device, table->Handle(), "BDA Page Table Buffer");
+	m_scheduler.EndRendering();
+	const auto               command = m_scheduler.Current().Handle();
+	vk::BufferMemoryBarrier2 barriers[2] {};
+	for (auto& barrier: barriers) {
+		barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+		barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+		barrier.dstStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.offset              = 0;
+		barrier.size                = old->Size();
+	}
+	barriers[0].buffer        = old->Handle();
+	barriers[0].dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+	barriers[1].buffer        = table->Handle();
+	barriers[1].dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	vk::DependencyInfo dependency {};
+	dependency.bufferMemoryBarrierCount = 2;
+	dependency.pBufferMemoryBarriers    = barriers;
+	command.pipelineBarrier2(dependency);
+	const vk::BufferCopy copy {0, 0, old->Size()};
+	command.copyBuffer(old->Handle(), table->Handle(), 1, &copy);
+	for (auto& barrier: barriers) {
+		barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+		barrier.srcAccessMask = barrier.dstAccessMask;
+		barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+		barrier.dstAccessMask = LaterAccess2;
+	}
+	command.pipelineBarrier2(dependency);
+	table->Fill(old->Size(), bytes - old->Size(), 0);
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "Buffer address table: {} MiB for {} GiB of guest addresses (a buffer at {:#x})\n",
+	    bytes >> 20u, (bytes / sizeof(vk::DeviceAddress)) >> (30u - CACHING_PAGEBITS),
+	    GuestAddress((entries - 1) << CACHING_PAGEBITS)));
+	m_bda_table.store(table.get(), std::memory_order_release);
+	m_bda_tables.push_back(std::move(table));
+	m_bda_retire_tick = m_gc_tick + BdaTableKeepTicks;
+}
+
+void BufferCache::RetireBdaTables() {
+	if (m_bda_tables.size() < 2 || m_gc_tick < m_bda_retire_tick) {
+		return;
+	}
+	// (Freed once the GPU is done with what is recorded so far.)
+	for (size_t i = 0; i + 1 < m_bda_tables.size(); ++i) {
+		m_scheduler.DeferOperation(
+		    [owner = std::move(m_bda_tables[i])]() mutable { owner.reset(); });
+	}
+	m_bda_tables.erase(m_bda_tables.begin(), m_bda_tables.end() - 1);
 }
 
 bool BufferCache::NoteBdaAccess(uint64_t address, uint64_t window_start) {
@@ -497,8 +600,6 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
-      m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-                             BDA_PAGETABLE_SIZE),
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
@@ -508,10 +609,13 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	m_bda_lazy = g_bda_lazy.On();
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
-	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
+	m_bda_tables.push_back(std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal,
+	                                                0, AllFlags, InitialBdaTableBytes(m_graphics)));
+	m_bda_table.store(m_bda_tables.back().get(), std::memory_order_release);
+	SetVulkanObjectNameF(m_graphics.device, GetBdaPageTableBuffer()->Handle(),
 	                     "BDA Page Table Buffer");
 	m_scheduler.BeginCommand();
-	for (auto* buffer: {&m_bda_pagetable_buffer, m_fault_manager.GetFaultBuffer()}) {
+	for (auto* buffer: {GetBdaPageTableBuffer(), m_fault_manager.GetFaultBuffer()}) {
 		buffer->Fill(0, buffer->Size(), 0);
 	}
 	const auto null_id =
@@ -1794,6 +1898,7 @@ bool BufferCache::ConsumeCpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::RunGarbageCollector() {
+	RetireBdaTables();
 	ProbeBdaReaders();
 	KeepAccessedBdaBuffers();
 	const auto tick = m_gc_tick++;
