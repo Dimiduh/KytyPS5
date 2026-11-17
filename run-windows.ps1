@@ -371,7 +371,7 @@ Write-Host "pid $($process.Id); logs: $logDir\$stamp.*.log"
 if (!$Precompile -and !$Follow) { return }
 
 # The run log in this window as it is written, until the emulator exits. Of a precompile pass only its own lines
-# (the pipeline cache's and the precompile's progress); its last "Precompile done:" line is the summary ("stopped"
+# (the pipeline cache's and the precompile's progress, and the shaders read from the game's files); its last "Precompile done:" line is the summary ("stopped"
 # when its window was closed; a pass that starts over with an empty driver cache logs more than one).
 $begin = Get-Date
 $reader = $null
@@ -391,7 +391,7 @@ while ($true) {
 		for ($i = 0; $i -lt $lines.Count - 1; $i++) {
 			$line = $lines[$i].TrimEnd("`r")
 			if ($line -match '^Precompile (done|stopped):') { $summary = $line }
-			if (!$Precompile -or $line -match 'Precompile|pipeline cache|Title ID') { Write-Host $line }
+			if (!$Precompile -or $line -match 'Precompile|pipeline cache|Title ID|^Shader (seeds|import):') { Write-Host $line }
 		}
 	}
 	if ($exited) { break }
