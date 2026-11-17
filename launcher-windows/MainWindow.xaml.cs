@@ -51,7 +51,7 @@ partial class MainWindow : Window {
 
 	TextBox gamePath, dataPath, resolutionText, extraArgs, environment;
 	ComboBox resolution, present, upscaling, renderScale, frameGen, language, gpu, log, uiLanguage;
-	CheckBox fullscreen, stretch, hdr, overlay, sound, skipNotice, redzone, background, lists, pairs, noWait, ecores, reopenLauncher, occlusion;
+	CheckBox fullscreen, stretch, hdr, overlay, sound, skipNotice, redzone, buildFirst, background, lists, pairs, noWait, ecores, reopenLauncher, occlusion;
 	TextBlock resolutionNote, renderNote, frameGenNote, streamlineText, bannerTitle, bannerLine, shaderLine, problemText;
 	Button precompilePageButton;
 	Image banner;
@@ -394,7 +394,8 @@ partial class MainWindow : Window {
 		} catch (Exception) {
 			// (Being written, or text that is no path: as if there were none.)
 		}
-		return T(precompileClosed ? "precompile.closed" : "precompile.none");
+		// (With "Before playing" on, PLAY runs the pass itself.)
+		return T(precompileClosed ? "precompile.closed" : S.Bool("precompile_first") ? "precompile.noneFirst" : "precompile.none");
 	}
 
 	// ------------------------------------------------------------------ Display
@@ -570,6 +571,8 @@ partial class MainWindow : Window {
 		shaderLine = new TextBlock { Foreground = Res<Brush>("TextBrush"), TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 4, 0, 0), LineHeight = 18 };
 		precompilePageButton = FlatButton("button.precompile", (s, e) => Precompile());
 		ecores = Switch(S.Bool("ecores") && context.EfficiencyMask != 0, context.EfficiencyMask != 0);
+		// (PLAY's own: the pass before the game when this data folder has no finished one.)
+		buildFirst = Switch(S.Bool("precompile_first"));
 		background = Switch(S.Bool("precompile_pipelines"));
 		lists = Switch(S.Bool("pipeline_lists"));
 		pairs = Switch(S.Bool("shader_pairs"));
@@ -577,6 +580,7 @@ partial class MainWindow : Window {
 		return Page("shaders.title",
 			shaderLine,
 			Section("shaders.precompile"),
+			Row("first", buildFirst, Desc(T("first.desc"))),
 			Row(null, precompilePageButton, Desc(T("precompile.desc"))),
 			Row(null, Labelled(ecores, "ecores"), context.EfficiencyMask != 0 ? null : Desc(T("ecores.none"))),
 			Section("shaders.playing"),
@@ -667,6 +671,7 @@ partial class MainWindow : Window {
 		S.Set("sound", sound.IsChecked == true);
 		S.Set("skip_notice_screen", skipNotice.IsChecked == true);
 		S.Set("redzone", redzone.IsChecked == true);
+		S.Set("precompile_first", buildFirst.IsChecked == true);
 		S.Set("precompile_pipelines", background.IsChecked == true);
 		S.Set("pipeline_lists", lists.IsChecked == true);
 		S.Set("shader_pairs", pairs.IsChecked == true);
@@ -696,6 +701,7 @@ partial class MainWindow : Window {
 		// (With a DLSS mode, the mode stands where the 3D resolution's percent does: that one does not apply.)
 		var dlss = commands.Dlss != "off";
 		var shaders = new List<string>();
+		if (S.Bool("precompile_first")) shaders.Add(T("summary.first"));
 		if (S.Bool("precompile_pipelines")) shaders.Add(T("summary.background"));
 		if (S.Bool("pipeline_lists")) shaders.Add(T("summary.lists"));
 		if (S.Bool("shader_pairs")) shaders.Add(T("summary.pairs"));

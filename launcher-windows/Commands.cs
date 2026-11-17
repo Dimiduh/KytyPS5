@@ -182,6 +182,12 @@ sealed class Commands {
 		// passed already when it is on.
 		arguments.AddRange(new[] { "-Dlss", Dlss });
 		if (Dlss != "off" && FrameGen < 2) arguments.AddRange(new[] { "-StreamlineDir", Quoted(context.Streamline) });
+		// The shaders before the game (run-windows.ps1 -PrecompileFirst): on, the precompile pass runs first in the
+		// game's console unless the data folder has a finished one for this emulator, game and driver; its summary goes
+		// to the file the "Precompile shaders" button's pass writes, so the window shows it afterwards. Always passed,
+		// like the other choices with a value.
+		arguments.AddRange(new[] { "-PrecompileFirst", S.Bool("precompile_first") ? "on" : "off" });
+		if (S.Bool("precompile_first")) arguments.AddRange(new[] { "-ResultFile", Quoted(context.PrecompileResultFile()) });
 		arguments.Add("-Follow");
 		return PowerShell() + " " + string.Join(" ", arguments) + (direct ? "" : " || pause");
 	}

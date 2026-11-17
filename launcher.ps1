@@ -28,7 +28,7 @@ $logNames = 'Off', 'File (in the logs folder)', 'Console (slow)'
 
 $settings = [ordered]@{ game = ''; data = ''; resolution = '1920x1080'; fullscreen = $false; stretch = $false; language = 1
 	gpu = -1; gpu_name = ''; present_mode = 'Mailbox'; hdr = $false; perf_overlay = $false; sound = $true
-	skip_notice_screen = $false; redzone = $false; precompile_pipelines = $true; pipeline_lists = $true; shader_pairs = $true; skip_pending_draws = $true; framegen = 1; render_scale = 100; dlss = 'off'; occlusion_queries = $true; streamline = ''; log = 'off'; extra_args = ''; environment = '' }
+	skip_notice_screen = $false; redzone = $false; precompile_first = $true; precompile_pipelines = $true; pipeline_lists = $true; shader_pairs = $true; skip_pending_draws = $true; framegen = 1; render_scale = 100; dlss = 'off'; occlusion_queries = $true; streamline = ''; log = 'off'; extra_args = ''; environment = '' }
 if (Test-Path -LiteralPath $settingsPath) {
 	# (A file that cannot be read leaves the defaults.)
 	try {
@@ -142,6 +142,8 @@ function Get-LogFolder {
 	if (Test-Path "$root\_Build") { return "$root\_Build\run-logs" }
 	return "$root\logs"
 }
+# run-windows.ps1 -ResultFile: the last precompile pass's summary, then its time and exit code.
+function Get-PrecompileResultFile { return Join-Path (Get-LogFolder) 'precompile-last.txt' }
 
 # A value as one argument of a command line: in double quotes, a quote inside as \" and the backslashes before a
 # quote doubled (the folder D:\data\ would otherwise end in an escaped quote).
@@ -297,6 +299,12 @@ function Get-PlayCommand {
 	if ($dlss -ne 'off' -and !($frameGenAvailable -and [int]$settings.framegen -ge 2)) {
 		$arguments += @('-StreamlineDir', (Format-Quoted $streamline))
 	}
+	# The shaders before the game (run-windows.ps1 -PrecompileFirst): on, the precompile pass runs first in the game's
+	# console unless the data folder has a finished one for this emulator, game and driver; its summary goes to the
+	# file the "Precompile shaders" button's pass writes, so the window shows it afterwards. Always passed, like the
+	# other choices with a value.
+	$arguments += @('-PrecompileFirst', $(if ($settings.precompile_first) { 'on' } else { 'off' }))
+	if ($settings.precompile_first) { $arguments += @('-ResultFile', (Format-Quoted (Get-PrecompileResultFile))) }
 	# The console stays for the live log; after a crash it waits for a key.
 	return "$powershellCommand " + (($arguments + '-Follow') -join ' ') + ' || pause'
 }
@@ -310,7 +318,7 @@ function Get-PrecompileCommand([string]$resultFile) {
 function Save-Settings { $settings | ConvertTo-Json | Set-Content -LiteralPath $settingsPath -Encoding UTF8 }
 if ($DryRun) {
 	"play:       cmd /s /c `"$(Get-PlayCommand)`""
-	"precompile: cmd /s /c `"$(Get-PrecompileCommand (Join-Path (Get-LogFolder) 'precompile-last.txt'))`""
+	"precompile: cmd /s /c `"$(Get-PrecompileCommand (Get-PrecompileResultFile))`""
 	"settings:   $settingsPath"
 	"emulator:   $exe$(if (!(Test-Path -LiteralPath $exe)) { ' (missing: build it with build-windows.cmd)' })"
 	"data:       $(Get-DataFolder); logs: $(Get-LogFolder)"
@@ -528,6 +536,11 @@ $tips.SetToolTip($redzone, "Windows writes exception frames just below the game'
 	"The emulator always runs the functions that do from a copy that is safe. With this (--redzone) it also patches`n" +
 	"single instructions of the functions it could not copy.")
 Add-Row '' @($redzone)
+$precompileFirst = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Before playing: build the shaders that are not built yet (the first pass of a game takes minutes)'; AutoSize = $true; Checked = [bool]$settings.precompile_first }
+$tips.SetToolTip($precompileFirst, "The first pass of a game takes a while (minutes); later starts take a second to check.`n" +
+	"On: the game starts with everything built and does not stutter while shaders compile. Close the pass's emulator`n" +
+	"window to play right away. Off: the game starts at once and builds what is missing while it runs.")
+Add-Row '' @($precompileFirst)
 $precompilePipelines = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Prepare shaders in the background while the game runs'; AutoSize = $true; Checked = [bool]$settings.precompile_pipelines }
 $tips.SetToolTip($precompilePipelines, "On: the shaders and pipelines earlier sessions recorded are built in the background, at low priority, from the`n" +
 	"start of the game, so that fewer are compiled the moment they are first drawn (a stutter).`n" +
@@ -627,6 +640,7 @@ function Read-Form {
 	$settings.sound                = $sound.Checked
 	$settings.skip_notice_screen   = $skipNotice.Checked
 	$settings.redzone              = $redzone.Checked
+	$settings.precompile_first     = $precompileFirst.Checked
 	$settings.precompile_pipelines = $precompilePipelines.Checked
 	$settings.pipeline_lists       = $pipelineLists.Checked
 	$settings.shader_pairs         = $shaderPairs.Checked
@@ -652,7 +666,7 @@ $play.Add_Click({
 $precompileTimer = New-Object System.Windows.Forms.Timer -Property @{ Interval = 1000 }
 $precompile.Add_Click({
 	Read-Form
-	$script:precompileResult = Join-Path (Get-LogFolder) 'precompile-last.txt'
+	$script:precompileResult = Get-PrecompileResultFile
 	Remove-Item -LiteralPath $script:precompileResult -ErrorAction SilentlyContinue
 	$script:precompileBegin = Get-Date
 	$script:precompileProcess = Start-Process $cmd -ArgumentList "/s /c `"$(Get-PrecompileCommand $script:precompileResult)`"" -WorkingDirectory $root -PassThru

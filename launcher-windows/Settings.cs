@@ -17,6 +17,7 @@ sealed class Settings {
 		new object[] {"gpu", -1}, new object[] {"gpu_name", ""}, new object[] {"present_mode", "Mailbox"},
 		new object[] {"hdr", false}, new object[] {"perf_overlay", false}, new object[] {"sound", true},
 		new object[] {"skip_notice_screen", false}, new object[] {"redzone", false},
+		new object[] {"precompile_first", true},
 		new object[] {"precompile_pipelines", true}, new object[] {"pipeline_lists", true},
 		new object[] {"shader_pairs", true},
 		new object[] {"skip_pending_draws", true}, new object[] {"framegen", 1}, new object[] {"render_scale", 100},

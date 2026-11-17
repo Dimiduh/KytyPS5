@@ -67,6 +67,7 @@ static class Strings {
 		{"fg.noStreamline", "Frame generation: choose NVIDIA's Streamline SDK folder (Graphics page)"},
 		{"precompile.last", "Last precompile: {0}"},
 		{"precompile.none", "No finished precompile for this data folder yet: 'Precompile shaders' builds the recorded shaders before playing."},
+		{"precompile.noneFirst", "No finished precompile for this data folder yet: PLAY builds the shaders first, then starts the game (a first pass takes a while)."},
 		{"precompile.running", "Precompiling the recorded shaders: its console window shows the progress."},
 		{"precompile.runningTime", "Precompiling the recorded shaders ({0}): its console window shows the progress."},
 		{"precompile.closed", "The precompile window was closed before the pass ended."},
@@ -82,6 +83,7 @@ static class Strings {
 		{"summary.redzone", "extended red-zone protection"}, {"summary.log", "log: {0}"},
 		{"summary.extra", "extra arguments"}, {"summary.environment", "environment switches"}, {"summary.data", "own data folder"},
 		{"summary.options", "Options"}, {"summary.shaders", "Shaders"},
+		{"summary.first", "built before playing"},
 		{"summary.background", "prepared in the background"}, {"summary.lists", "shared list"}, {"summary.pairs", "shader pairs"}, {"summary.noWait", "no waiting for new ones"},
 		{"summary.ecores", "precompile on the efficiency cores"},
 
@@ -133,6 +135,8 @@ static class Strings {
 		{"data.desc", "Where the emulator keeps its data: the saves (_SaveData), the shader and pipeline caches (_PipelineCache), downloads, temporary data, trophies and the logs. Empty: the emulator's folder ({0}). Each folder has its own saves and shader caches: a precompile is for the folder it ran with."},
 
 		{"shaders.title", "Shaders"}, {"shaders.precompile", "Precompile"}, {"shaders.playing", "While playing"},
+		{"first", "Before playing"},
+		{"first.desc", "Build the shaders that are not built yet before the game starts. The first pass of a game takes a while (minutes); later starts take a second to check. On: the game starts with everything built and does not stutter while shaders compile. Close the pass's emulator window to play right away. Off: the game starts at once and builds what is missing while it runs."},
 		{"precompile.desc", "Builds every shader and pipeline that earlier sessions of the game recorded into the graphics driver's cache, with the current settings, then exits: the game finds them there instead of compiling them while playing. For an Unreal Engine 5 game it also reads the game's own shader files (a few seconds, the first time) and builds all of its compute shaders; that first pass takes long. Worth running after a new emulator build or a graphics driver update. Its summary and the time it took show here when it ends."},
 		{"ecores", "Precompile on the efficiency cores only (slower, the PC stays responsive)"},
 		{"ecores.none", "This processor has one kind of core."},
@@ -201,6 +205,7 @@ static class Strings {
 		{"fg.noStreamline", "帧生成：请在「画质」页选择 NVIDIA Streamline SDK 文件夹"},
 		{"precompile.last", "上次预编译：{0}"},
 		{"precompile.none", "此数据文件夹还没有完成过预编译：「预编译着色器」会在游戏前编译好已记录的着色器。"},
+		{"precompile.noneFirst", "此数据文件夹还没有完成过预编译：点击开始游戏时会先编译着色器，然后启动游戏（首次预编译需要一段时间）。"},
 		{"precompile.running", "正在预编译已记录的着色器：进度显示在它的控制台窗口中。"},
 		{"precompile.runningTime", "正在预编译已记录的着色器（{0}）：进度显示在它的控制台窗口中。"},
 		{"precompile.closed", "预编译窗口在完成前被关闭。"},
@@ -216,6 +221,7 @@ static class Strings {
 		{"summary.redzone", "扩展红区保护"}, {"summary.log", "日志：{0}"},
 		{"summary.extra", "附加参数"}, {"summary.environment", "环境开关"}, {"summary.data", "单独的数据文件夹"},
 		{"summary.options", "选项"}, {"summary.shaders", "着色器"},
+		{"summary.first", "游戏前先编译"},
 		{"summary.background", "后台准备"}, {"summary.lists", "共享列表"}, {"summary.pairs", "着色器配对"}, {"summary.noWait", "不等待新着色器"},
 		{"summary.ecores", "在能效核上预编译"},
 
@@ -267,6 +273,8 @@ static class Strings {
 		{"data.desc", "模拟器保存数据的位置：存档（_SaveData）、着色器与管线缓存（_PipelineCache）、下载内容、临时数据、奖杯和日志。留空：模拟器所在的文件夹（{0}）。每个文件夹有各自的存档和着色器缓存：预编译只对运行它时所用的文件夹有效。"},
 
 		{"shaders.title", "着色器"}, {"shaders.precompile", "预编译"}, {"shaders.playing", "游戏运行时"},
+		{"first", "开始游戏前"},
+		{"first.desc", "在游戏启动前先编译尚未编译的着色器。一个游戏的首次预编译需要一段时间（数分钟）；之后每次启动只需约一秒的检查。打开：游戏启动时所有着色器都已编译好，不会因编译着色器而卡顿。想立即开始游戏时，关掉预编译的模拟器窗口即可。关闭：游戏立即启动，缺少的着色器在运行时编译。"},
 		{"precompile.desc", "按当前设置，把之前游玩时记录的所有着色器和管线编译进显卡驱动的缓存，然后退出：游戏运行时直接使用，不必边玩边编译。对于虚幻引擎 5 游戏，还会读取游戏自身的着色器文件（首次需要几秒），并编译其全部计算着色器；首次运行耗时较长。更新模拟器或显卡驱动后值得再运行一次。完成后这里会显示它的摘要和用时。"},
 		{"ecores", "仅在能效核上预编译（较慢，但电脑仍保持流畅）"},
 		{"ecores.none", "此处理器只有一种核心。"},
