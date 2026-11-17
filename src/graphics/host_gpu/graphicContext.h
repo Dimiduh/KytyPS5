@@ -214,6 +214,14 @@ struct GraphicContext {
 	MemoryPriority::Tracker                  memory_priority;
 	std::mutex                               priority_pools_mutex;
 	std::array<VmaPool, VK_MAX_MEMORY_TYPES> priority_pools {};
+	// KYTY_SIMULATE_VRAM_MB: the video memory taken at start-up and kept, so that this process
+	// has as much left as on a smaller card. The budgets and usages read through HeapBudgets
+	// leave it out (vma.cpp).
+	std::vector<vk::DeviceMemory> simulation_ballast;
+	uint64_t                      simulation_ballast_bytes = 0;
+	uint32_t                      simulation_ballast_heap  = 0;
+	void                          HeapBudgets(VmaBudget* budgets) const;
+	void                          TakeSimulationBallast();
 
 	uint32_t screen_width  = 0;
 	uint32_t screen_height = 0;

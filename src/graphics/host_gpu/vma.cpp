@@ -47,13 +47,104 @@ bool GraphicContext::CreateAllocator() {
 	if (memory_priority_enabled) {
 		info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_PRIORITY_BIT;
 	}
+	// The allocator's blocks: 64 MiB on a card with less than 13 GiB of video memory
+	// (KYTY_SIMULATE_VRAM_MB counts), its own 256 MiB on bigger ones. A card that runs past its
+	// budget has part of the game's memory moved to system memory by the driver, block by
+	// block: with smaller blocks more of what a frame reads stays in video memory (the DS fork
+	// measured 2 to 6% on a card of 8 GB). KYTY_VMA_BLOCK_MB=<n>: n MiB.
+	{
+		uint64_t video = 0;
+		for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
+			if (physical_device_memory_properties.memoryHeaps[heap].flags &
+			    vk::MemoryHeapFlagBits::eDeviceLocal) {
+				video = std::max<uint64_t>(video,
+				                           physical_device_memory_properties.memoryHeaps[heap].size);
+			}
+		}
+		if (const char* simulate = std::getenv("KYTY_SIMULATE_VRAM_MB");
+		    simulate != nullptr && *simulate != '\0') {
+			video = std::min<uint64_t>(video, std::strtoull(simulate, nullptr, 10) << 20u);
+		}
+		const char*    text  = std::getenv("KYTY_VMA_BLOCK_MB");
+		const uint64_t asked = text != nullptr ? std::strtoull(text, nullptr, 10) : 0;
+		if (asked != 0) {
+			info.preferredLargeHeapBlockSize = asked << 20u;
+		} else if (video != 0 && video < (uint64_t {13} << 30u)) {
+			info.preferredLargeHeapBlockSize = uint64_t {64} << 20u;
+		}
+	}
 
 	const auto result = static_cast<vk::Result>(vmaCreateAllocator(&info, &allocator));
 	if (result != vk::Result::eSuccess) {
 		LOGF("vmaCreateAllocator failed: %s\n", vk::to_string(result).c_str());
 		return false;
 	}
+	TakeSimulationBallast();
 	return true;
+}
+
+// KYTY_SIMULATE_VRAM_MB=<n>: a card with n MiB of video memory, for tests on a bigger one. A
+// limit in the allocator would not do it: what the allocator then puts elsewhere the driver
+// still keeps in video memory while there is room. So the rest of the largest device-local
+// heap is taken here, at the highest priority, and kept: the driver and Windows then move
+// the game's memory to system memory as on such a card.
+void GraphicContext::TakeSimulationBallast() {
+	const char* text = std::getenv("KYTY_SIMULATE_VRAM_MB");
+	if (text == nullptr || *text == '\0') {
+		return;
+	}
+	const uint64_t simulated = std::strtoull(text, nullptr, 10) << 20u;
+	const auto&    memory    = physical_device_memory_properties;
+	uint32_t       heap      = UINT32_MAX;
+	for (uint32_t i = 0; i < memory.memoryHeapCount; i++) {
+		if ((memory.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) &&
+		    (heap == UINT32_MAX || memory.memoryHeaps[i].size > memory.memoryHeaps[heap].size)) {
+			heap = i;
+		}
+	}
+	uint32_t type = UINT32_MAX;
+	for (uint32_t i = 0; i < memory.memoryTypeCount && type == UINT32_MAX && heap != UINT32_MAX; i++) {
+		if (memory.memoryTypes[i].heapIndex == heap &&
+		    memory.memoryTypes[i].propertyFlags == vk::MemoryPropertyFlagBits::eDeviceLocal) {
+			type = i;
+		}
+	}
+	if (type == UINT32_MAX || simulated == 0) {
+		return;
+	}
+	const uint64_t size = memory.memoryHeaps[heap].size;
+	simulation_ballast_heap = heap;
+	for (uint64_t left = simulated < size ? size - simulated : 0; left > 0;) {
+		const uint64_t                    chunk = std::min<uint64_t>(left, uint64_t {1} << 30u);
+		vk::MemoryPriorityAllocateInfoEXT priority {};
+		priority.priority = 1.0f;
+		vk::MemoryAllocateInfo info {};
+		info.pNext           = memory_priority_enabled ? &priority : nullptr;
+		info.allocationSize  = chunk;
+		info.memoryTypeIndex = type;
+		vk::DeviceMemory taken = nullptr;
+		if (device.allocateMemory(&info, nullptr, &taken) != vk::Result::eSuccess) {
+			break;
+		}
+		simulation_ballast.push_back(taken);
+		simulation_ballast_bytes += chunk;
+		left -= chunk;
+	}
+	LOGF("Simulated video memory: %" PRIu64 " MiB of heap %u (%" PRIu64
+	     " MiB) taken, so %" PRIu64 " MiB are left; priorities %s\n",
+	     simulation_ballast_bytes >> 20u, heap, size >> 20u,
+	     (size - simulation_ballast_bytes) >> 20u, memory_priority_enabled ? "on" : "off");
+}
+
+// The allocator's budgets without the simulation's ballast: the budget and the usage of its
+// heap as a card without that memory would report them.
+void GraphicContext::HeapBudgets(VmaBudget* budgets) const {
+	vmaGetHeapBudgets(allocator, budgets);
+	if (simulation_ballast_bytes != 0) {
+		auto& heap = budgets[simulation_ballast_heap];
+		heap.usage -= std::min<uint64_t>(heap.usage, simulation_ballast_bytes);
+		heap.budget -= std::min<uint64_t>(heap.budget, simulation_ballast_bytes);
+	}
 }
 
 void GraphicContext::DestroyAllocator() {
@@ -67,6 +158,11 @@ void GraphicContext::DestroyAllocator() {
 			pool = nullptr;
 		}
 	}
+	for (const auto memory: simulation_ballast) {
+		device.freeMemory(memory);
+	}
+	simulation_ballast.clear();
+	simulation_ballast_bytes = 0;
 	vmaDestroyAllocator(allocator);
 	allocator = nullptr;
 }
@@ -167,7 +263,7 @@ void GraphicContext::LogMemoryBudget() const {
 
 	const auto& properties = physical_device_memory_properties;
 	VmaBudget   budgets[VK_MAX_MEMORY_HEAPS] {};
-	vmaGetHeapBudgets(allocator, budgets);
+	HeapBudgets(budgets);
 	for (uint32_t i = 0; i < properties.memoryHeapCount; i++) {
 		LOGF("VMA heap %u: usage=%" PRIu64 ", budget=%" PRIu64 ", allocation=%" PRIu64
 		     ", blocks=%" PRIu64 "\n",
@@ -182,7 +278,7 @@ uint64_t GraphicContext::GetDeviceMemoryUsage() const {
 		return 0;
 	}
 	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
-	vmaGetHeapBudgets(allocator, budgets);
+	HeapBudgets(budgets);
 	const bool discrete =
 	    physical_device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu;
 	uint64_t usage = 0;
@@ -202,7 +298,7 @@ uint32_t GraphicContext::GetHeapUsage(std::span<HeapUsage, VK_MAX_MEMORY_HEAPS> 
 		return 0;
 	}
 	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
-	vmaGetHeapBudgets(allocator, budgets);
+	HeapBudgets(budgets);
 	const auto count = physical_device_memory_properties.memoryHeapCount;
 	for (uint32_t heap = 0; heap < count; heap++) {
 		const auto& properties = physical_device_memory_properties.memoryHeaps[heap];
@@ -223,7 +319,7 @@ GraphicContext::MemoryHeaps GraphicContext::SampleMemoryHeaps() const {
 		return heaps;
 	}
 	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
-	vmaGetHeapBudgets(allocator, budgets);
+	HeapBudgets(budgets);
 	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
 		const bool device_local =
 		    static_cast<bool>(physical_device_memory_properties.memoryHeaps[heap].flags &
@@ -292,7 +388,7 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 		return 0;
 	}
 	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
-	vmaGetHeapBudgets(allocator, budgets);
+	HeapBudgets(budgets);
 	const bool discrete =
 	    physical_device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu;
 	uint64_t budget = 0;
