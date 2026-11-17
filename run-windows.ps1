@@ -27,6 +27,11 @@
 #                                            exit: its "Precompile done:" line and the time it took at the end.
 #                                            The pass can be stopped by closing the emulator's window: what it
 #                                            built is kept, and the next pass goes on from there
+#   .\run-windows.ps1 -PrecompileFirst on    before the game starts: that pass first, in this window, unless this data
+#                                            folder has a finished one for this emulator, game, shader lists and
+#                                            graphics driver (the pass leaves _PipelineCache\precompile-stamp.txt).
+#                                            The game then starts with everything built. Closing the pass's window
+#                                            starts the game at once; the next start goes on with the pass
 #   .\run-windows.ps1 -PrecompileThreads 6   with -Precompile: build 6 pipelines at a time (default: every logical
 #                                            CPU but two; fewer leaves more of the PC for other things)
 #   .\run-windows.ps1 -ImportShaders <file>  with -Precompile: also build the compute shaders of this file, which
@@ -132,6 +137,7 @@ param(
 	# -Precompile: the pass's last lines (its summary, then the time and exit code) into this file too, for the
 	# launcher's window.
 	[string]$ResultFile = '',
+	[ValidateSet('', 'on', 'off')][string]$PrecompileFirst = '',
 	[switch]$Follow,
 	[switch]$DryRun
 )
@@ -388,10 +394,61 @@ Write-Host "data:     $DataDir; logs: $logDir"
 Write-Host ("affinity: 0x{0:X} ({1} CPUs)" -f $mask, $cpus)
 Write-Host "switches: $($environment.Count)"
 Write-Host "command:  $Exe $($quoted -join ' ')"
+# What a finished precompile pass of this data folder is good for: this emulator, this game, these lists of shaders
+# and this graphics driver. The pass leaves it as _PipelineCache\precompile-stamp.txt; -PrecompileFirst compares.
+function Get-PrecompileStamp {
+	$lines = New-Object System.Collections.Generic.List[string]
+	$about = { param([string]$kind, [string]$path)
+		if (!$path) { return }
+		$items = if (Test-Path -LiteralPath $path -PathType Container) {
+			@(Get-ChildItem -LiteralPath $path -File | Where-Object { $_.Name -notmatch '^README' } | Sort-Object Name)
+		} elseif (Test-Path -LiteralPath $path) { @(Get-Item -LiteralPath $path) } else { @() }
+		$lines.Add("$kind $path")
+		foreach ($item in $items) { $lines.Add("  $($item.Name) $($item.Length) $($item.LastWriteTimeUtc.Ticks)") }
+	}
+	& $about 'emulator' $Exe
+	& $about 'game' $Game
+	foreach ($name in '--import-pipeline-list', '--shader-pairs', '--import-shaders', '--gpu') {
+		$at = $options.IndexOf($name)
+		if ($at -lt 0) { continue }
+		if ($name -eq '--gpu') { $lines.Add("gpu $($options[$at + 1])") } else { & $about $name.TrimStart('-') $options[$at + 1] }
+	}
+	# (A new graphics driver starts its pipeline cache over.)
+	try {
+		foreach ($card in @(Get-CimInstance Win32_VideoController -ErrorAction Stop | Sort-Object Name)) { $lines.Add("driver $($card.Name) $($card.DriverVersion)") }
+	} catch { }
+	return ($lines -join "`n")
+}
+$stampFile = Join-Path $DataDir '_PipelineCache\precompile-stamp.txt'
+$stampNow = Get-PrecompileStamp
+$stampKept = if (Test-Path -LiteralPath $stampFile) { "$(Get-Content -LiteralPath $stampFile -Raw)".Replace("`r", '').TrimEnd("`n") } else { '' }
+$passDue = $PrecompileFirst -eq 'on' -and !$Precompile -and $stampKept -ne $stampNow
+if ($PrecompileFirst -eq 'on' -and !$Precompile) {
+	Write-Host "shaders:  $(if (!$passDue) { 'built for this emulator, game and driver' } elseif ($stampKept) { 'built for another emulator, game, list or driver: the precompile pass runs first' } else { 'no finished precompile pass in this data folder: it runs first' })"
+}
 if ($DryRun) {
 	$environment.GetEnumerator() | ForEach-Object { "  $($_.Key)=$($_.Value)" }
 	$removed | ForEach-Object { "  $_ (removed)" }
 	return
+}
+
+# -PrecompileFirst: the pass, in this window, with what this start was given; then the game. A pass that is closed
+# leaves no stamp, so the next start goes on with it.
+if ($passDue) {
+	Write-Host ''
+	Write-Host 'Building the shaders before the game starts. A first pass of a game takes a while; later ones take seconds.'
+	Write-Host 'To play right away, close the emulator window of the pass: the game starts and builds the rest as it runs.'
+	Write-Host ''
+	$forward = @{}
+	foreach ($key in $PSBoundParameters.Keys) {
+		if ($key -notin 'Follow', 'PrecompileFirst', 'Dlss', 'FrameGen', 'Fullscreen', 'DryRun') { $forward[$key] = $PSBoundParameters[$key] }
+	}
+	$forward['Game'] = $Game
+	$forward['Precompile'] = $true
+	& $PSCommandPath @forward
+	Write-Host ''
+	$stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
+	if ($Log -eq 'file') { Set-Option '--printf-output-file' "$logDir\$stamp.log"; $quoted = @('--game', (Format-Argument $Game)) + @($options | ForEach-Object { Format-Argument $_ }); if ($ExtraArgs.Trim()) { $quoted += $ExtraArgs.Trim() } }
 }
 
 New-Item -ItemType Directory -Force $DataDir | Out-Null
@@ -463,5 +520,13 @@ if ($process.ExitCode -ne 0) {
 if ($ResultFile) {
 	New-Item -ItemType Directory -Force (Split-Path $ResultFile) | Out-Null
 	Set-Content -LiteralPath $ResultFile -Value @($summary, $result) -Encoding UTF8
+}
+# A pass that went through: what it is good for (taken now: the pass itself writes a game's shader seeds), for
+# -PrecompileFirst. A closed or failed one leaves the folder without, or with the stamp of an older pass.
+if ($process.ExitCode -eq 0 -and $summary -match '^Precompile done:') {
+	New-Item -ItemType Directory -Force (Split-Path $stampFile) | Out-Null
+	Set-Content -LiteralPath $stampFile -Value (Get-PrecompileStamp) -Encoding UTF8
+} elseif ($stampKept -and $stampKept -ne $stampNow) {
+	Remove-Item -LiteralPath $stampFile -ErrorAction SilentlyContinue
 }
 exit $process.ExitCode
