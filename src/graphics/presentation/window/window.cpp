@@ -914,12 +914,13 @@ int WindowPrecompilePipelines() {
 	// asked for the pipeline: a build for every logical CPU the process may use but two, which
 	// stay free for the rest of the PC (--precompile-threads names another count). Measured on
 	// Saros with an i9-13900K (8 fast and 16 small cores): the same 3,000 builds take 208 s on
-	// 8 threads and 118 s on 30. Each build at a time costs about a quarter of a gigabyte of
-	// memory in the driver, next to the 2 to 3 GB the pass holds anyway.
+	// 8 threads and 118 s on 30. Memory bounds the count too: the driver's compiler takes up to
+	// two thirds of a gigabyte for each build it has at a time (22 GB at the peak with 30
+	// builds), next to the few GB the pass and the rest of the PC hold anyway.
 	const auto asked     = Config::PrecompileThreads();
 	const auto cpus      = Common::Thread::AvailableProcessors();
 	const auto memory    = static_cast<uint32_t>(std::max(SDL_GetSystemRAM(), 0)); // MiB; 0: unknown
-	const auto by_memory = memory == 0 ? 64u : memory > 5632u ? (memory - 4096u) / 384u : 4u;
+	const auto by_memory = memory == 0 ? 64u : memory > 7680u ? (memory - 6144u) / 700u : 2u;
 	const auto threads =
 	    asked != UINT32_MAX ? asked : std::clamp(std::min(cpus > 2u ? cpus - 2u : 1u, by_memory), 1u, 64u);
 	SDL_SetWindowTitle(g_window->window, "Kyty: precompiling pipelines");

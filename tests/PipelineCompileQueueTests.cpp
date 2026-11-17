@@ -135,6 +135,37 @@ void TestStop() {
 	      "the destructor discards uncollected results and skips failed builds");
 }
 
+// A pass that ends drops what has not started and lets the running job finish by itself.
+void TestDropQueued() {
+	PipelineCompileQueue queue(1, [](uint64_t) {});
+	std::atomic<int>     alive = 0;
+	std::atomic<int>     ran   = 0;
+	Gate                 started;
+	Gate                 release;
+	const auto           first = queue.Enqueue([&, inputs = std::make_unique<Inputs>(alive)] {
+		started.Release();
+		release.Wait();
+		ran++;
+		return uint64_t {0x11};
+	});
+	for (uint64_t i = 0; i < 3; i++) {
+		queue.Enqueue([&, inputs = std::make_unique<Inputs>(alive)] {
+			ran++;
+			return uint64_t {0x22};
+		});
+	}
+	started.Wait();
+	Check(queue.DropQueued() == 3 && alive == 1 && queue.Outstanding() == 1,
+	      "dropping the queued jobs leaves the running one, without waiting for it");
+	Check(queue.DropQueued() == 0, "nothing is left to drop");
+	release.Release();
+	queue.WaitIdle();
+	std::vector<PipelineCompileQueue::Completion> completed;
+	queue.TakeCompleted(completed);
+	Check(ran == 1 && completed.size() == 1 && completed[0].ticket == first && completed[0].handle == 0x11,
+	      "the running job completes as usual and no dropped job ran");
+}
+
 void TestExpedite() {
 	std::vector<uint64_t> discarded;
 	PipelineCompileQueue  queue(1, [&](uint64_t handle) { discarded.push_back(handle); });
@@ -314,6 +345,7 @@ void TestAbandon() {
 int main() {
 	TestCompletion();
 	TestStop();
+	TestDropQueued();
 	TestExpedite();
 	TestOrder();
 	TestActiveThreads();

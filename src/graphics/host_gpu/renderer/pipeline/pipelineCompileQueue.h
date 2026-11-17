@@ -74,6 +74,10 @@ public:
 	bool Abandon(uint64_t ticket);
 	// Workers that run an abandoned job.
 	[[nodiscard]] size_t AbandonedRunning();
+	// Drops the queued jobs without waiting for the running ones, which go on and complete as
+	// usual (a pass that ends: its driver builds cannot be interrupted, but no new one should
+	// start). Returns how many jobs were dropped.
+	size_t DropQueued();
 	// Drops the queued jobs, waits for the running ones (except abandoned ones), joins the
 	// threads and discards every uncollected handle. Idempotent.
 	void Stop();

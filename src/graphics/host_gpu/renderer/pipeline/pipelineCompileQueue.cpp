@@ -164,6 +164,21 @@ void PipelineCompileQueue::Finish(State& state, uint64_t ticket, uint64_t handle
 	std::erase(state.running_tickets, ticket);
 }
 
+size_t PipelineCompileQueue::DropQueued() {
+	auto&                                        state = *m_state;
+	std::map<std::pair<uint64_t, uint64_t>, Job> dropped;
+	{
+		std::lock_guard lock(state.mutex);
+		dropped = std::move(state.jobs);
+		state.jobs.clear();
+		state.job_orders.clear();
+	}
+	// A job owns its build inputs; destroy them outside the lock.
+	const auto count = dropped.size();
+	dropped.clear();
+	return count;
+}
+
 void PipelineCompileQueue::Stop() {
 	auto&                                        state = *m_state;
 	std::map<std::pair<uint64_t, uint64_t>, Job> dropped;

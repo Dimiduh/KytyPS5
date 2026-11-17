@@ -212,6 +212,17 @@ public:
 		Collect();
 	}
 
+	// Drops the jobs that have not started without waiting for the running ones, and takes no
+	// new ones: for a pass that ends while its builds run (Stop would wait for driver builds
+	// that take minutes). Returns how many jobs were dropped.
+	size_t DropQueued() {
+		{
+			std::lock_guard lock(m_mutex);
+			m_stopped = true;
+		}
+		return m_queue.DropQueued();
+	}
+
 	// Drops the jobs that have not started and waits for the running ones that were not
 	// abandoned. Idempotent.
 	void Stop() {

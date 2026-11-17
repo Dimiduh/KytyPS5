@@ -2503,17 +2503,42 @@ public:
 		std::lock_guard lock(m_mutex);
 		return m_keys.size();
 	}
+	// A build has ended. It is not queued again in this process; the file gets it with Commit.
 	void Add(uint64_t key, bool built) {
 		std::lock_guard lock(m_mutex);
-		if (m_keys.try_emplace(key, built).second && m_file.is_open()) {
-			m_file << fmt::format("{} {:016x}\n", built ? 'b' : 's', key);
-			m_file.flush();
+		if (m_keys.try_emplace(key, built).second) {
+			m_pending.emplace_back(key, built);
 		}
+	}
+	using Ended = std::vector<std::pair<uint64_t, bool>>;
+	// The builds that ended since the last call. They go to the file (Commit) once a driver
+	// cache file that holds their pipelines is written, and back (Restore) when it could not
+	// be: the file must never name a pipeline that the cache file of a pass that was cut off
+	// does not have, or no later pass would build it.
+	[[nodiscard]] Ended TakePending() {
+		std::lock_guard lock(m_mutex);
+		return std::exchange(m_pending, {});
+	}
+	void Commit(const Ended& ended) {
+		std::lock_guard lock(m_mutex);
+		if (ended.empty() || !m_file.is_open()) {
+			return;
+		}
+		for (const auto& [key, built]: ended) {
+			m_file << fmt::format("{} {:016x}\n", built ? 'b' : 's', key);
+		}
+		m_file.flush();
+	}
+	void Restore(Ended ended) {
+		std::lock_guard lock(m_mutex);
+		ended.insert(ended.end(), m_pending.begin(), m_pending.end());
+		m_pending = std::move(ended);
 	}
 	// The driver cache starts over: so does this.
 	void Clear() {
 		std::lock_guard lock(m_mutex);
 		m_keys.clear();
+		m_pending.clear();
 		Rewrite();
 	}
 
@@ -2532,6 +2557,8 @@ private:
 	std::string                  m_line;
 	mutable std::mutex                 m_mutex;
 	std::unordered_map<uint64_t, bool> m_keys;
+	// Ended and not in the file yet.
+	Ended                              m_pending;
 	std::ofstream                      m_file;
 };
 
@@ -3760,8 +3787,8 @@ PipelineCache::PrecompileResult PipelineCache::PrecompileAll(uint32_t thread_cou
 	// A long pass says that it need not be sat through.
 	if (m_precompile_progress.Get().queued >= 2000) {
 		PipelineCacheLog("Precompile: the pass can be stopped at any time by closing the emulator's "
-		                 "window: what it has built is kept (it is also saved every few minutes), "
-		                 "and the next pass goes on from there");
+		                 "window: what it has built is saved then (and every few minutes while it "
+		                 "runs), and the next pass goes on from there");
 	}
 	while (!m_precompile_progress.Complete()) {
 		if (pump && !pump()) {
@@ -3769,6 +3796,12 @@ PipelineCache::PrecompileResult PipelineCache::PrecompileAll(uint32_t thread_cou
 			break;
 		}
 		CheckPrecompileTimeouts();
+		// What the pass has built is written every few minutes, in the background, as a session
+		// does it: a pass that is cut off (a power cut, a closed console) loses the minutes since.
+		if (m_precompile_dirty.load(std::memory_order_relaxed) &&
+		    m_precompile_dirty.exchange(false, std::memory_order_relaxed)) {
+			CheckpointDriverCache();
+		}
 		if (const auto now = std::chrono::steady_clock::now(); now >= next_report) {
 			next_report += std::chrono::seconds {30};
 			const auto counts = m_precompile_progress.Get();
@@ -3792,7 +3825,12 @@ PipelineCache::PrecompileResult PipelineCache::PrecompileAll(uint32_t thread_cou
 		std::this_thread::sleep_for(std::chrono::milliseconds {250});
 	}
 	if (interrupted) {
-		PipelineCacheLog("Precompile: interrupted (window closed)");
+		// No build starts any more. The ones in a driver call cannot be stopped; they do not count
+		// as attempts that ended the process (two of those quarantine a build), and what they add
+		// to the cache while it is written is allowed for (WriteDriverCache).
+		const auto dropped = m_precompile_queue->DropQueued();
+		EndPrecompileForExit();
+		PipelineCacheLog("Precompile: interrupted (window closed); {} builds were not started", dropped);
 		if (m_driver_cache_rebuild) {
 			// The next run rebuilds again; the old file stays meanwhile.
 			m_driver_cache_dirty.store(false);
@@ -4030,6 +4068,12 @@ bool PipelineCache::Save() {
 	PersistStaleMisses();
 	if (m_driver_cache == nullptr || m_driver_cache_path.empty() ||
 	    !m_driver_cache_dirty.exchange(false)) {
+		// Nothing to write: what ended since the last write changed no cache (shaders that do
+		// not translate), or there is no cache file to fall behind. (A rebuild that was stopped
+		// keeps the old file, which does not have what this pass built.)
+		if (m_finished_created != nullptr && !m_driver_cache_rebuild) {
+			m_finished_created->Commit(m_finished_created->TakePending());
+		}
 		return true;
 	}
 	m_next_driver_cache_save = std::chrono::steady_clock::now() + DriverCacheSaveInterval;
@@ -4045,15 +4089,28 @@ bool PipelineCache::WriteDriverCache() {
 	const auto built =
 	    m_driver_history != nullptr ? m_driver_history->Snapshot() : std::vector<uint64_t> {};
 	const auto           stale = m_driver_history != nullptr ? m_driver_history->StaleCount() : 0;
+	// And the builds that ended before the data is taken: their pipelines are in it.
+	auto ended = m_finished_created != nullptr ? m_finished_created->TakePending()
+	                                           : FinishedBuilds::Ended {};
+	const auto give_back = [&] {
+		if (m_finished_created != nullptr) {
+			m_finished_created->Restore(std::move(ended));
+		}
+	};
 	size_t               size  = 0;
 	vk::Result           result;
 	std::vector<uint8_t> payload;
-	for (uint32_t attempt = 0; attempt < 3; attempt++) {
+	// Builds may run meanwhile (a precompile's threads, a pass that was stopped and whose driver
+	// calls cannot be interrupted), and each adds to the cache between the question for its size
+	// and the copy, which then comes back incomplete: the buffer gets room to spare, more with
+	// every attempt.
+	for (uint32_t attempt = 0; attempt < 8; attempt++) {
 		size   = 0;
 		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, nullptr);
 		if (result != vk::Result::eSuccess || size == 0) {
 			break;
 		}
+		size += (size / 16u + (size_t {16} << 20u)) * (size_t {1} << std::min(attempt, 4u));
 		payload.resize(size);
 		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, payload.data());
 		if (result != vk::Result::eIncomplete) {
@@ -4063,6 +4120,7 @@ bool PipelineCache::WriteDriverCache() {
 	if (result != vk::Result::eSuccess || size == 0) {
 		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {:.2f} MB)",
 		                 vk::to_string(result), static_cast<double>(size) / 1'000'000.0);
+		give_back();
 		return false;
 	}
 	payload.resize(size);
@@ -4072,10 +4130,14 @@ bool PipelineCache::WriteDriverCache() {
 	                            DriverCacheFile::DefaultChunkSize, &hash)) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
+		give_back();
 		return false;
 	}
 	if (m_driver_history != nullptr) {
 		WriteDriverHistory(built, hash, stale);
+	}
+	if (m_finished_created != nullptr) {
+		m_finished_created->Commit(ended);
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {:.2f} MB to {}",
 	                 static_cast<double>(payload.size()) / 1'000'000.0,
