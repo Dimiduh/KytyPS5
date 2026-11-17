@@ -91,10 +91,14 @@ private:
 		std::unique_ptr<Buffer> buffer;
 		size_t                  dirty_begin   = 0; // Slots to upload.
 		size_t                  dirty_end     = 0;
-		size_t                  changed_begin = 0; // Table bytes changed since it was probed.
-		size_t                  changed_end   = 0;
+		// Table bytes changed since it was probed: one range per run of rewritten pages, in
+		// ascending order (a table of 200,000 entries with a few rewritten far apart is not
+		// probed again in between).
+		std::vector<std::pair<size_t, size_t>> changed;
 		uint64_t                resolve_epoch = 0;
 		uint64_t                layout_epoch  = 0;
+		// Taken for the images its table holds, not for its probes (Acquire).
+		bool by_content = false;
 		uint64_t                held_serial   = 0; // Image::serials when held was last retried.
 		size_t                  published     = SIZE_MAX; // Kinds Peek returns.
 	};
@@ -145,6 +149,12 @@ private:
 	void     Unreference(Element& element);
 	Image*   ImageOf(const Element& element) const;
 	uint32_t Allocate();
+	// Whether the usable descriptors at the probes of a view of `memory` are at most `budget`
+	// different ones.
+	[[nodiscard]] bool HoldsAtMost(const Memory& memory, uint64_t first, uint64_t step,
+	                               uint64_t count,
+	                               const ShaderRecompiler::IR::ImageResource& profile,
+	                               uint64_t                                   budget) const;
 	void     Retire(View& view);
 	void     Resize(Memory& memory, uint64_t size);
 	void     WriteDescriptors();

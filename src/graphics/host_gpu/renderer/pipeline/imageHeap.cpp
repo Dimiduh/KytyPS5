@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/liveControl.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
@@ -13,6 +14,9 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdio>
+#include <unordered_set>
+#include <utility>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
@@ -39,6 +43,18 @@ void ForEachRun(size_t begin, size_t end, Pred&& pred, Fn&& fn) {
 }
 
 // The requests Acquire may keep resident: whole DWORDs.
+// 1: a table whose probes could exceed the heap (two elements a probe are reserved, since a
+// probe may hold an image of its own and a rewritten table keeps the released ones for a tick)
+// is taken all the same when the usable descriptors it holds now are few: at most a quarter of
+// the room the other tables leave. A table that then grows past the heap gets null images for
+// the entries that do not fit (Allocate) instead of leaving the heap.
+// Saros keeps its texture descriptors in one table of 198,656 entries (6 MiB) with about 2,100
+// different textures in it; the reservation refused it, and the one pixel shader a frame that
+// indexes it had the whole table enumerated at every draw (1.4 ms).
+// 0: only the reservation decides.
+Common::LiveControl::Switch  g_heap_by_content("heap_by_content", 1);
+Common::LiveControl::Counter g_heap_probes("heap_probes");
+
 bool Eligible(const IR::ImageHeapRequest& request) {
 	return request.count != 0u && request.step != 0u &&
 	       ((request.base | request.first | request.step) & 3u) == 0u;
@@ -176,17 +192,31 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 		// the elements it released until the tick is done: each view may need twice its probes.
 		// A table that could exceed the heap stays with the caller (materialized), not an exit.
 		// The probes the table's size allows bound a view, whatever count the request names.
-		uint64_t reserved = 2u * std::min(limit, Probes(bytes, request.first, request.step));
+		const auto count    = std::min(limit, Probes(bytes, request.first, request.step));
+		uint64_t   others   = 0;
 		for (const auto& other: m_memories) {
 			for (const auto& existing: other->views)
-				reserved += 2u * existing->count;
+				others += 2u * (existing->by_content ? existing->elements.size() : existing->count);
 		}
-		if (reserved >= IR::ImageHeapCapacity) {
-			PublishDecline(request, size, limit, profile);
-			return false;
+		bool by_content = false;
+		if (others + 2u * count >= IR::ImageHeapCapacity) {
+			// A decline holds until a table leaves the heap (Drop): the table is not counted
+			// again at every draw.
+			const bool declined = [&] {
+				std::scoped_lock lock {m_published_mutex};
+				return std::ranges::any_of(m_published, [&](const Published& published) {
+					return published.declined && published.Matches(request, size, limit, profile);
+				});
+			}();
+			const auto room = others < IR::ImageHeapCapacity ? IR::ImageHeapCapacity - others : 0u;
+			by_content = !declined && g_heap_by_content.On() &&
+			             HoldsAtMost(**memory, request.first, request.step, count, profile, room / 4u);
+			if (!by_content) {
+				PublishDecline(request, size, limit, profile);
+				return false;
+			}
 		}
-		const auto epoch   = Image::heap_epoch.load(std::memory_order_relaxed);
-		const auto count   = std::min(limit, Probes(bytes, request.first, request.step));
+		const auto epoch = Image::heap_epoch.load(std::memory_order_relaxed);
 		auto       created = std::make_unique<View>(View {.memory        = **memory,
 		                                                  .step          = request.step,
 		                                                  .first         = request.first,
@@ -194,7 +224,8 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 		                                                  .limit         = limit,
 		                                                  .profile       = profile,
 		                                                  .resolve_epoch = epoch,
-		                                                  .layout_epoch  = epoch});
+		                                                  .layout_epoch  = epoch,
+		                                                  .by_content    = by_content});
 		created->slots.resize(bytes / 4u + 1u);
 		created->buffer = SlotBuffer(m_context, bytes);
 		UpdateProbes(*created, 0u, bytes);
@@ -204,12 +235,14 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 		view = views.insert(views.end(), std::move(created));
 	} else {
 		// Empty after the first acquire in a draw, since the table refreshes once per draw.
-		UpdateProbes(**view, (*view)->changed_begin, (*view)->changed_end);
-		(*view)->changed_begin = (*view)->changed_end = 0;
+		for (const auto [begin, end]: (*view)->changed) UpdateProbes(**view, begin, end);
+		(*view)->changed.clear();
 		// Elements the changes released are free once the work submitted so far is done, also
 		// when no commit follows (a draw skipped while its pipeline builds).
 		Retire(**view);
 	}
+	// (For an A/B while the game runs: with the switch off the caller enumerates the table.)
+	if ((*view)->by_content && !g_heap_by_content.On()) return false;
 	if (std::ranges::find(m_active, view->get()) == m_active.end()) m_active.push_back(view->get());
 	if ((*view)->published != (*view)->kinds.size()) Publish(**view);
 	const auto& selected = **view;
@@ -326,7 +359,15 @@ bool ImageHeap::Refresh(Memory& memory) {
 		std::copy(m_scratch.begin() + first, m_scratch.begin() + last, words.begin() + first);
 		const auto offset = address - memory.base;
 		for (auto& view: memory.views) {
-			Widen(view->changed_begin, view->changed_end, offset + first * 4u, offset + last * 4u);
+			// A probe reads up to 32 bytes: a range that begins within those of the one before
+			// would probe an entry twice, so the two are joined.
+			const auto begin = offset + first * 4u;
+			const auto end   = offset + last * 4u;
+			if (!view->changed.empty() && begin <= view->changed.back().second + 32u) {
+				view->changed.back().second = std::max(view->changed.back().second, end);
+			} else {
+				view->changed.emplace_back(begin, end);
+			}
 		}
 	}
 	return true;
@@ -368,12 +409,30 @@ void ImageHeap::InvalidateMemory(uint64_t address, uint64_t size) {
 	}
 }
 
+bool ImageHeap::HoldsAtMost(const Memory& memory, uint64_t first, uint64_t step, uint64_t count,
+                            const IR::ImageResource& profile, uint64_t budget) const {
+	std::unordered_set<DescriptorValue, DescriptorHash> seen;
+	const auto&                                         words = memory.words;
+	for (uint64_t probe = 0; probe < count; ++probe) {
+		const auto      offset = (first + probe * step) / 4u;
+		DescriptorValue value {.dword_count = 8u};
+		std::copy_n(words.begin() + offset,
+		            std::min<size_t>(profile.r128 ? 4u : 8u, words.size() - offset),
+		            value.dwords.begin());
+		if (IR::ImageHeapKind(profile, value) == 0u) continue;
+		seen.insert(value);
+		if (seen.size() > budget) return false;
+	}
+	return true;
+}
+
 void ImageHeap::UpdateProbes(View& view, uint64_t begin, uint64_t end) {
 	// A probe reads its descriptor from first + probe * step.
 	const uint64_t bytes = view.profile.r128 ? 16u : 32u;
 	auto probe = begin < view.first + bytes ? 0u : (begin - view.first - bytes) / view.step + 1u;
 	for (; probe < view.count && view.first + probe * view.step < end; ++probe) {
 		UpdateProbe(view, probe);
+		g_heap_probes.Add();
 	}
 }
 
@@ -432,7 +491,12 @@ uint32_t ImageHeap::Intern(View& view, uint32_t kind, const DescriptorValue& val
 	}
 	auto [found, inserted] = view.elements.try_emplace(value, 0u);
 	if (inserted) {
-		found->second    = Allocate();
+		found->second = Allocate();
+		if (found->second == 0u) {
+			// The heap is full (only with a table taken for its contents): a null image.
+			view.elements.erase(found);
+			return 0u;
+		}
 		auto& element    = m_elements[found->second];
 		element.value    = value;
 		element.kind     = kind;
@@ -475,7 +539,20 @@ uint32_t ImageHeap::Allocate() {
 	}
 	if (m_free.empty()) {
 		if (m_elements.size() == IR::ImageHeapCapacity) {
-			EXIT("image heaps exceed %u resident images\n", IR::ImageHeapCapacity);
+			const bool by_content = std::ranges::any_of(m_memories, [](const auto& memory) {
+				return std::ranges::any_of(memory->views,
+				                           [](const auto& view) { return view->by_content; });
+			});
+			if (!by_content) {
+				EXIT("image heaps exceed %u resident images\n", IR::ImageHeapCapacity);
+			}
+			static bool reported = false;
+			if (!std::exchange(reported, true)) {
+				std::printf("Warning: the image heap is full (%u images): further images of its "
+				            "tables read as null\n",
+				            IR::ImageHeapCapacity);
+			}
+			return 0u;
 		}
 		m_elements.emplace_back();
 		return static_cast<uint32_t>(m_elements.size() - 1u);

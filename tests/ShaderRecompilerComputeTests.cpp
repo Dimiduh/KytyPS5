@@ -7082,6 +7082,104 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // A table with more probes than the heap could serve if each held an image of
+  // its own is kept resident when the images it holds are few, and stays with
+  // the caller when they are many.
+  void CheckResidentImageHeapByContent() {
+    constexpr const char *name = "ResidentImageHeapByContent";
+    constexpr uintptr_t base = 0x000000020a000000ull;
+    constexpr uint64_t allocation_size = 0x800000;
+    constexpr uint64_t sparse_table = base + 0x200000;
+    constexpr uint64_t dense_table = base + 0x400000;
+    namespace IR = ShaderRecompiler::IR;
+    using Format = Prospero::BufferFormat;
+    // Two elements a probe are reserved: this many probes alone fill the heap.
+    constexpr uint64_t probes = IR::ImageHeapCapacity;
+    constexpr uint64_t table_size = probes * 32u;
+    static_assert(table_size == 0x200000);
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "image heap allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 && mapped == reinterpret_cast<void *>(base),
+            "image heap mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    // A 4x4 linear 2D texture per index (only the first few lie in mapped memory;
+    // the dense table is counted, never resolved).
+    const auto descriptor = [](uint32_t texture) {
+      const uint64_t address = base + 0x10000u + texture * 0x1000u;
+      std::array<uint32_t, 8> words{};
+      words[0] = static_cast<uint32_t>(address >> 8u);
+      words[1] = static_cast<uint32_t>(address >> 40u) |
+                 (static_cast<uint32_t>(Format::k8_8_8_8UNorm) << 20u);
+      words[2] = 3u | (3u << 14u);
+      words[3] = DstSel(4, 5, 6, 7) |
+                 (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+      return words;
+    };
+    const auto put = [&](uint64_t table, uint64_t probe, uint32_t texture) {
+      const auto words = descriptor(texture);
+      std::memcpy(reinterpret_cast<void *>(table + probe * 32u), words.data(), sizeof(words));
+    };
+    put(sparse_table, 0, 0);
+    put(sparse_table, 7, 0);
+    put(sparse_table, probes - 1u, 1);
+    // More different images than a quarter of the heap.
+    for (uint32_t probe = 0; probe < IR::ImageHeapCapacity / 4u + 8u; ++probe) {
+      put(dense_table, probe * 2u, probe);
+    }
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &heap = context.GetImageHeap();
+      IR::ImageResource sampled{};
+      sampled.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      sampled.unfiltered_access_only = false;
+      IR::ImageHeapView view{};
+      const auto acquire = [&](uint64_t table) {
+        return heap.Acquire({table, table_size, 32u, 0u, probes, &sampled}, view);
+      };
+      Require(name, "sparse table",
+              acquire(sparse_table) && view.slot_count == table_size / 4u &&
+                  view.kinds.size() == 1u && ImageHeapTestAccess::ElementCount(heap) == 3u,
+              "a table of few images and more probes than the heap serves was "
+              "declined, or its equal descriptors did not share an element");
+      const auto &sparse = *ImageHeapTestAccess::Views(heap)[0];
+      Require(name, "sparse slots",
+              sparse.slots[0] != 0u && sparse.slots[7u * 8u] == sparse.slots[0] &&
+                  sparse.slots[(probes - 1u) * 8u] != 0u &&
+                  sparse.slots[(probes - 1u) * 8u] != sparse.slots[0] && sparse.slots[8] == 0u,
+              "the table's slot words do not select its images");
+      Require(name, "dense table",
+              !acquire(dense_table) && !acquire(dense_table) &&
+                  ImageHeapTestAccess::ElementCount(heap) == 3u,
+              "a table holding more images than a quarter of the heap was taken, "
+              "or counting it left elements behind");
+      Require(name, "sparse table again", acquire(sparse_table),
+              "a declined table declined the one already resident");
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "image heap unmap failed");
+    Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "image heap release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   // Workgroup counts past the device limits are not dispatched: the host
   // converts thread dimensions from guest arguments, which a game can leave
   // stale (one asked for 329777152 x 1158303719 x 3305083311 threads).
@@ -64809,6 +64907,7 @@ int main(int argc, char **argv) {
     CheckGuardedRecordImageTable(vulkan);
     CheckIndirectImageKeySwitch(vulkan);
     vulkan.CheckResidentImageHeap();
+    vulkan.CheckResidentImageHeapByContent();
     CheckFiniteFirstLaneImageChoice(vulkan);
     CheckFiniteInlineSamplerPhi(vulkan);
     CheckSamplerCandidateTables(vulkan);
@@ -65005,6 +65104,7 @@ int main(int argc, char **argv) {
   CheckGuardedRecordImageTable(vulkan);
   CheckIndirectImageKeySwitch(vulkan);
   vulkan.CheckResidentImageHeap();
+  vulkan.CheckResidentImageHeapByContent();
   CheckDynamicSampleOffsets(vulkan, 32u);
   CheckDynamicSampleOffsets(vulkan, 64u);
   CheckFiniteFirstLaneImageChoice(vulkan);
