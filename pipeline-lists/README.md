@@ -26,4 +26,4 @@ with the data folder's recordings added after it, and says how many were new. Wi
 
 | File | Game | Recorded |
 |---|---|---|
-| `PPSA07631.pipelinelist` | Saros | 2026-11-17, the first hours of the game and five starts of a new game: 967 graphics pipelines (the patterns of `shader-pairs/PPSA07631.pairs` are among them) and 14,603 compute programs |
+| `PPSA07631.pipelinelist` | Saros | 2026-11-17, the first hours of the game and five starts of a new game: 977 graphics pipelines (the patterns of `shader-pairs/PPSA07631.pairs` are among them) and 14,603 compute programs |

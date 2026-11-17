@@ -94,7 +94,7 @@ with them; other places and machines will differ.
   2026-11-16 could not do this yet: without a seeds file made by hand, its pass built only what
   sessions had recorded and the Saros lists.
 - **Pipeline lists** (`pipeline-lists/`): recordings shared without any game code; a list for Saros
-  is included. The list of 2026-11-17 has 14,603 compute programs and 967 graphics pipelines
+  is included. The list of 2026-11-17 has 14,603 compute programs and 977 graphics pipelines
   (12,655 and 610 before): the recordings of every session since, five starts of a new game
   among them. `-ExportPipelineList` now adds a data folder's recordings to the list instead of
   writing them alone.
