@@ -174,6 +174,7 @@ bool RenderExecutor::SkipsGamePass(const FrameGen::UpscalerPass& pass) const {
 void RenderExecutor::UpscaleGameFrame(CommandBuffer& buffer, const PreparedBindings& bindings,
                                       const FrameGen::UpscalerPass& pass, uint64_t shader_hash,
                                       bool skipped) {
+	const CommandBuffer::ProfileGuard profile(buffer, CommandBuffer::ProfileScope::Upscaler);
 	auto* capture = FrameGen::TakeCaptured();
 	if (capture == nullptr || !Upscaler::Enabled() || !g_game_upscaler.On()) {
 		m_game_upscaler_taken = 0;

@@ -472,6 +472,8 @@ void BufferCache::DeleteBuffer(BufferId id) {
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
                                        std::vector<Common::UniqueFunction<void>>* batch) {
+	const CommandBuffer::ProfileGuard profile(m_scheduler.Current(),
+	                                          CommandBuffer::ProfileScope::Downloads);
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -1205,6 +1207,8 @@ void BufferCache::RecordAsyncDownloads() {
 		return;
 	}
 	DrainPublished();
+	const CommandBuffer::ProfileGuard profile(m_scheduler.Current(),
+	                                          CommandBuffer::ProfileScope::Downloads);
 	if (m_pending_async.Empty() || m_scheduler.Current().IsInvalid()) {
 		return;
 	}

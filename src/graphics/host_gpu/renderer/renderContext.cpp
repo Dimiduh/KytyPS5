@@ -398,6 +398,7 @@ void RenderContext::RunGarbageCollector() {
 		m_buffer_cache.ProcessFaultBuffer();
 	}
 	m_graphics.MonitorMemoryBudget();
+	CollectGpuProfile(*this);
 	m_image_heap.RunGarbageCollector();
 	m_texture_cache.ProcessDownloadImages();
 	m_texture_cache.RunGarbageCollector();

@@ -305,6 +305,17 @@ start. `present_crop` 1 to 9 shows a part of the picture pixel for pixel in the 
   `Perf <time of day> ...` line with the numbers of `measure` into the log, so a session played
   through any part of the game says afterwards where it was slow and whether the CPU or the GPU
   was the limit there. Windows without a frame (loading) are left out.
+- **The GPU's time by shader** (live switch `gpu_prof`; the idea of the Jetsku fork's operation
+  profiler). While it is on, a timestamp is recorded before and after every guest dispatch and
+  render pass instance, and turning it off writes `GpuProf` lines into the log: the GPU's time a
+  frame for each compute shader (by its hash, with how often it ran), for draws, buffer
+  uploads, texture uploads, downloads and the upscaler. The timestamps make the commands run
+  one after the other and cost about 3 µs each, so the frame rate drops while it runs; the
+  shares are what it is for. At the heavy spot of Saros with DLSS at 1440p it says: compute
+  shaders about 60% of the GPU's time, spread over 350 of them with the largest at 5%, the
+  upscaler 8%, draws 7%, uploads and downloads together about 11%. It also settled a guess:
+  leaving out the 440 compute-to-all barriers a frame (a test build) changed neither the GPU's
+  time nor the frame rate, so barriers are not what the GPU waits on.
 - **A card with less video memory, for tests on a bigger one** (`KYTY_SIMULATE_VRAM_MB=<n>`, from
   the DS fork): the rest of the card's memory is taken at start and kept, so the driver and
   Windows treat the game as on a card of n MiB.

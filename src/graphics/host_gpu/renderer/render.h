@@ -134,6 +134,10 @@ struct SubmitInfo {
 	}
 };
 
+// Once a frame, for the GPU time profile (live switch `gpu_prof`, context.cpp): takes the
+// timestamps of finished submissions, and writes the list to the log once the switch is off.
+void CollectGpuProfile(RenderContext& context);
+
 class CommandBuffer {
 public:
 	~CommandBuffer() = default;
@@ -170,6 +174,38 @@ public:
 	// write memory through any path. `shared`: it uses emulator memory shared between dispatches
 	// (the LDS backing, GDS). Records the barrier it needs against earlier commands.
 	[[nodiscard]] vk::CommandBuffer DispatchHandle(bool writes, bool shared) const;
+	// For the GPU time profile (live switch `gpu_prof`): names the guest dispatch that the next
+	// DispatchHandle() is for, by its shader. Unnamed dispatches are counted together.
+	void SetProfileKey(uint64_t key) const noexcept { m_profile_key = key; }
+	// The profile's names for what is no guest compute shader. (Shader hashes are larger.)
+	enum class ProfileScope : uint64_t {
+		Other = 1,
+		Draws,
+		Dispatches,
+		BufferUploads,
+		TextureUploads,
+		Downloads,
+		Upscaler,
+		Count,
+	};
+	// Gives the GPU's time for what is recorded while the guard lives to `scope` (nothing while
+	// the profile is off). A guard made or ended inside a render pass instance leaves that end
+	// to the instance.
+	class [[nodiscard]] ProfileGuard {
+	public:
+		ProfileGuard(const CommandBuffer& command, ProfileScope scope) noexcept
+		    : m_command(command), m_scope(scope) {
+			m_command.ProfileBegin();
+		}
+		~ProfileGuard() { m_command.ProfileEnd(m_scope); }
+		KYTY_CLASS_NO_COPY(ProfileGuard);
+
+	private:
+		const CommandBuffer& m_command;
+		ProfileScope         m_scope;
+	};
+	void ProfileBegin() const;
+	void ProfileEnd(ProfileScope scope) const;
 	// A guest request to finish all earlier work before later work starts (a partial flush,
 	// a cache writeback or invalidation).
 	void GuestFlush() const;
@@ -240,6 +276,10 @@ private:
 	void FinishCopies() const;
 	// Records the copies of the run waiting for a scatter dispatch.
 	void RecordScatter() const;
+	// The GPU time profile: a timestamp that gives the GPU's time since the last one to `key`,
+	// and the end of the open scope (a guest dispatch or a render pass instance).
+	void ProfileMark(uint64_t key) const;
+	void ProfileClose() const;
 
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
@@ -251,6 +291,10 @@ private:
 	mutable uint64_t    m_indirect_reads_since = UINT64_MAX;
 	mutable bool        m_has_commands = false;
 	mutable uint32_t    m_command_count = 0;
+	// The GPU time profile: the name of the dispatch recorded next, and the scope whose time
+	// the next mark closes (0: none).
+	mutable uint64_t    m_profile_key  = 0;
+	mutable uint64_t    m_profile_open = 0;
 	// The pipelines BindComputePipeline and BindGraphicsPipeline bound last, until
 	// PipelineHandle() or the next Begin.
 	mutable vk::Pipeline m_compute_pipeline  = nullptr;

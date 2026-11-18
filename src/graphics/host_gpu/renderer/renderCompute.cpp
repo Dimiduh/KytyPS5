@@ -630,6 +630,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	// A host fence used to serialize every dispatch; the command buffer keeps that order with
 	// pipeline barriers.
 	buffer.BindComputePipeline(pipeline.pipeline);
+	buffer.SetProfileKey(program.shader_hash);
 	const auto vk_buffer = buffer.DispatchHandle(DispatchMayWriteMemory(program, bindings),
 	                                             DispatchUsesSharedMemory(program, bindings));
 	constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
@@ -731,6 +732,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	FillGpuWords(m_context, buffer, input_info.stage, bindings);
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
+	buffer.SetProfileKey(program.shader_hash);
 	const auto vk_buffer = buffer.DispatchHandle(DispatchMayWriteMemory(program, bindings),
 	                                             DispatchUsesSharedMemory(program, bindings));
 	buffer.OrderIndirectDispatchReads();
