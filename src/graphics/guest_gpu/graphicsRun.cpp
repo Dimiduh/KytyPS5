@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
@@ -37,6 +38,7 @@
 #include <optional>
 #include <semaphore>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -1165,6 +1167,245 @@ static Common::LiveControl::Switch  g_skip_empty_indirect("skip_empty_indirect",
 static Common::LiveControl::Counter g_empty_draws("empty_draws");
 static Common::LiveControl::Counter g_empty_dispatches("empty_dispatches");
 
+// 1: a GPU-driven draw whose record the GPU still holds is left out when the same draw had
+// nothing to draw in the frames before (EmptyDrawPredictor). NOT EXACT: a draw that gets
+// something to draw is recorded a frame or two late. 0 (the default): every such draw is
+// prepared and recorded.
+static Common::LiveControl::Switch  g_predict_empty_draws("predict_empty_draws", 0);
+static Common::LiveControl::Counter g_predicted_draws("predicted_draws");
+static Common::LiveControl::Counter g_predicted_wrong("predicted_wrong");
+static Common::LiveControl::Counter g_draw_checks("draw_checks");
+
+// Guesses which GPU-driven draws draw nothing, from what they drew in the frames before.
+//
+// Such a draw's record (its index and instance counts) is written by a culling pass on the GPU
+// just before the draw, so the emulator cannot know that it is empty without waiting for the GPU,
+// which costs more than preparing the draw (IndirectDrawsNothing). More than half of Saros's
+// GPU-driven draws are empty, and mostly the same ones frame after frame: what the camera does
+// not see stays unseen for a while.
+//
+// Every GPU-driven draw with one record gets an identity that needs no record: a key of its
+// shaders, index buffer, targets and viewport (CommandProcessor::IndirectDrawKey) and its
+// place among the draws with that key in the frame. Whether it was empty is learned for every
+// such draw of every frame, left out or not, without a wait: the first eight bytes of its
+// record are copied into a download buffer where the draws stand in the command stream
+// (CommandBuffer::QueueRead) and read when that submission has completed. A draw is left out
+// when its identity was empty in each of its last Streak checks (some passes are drawn every
+// other frame, so a gap of up to Recent frames continues the row), the newest of them not older
+// than Recent frames, and was not seen with something to draw in the last Hold frames. A draw
+// left out that had something to draw is counted (predicted_wrong), and its identity is then
+// drawn for the next Hold frames whatever its record says.
+//
+// What it costs when it is wrong: the draw is missing from the picture until the check of its
+// frame arrives, one or two frames. Nothing else depends on a draw having been recorded. At a
+// heavy spot of Saros about 125 of 170 empty draws a frame are left out and one draw in ten
+// frames is left out wrongly, standing or turning; stills with it on and off do not differ.
+class EmptyDrawPredictor {
+public:
+	explicit EmptyDrawPredictor(RenderContext& renderer)
+	    : m_renderer(renderer),
+	      m_download(renderer.GetCommandScheduler().Graphics(), renderer.GetCommandScheduler(),
+	                 MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst,
+	                 Slots * SlotBytes),
+	      m_shared(std::make_shared<Shared>()) {
+		m_shared->mapped = m_download.Mapped().data();
+	}
+	~EmptyDrawPredictor() {
+		std::lock_guard lock(m_shared->mutex);
+		m_shared->mapped = nullptr;
+	}
+	KYTY_CLASS_NO_COPY(EmptyDrawPredictor);
+
+	// Without coherent memory the download buffer would need a call before each read.
+	[[nodiscard]] bool Usable() const noexcept { return m_download.IsCoherent(); }
+
+	// The identity of the next draw with `key` in this frame.
+	[[nodiscard]] uint64_t Identify(uint64_t key) {
+		const auto frame = Frame();
+		auto&      seen  = m_seen[key];
+		if (seen.frame != frame) {
+			seen = {frame, 0};
+		}
+		const uint64_t place = seen.count++;
+		return key ^ (place * 0x9e3779b97f4a7c15ull + (key << 6u) + (key >> 2u));
+	}
+
+	// Whether the draw is left out.
+	[[nodiscard]] bool Predict(uint64_t id) {
+		TakeResults();
+		const auto it = m_history.find(id);
+		if (it == m_history.end()) {
+			return false;
+		}
+		const auto  frame = Frame();
+		const auto& draw  = it->second;
+		return draw.streak >= Streak && frame - draw.checked <= Recent &&
+		       (draw.drew == 0 || frame - draw.drew > Hold);
+	}
+
+	// The record is in guest memory: what it says, at once.
+	void Known(uint64_t id, bool empty) { Apply(id, Frame(), empty, false); }
+
+	// Has the record of the draw read where the command stream stands, for the frames to come.
+	void Check(CommandBuffer& buffer, uint64_t id, uint64_t args_address, bool left_out) {
+		auto&      scheduler = m_renderer.GetCommandScheduler();
+		const auto tick      = scheduler.CurrentTick();
+		if (m_batch == nullptr || m_batch_tick != tick) {
+			m_batch      = std::make_shared<std::vector<Entry>>();
+			m_batch_tick = tick;
+			// On the completion thread, when the submission that holds the copies has finished.
+			scheduler.DeferPriorityOperation(
+			    [shared = m_shared, batch = m_batch] {
+				    std::lock_guard lock(shared->mutex);
+				    if (shared->mapped == nullptr) {
+					    return;
+				    }
+				    for (const auto& entry: *batch) {
+					    std::array<uint32_t, 2> counts {};
+					    std::memcpy(counts.data(), shared->mapped + entry.slot * SlotBytes, SlotBytes);
+					    shared->results.push_back(
+					        {entry.id, entry.frame, counts[0] == 0 || counts[1] == 0, entry.left_out});
+				    }
+				    shared->pending.store(true, std::memory_order_release);
+			    },
+			    GuestWrites::None());
+		}
+		const auto [source, offset] =
+		    m_renderer.GetBufferCache().ObtainBuffer(args_address, SlotBytes, false, false);
+		const auto slot = m_next_slot++ % Slots;
+		buffer.QueueRead(source->Handle(), offset, m_download.Handle(), slot * SlotBytes, SlotBytes);
+		m_batch->push_back({id, Frame(), slot, left_out});
+		g_draw_checks.Add();
+	}
+
+private:
+	// Both kinds of record begin with the vertex or index count and the instance count.
+	static constexpr uint64_t SlotBytes = 2 * sizeof(uint32_t);
+	static constexpr uint64_t Slots     = uint64_t {1} << 16u;
+	static constexpr uint32_t Streak    = 4;
+	static constexpr uint64_t Recent    = 4;
+	static constexpr uint64_t Hold      = 90;
+	static constexpr uint64_t Forget    = 3000;
+
+	struct Entry {
+		uint64_t id       = 0;
+		uint64_t frame    = 0;
+		uint64_t slot     = 0;
+		bool     left_out = false;
+	};
+	struct Result {
+		uint64_t id       = 0;
+		uint64_t frame    = 0;
+		bool     empty    = false;
+		bool     left_out = false;
+	};
+	struct Shared {
+		std::mutex          mutex;
+		const uint8_t*      mapped = nullptr;
+		std::vector<Result> results;
+		std::atomic<bool>   pending {false};
+	};
+	struct Seen {
+		uint64_t frame = 0;
+		uint32_t count = 0;
+	};
+	struct Draw {
+		// The newest frame checked, the frames in a row it was empty up to that one, and the
+		// newest frame it had something to draw (0: never).
+		uint64_t checked = 0;
+		uint32_t streak  = 0;
+		uint64_t drew    = 0;
+	};
+
+	// The guest's frames are counted by its flips. (From 1: 0 stands for "never".)
+	[[nodiscard]] static uint64_t Frame() noexcept { return Common::GpuTiming::GuestFlips() + 1u; }
+
+	void Apply(uint64_t id, uint64_t frame, bool empty, bool left_out) {
+		auto& draw = m_history[id];
+		if (!empty) {
+			draw.streak = 0;
+			draw.drew   = std::max(draw.drew, frame);
+			if (left_out) {
+				g_predicted_wrong.Add();
+			}
+		} else if (frame > draw.checked) {
+			// Some passes are drawn every other frame, so the checks of one identity need not be
+			// of frames in a row: a gap within what counts as recent continues the row.
+			draw.streak = frame - draw.checked <= Recent ? draw.streak + 1u : 1u;
+		}
+		draw.checked = std::max(draw.checked, frame);
+	}
+
+	void TakeResults() {
+		if (!m_shared->pending.load(std::memory_order_acquire)) {
+			return;
+		}
+		{
+			std::lock_guard lock(m_shared->mutex);
+			m_results.swap(m_shared->results);
+			m_shared->pending.store(false, std::memory_order_release);
+		}
+		for (const auto& result: m_results) {
+			Apply(result.id, result.frame, result.empty, result.left_out);
+		}
+		m_results.clear();
+		// Identities not seen for a long time are forgotten, now and then.
+		if (const auto frame = Frame(); frame - m_swept > Forget) {
+			m_swept = frame;
+			std::erase_if(m_history,
+			              [&](const auto& item) { return frame - item.second.checked > Forget; });
+			std::erase_if(m_seen, [&](const auto& item) { return frame - item.second.frame > Forget; });
+		}
+	}
+
+	RenderContext&                         m_renderer;
+	Buffer                                 m_download;
+	std::shared_ptr<Shared>                m_shared;
+	std::shared_ptr<std::vector<Entry>>    m_batch;
+	uint64_t                               m_batch_tick = 0;
+	uint64_t                               m_next_slot  = 0;
+	uint64_t                               m_swept      = 0;
+	std::vector<Result>                    m_results;
+	std::unordered_map<uint64_t, Seen>     m_seen;
+	std::unordered_map<uint64_t, Draw>     m_history;
+};
+
+uint64_t CommandProcessor::IndirectDrawKey(bool indexed) const {
+	uint64_t   key = indexed ? 0x9e3779b97f4a7c15ull : 0xc2b2ae3d27d4eb4full;
+	const auto add = [&key](uint64_t value) {
+		key ^= value + 0x9e3779b97f4a7c15ull + (key << 6u) + (key >> 2u);
+	};
+	const auto pair = [](uint32_t low, uint32_t high) {
+		return static_cast<uint64_t>(low) | (static_cast<uint64_t>(high) << 32u);
+	};
+	const auto& vs = m_sh_ctx.GetVs();
+	add(vs.es_regs.data_addr);
+	add(vs.ls_regs.data_addr);
+	add(vs.hs_regs.data_addr);
+	add(vs.gs_regs.data_addr);
+	add(m_sh_ctx.GetPs().ps_regs.data_addr);
+	add(m_index_base_addr);
+	add(pair(m_index_buffer_size, m_index_type_and_size));
+	// The pass: its targets, and the part of them it draws into (shadow views share an atlas).
+	const auto& depth = m_ctx.GetDepthRenderTarget();
+	add(depth.z_write_base_addr);
+	add(depth.z_read_base_addr);
+	add(m_ctx.GetRenderTarget(0).base.addr);
+	const auto& screen   = m_ctx.GetScreenViewport();
+	const auto& viewport = screen.viewports[0];
+	add(pair(std::bit_cast<uint32_t>(viewport.xscale), std::bit_cast<uint32_t>(viewport.xoffset)));
+	add(pair(std::bit_cast<uint32_t>(viewport.yscale), std::bit_cast<uint32_t>(viewport.yoffset)));
+	add(pair(static_cast<uint32_t>(viewport.viewport_scissor_left),
+	         static_cast<uint32_t>(viewport.viewport_scissor_top)));
+	add(pair(static_cast<uint32_t>(viewport.viewport_scissor_right),
+	         static_cast<uint32_t>(viewport.viewport_scissor_bottom)));
+	add(pair(static_cast<uint32_t>(screen.generic_scissor_left),
+	         static_cast<uint32_t>(screen.generic_scissor_top)));
+	add(pair(static_cast<uint32_t>(screen.generic_scissor_right),
+	         static_cast<uint32_t>(screen.generic_scissor_bottom)));
+	return key;
+}
+
 bool CommandProcessor::IndirectDrawsNothing(uint64_t args_address, uint32_t max_count,
                                             const volatile uint32_t* count_addr,
                                             uint32_t                 stride_in_bytes) {
@@ -1483,10 +1724,31 @@ bool CommandProcessor::DrawIndirectOnGpu(uint32_t data_offset, uint32_t max_coun
 	};
 	// A packet that draws nothing is done as the GPU would have done it: the state it leaves for
 	// later packets (below) is the same.
-	const bool nothing =
+	bool nothing =
 	    IndirectDrawsNothing(args.args_address, max_count_or_count, count_addr, stride_in_bytes);
 	if (nothing) {
 		g_empty_draws.Add();
+	}
+	// The guess for a draw whose record the GPU holds (off by default, see EmptyDrawPredictor).
+	if (g_predict_empty_draws.On() && count_addr == nullptr && max_count_or_count == 1) {
+		if (m_empty_draws == nullptr) {
+			m_empty_draws = std::make_shared<EmptyDrawPredictor>(m_renderer);
+		}
+		if (m_empty_draws->Usable()) {
+			const auto              id = m_empty_draws->Identify(IndirectDrawKey(indexed));
+			std::array<uint32_t, 2> counts {};
+			if (nothing) {
+				m_empty_draws->Known(id, true);
+			} else if (TryReadSettled(args.args_address, counts.data(), sizeof(counts))) {
+				m_empty_draws->Known(id, false);
+			} else {
+				nothing = m_empty_draws->Predict(id);
+				m_empty_draws->Check(CurrentBuffer(), id, args.args_address, nothing);
+				if (nothing) {
+					g_predicted_draws.Add();
+				}
+			}
+		}
 	}
 	auto& executor = m_renderer.GetRenderExecutor();
 	auto  result =

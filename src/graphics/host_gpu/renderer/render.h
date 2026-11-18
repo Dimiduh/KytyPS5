@@ -229,6 +229,13 @@ public:
 	void CopyToBuffer(vk::Buffer source, vk::Buffer destination,
 	                  std::span<const vk::BufferCopy> regions, vk::DeviceAddress source_address = 0,
 	                  vk::DeviceAddress destination_address = 0) const;
+	// Reads `size` bytes of `source` as they are at this point of the command stream into
+	// `destination`, a download buffer the caller reads once this submission has completed.
+	// The copy is recorded before the next command that can write memory (a dispatch, a copy,
+	// anything recorded through Handle() outside a render pass instance) or when the buffer
+	// ends, so reads queued while draws are recorded do not end their render pass instance.
+	void QueueRead(vk::Buffer source, uint64_t source_offset, vk::Buffer destination,
+	               uint64_t destination_offset, uint64_t size) const;
 	// Batches the copies CopyToBuffer records until the guard is destroyed. The barrier after the
 	// copies is deferred to the next command recorded through Handle(), DispatchHandle(),
 	// BarrierHandle() and the like, or to the end of the batch: code inside a batch must not
@@ -276,6 +283,8 @@ private:
 	void FinishCopies() const;
 	// Records the copies of the run waiting for a scatter dispatch.
 	void RecordScatter() const;
+	// Records the reads QueueRead queued (nothing inside a render pass instance).
+	void FlushReads() const;
 	// The GPU time profile: a timestamp that gives the GPU's time since the last one to `key`,
 	// and the end of the open scope (a guest dispatch or a render pass instance).
 	void ProfileMark(uint64_t key) const;
@@ -319,6 +328,13 @@ private:
 	mutable vk::DeviceAddress                 m_scatter_source_address = 0;
 	// Regions of a CopyToBuffer call recorded as a copy command.
 	mutable std::vector<vk::BufferCopy> m_direct_regions;
+	// Reads waiting to be recorded (QueueRead), in the order they were queued.
+	struct QueuedRead {
+		vk::Buffer     source;
+		vk::Buffer     destination;
+		vk::BufferCopy region;
+	};
+	mutable std::vector<QueuedRead> m_reads;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;

@@ -261,8 +261,40 @@ CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
 	m_barriers.SetSerializeDispatches(Config::SerializeDispatchesEnabled());
 }
 
+void CommandBuffer::QueueRead(vk::Buffer source, uint64_t source_offset, vk::Buffer destination,
+                              uint64_t destination_offset, uint64_t size) const {
+	m_reads.push_back({source, destination, {source_offset, destination_offset, size}});
+}
+
+void CommandBuffer::FlushReads() const {
+	if (m_reads.empty() || m_rendering) {
+		return;
+	}
+	FinishCopies();
+	ProfileClose();
+	// The copies read what dispatches wrote.
+	RecordBarrier(m_barriers.BeforeCommand());
+	for (size_t first = 0; first < m_reads.size();) {
+		// One copy command for the reads between the same two buffers.
+		m_direct_regions.clear();
+		size_t last = first;
+		for (; last < m_reads.size() && m_reads[last].source == m_reads[first].source &&
+		       m_reads[last].destination == m_reads[first].destination;
+		     last++) {
+			m_direct_regions.push_back(m_reads[last].region);
+		}
+		m_buffer.copyBuffer(m_reads[first].source, m_reads[first].destination,
+		                    static_cast<uint32_t>(m_direct_regions.size()), m_direct_regions.data());
+		first = last;
+	}
+	m_reads.clear();
+	m_has_commands = true;
+	m_command_count++;
+}
+
 vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
+	FlushReads();
 	FinishCopies();
 	ProfileClose();
 	RecordBarrier(m_barriers.BeforeCommand());
@@ -311,6 +343,7 @@ void CommandBuffer::BindGraphicsPipeline(vk::Pipeline pipeline) const {
 vk::CommandBuffer CommandBuffer::DispatchHandle(bool writes, bool shared) const {
 	EXIT_IF(IsInvalid() || m_rendering);
 	Common::GpuTiming::Sync().AddUnmergedBarriers(writes ? 2 : 1);
+	FlushReads();
 	FinishCopies();
 	ProfileClose();
 	RecordBarrier(m_barriers.BeforeDispatch(writes, shared));
@@ -384,6 +417,7 @@ void CommandBuffer::CopyToBuffer(vk::Buffer source, vk::Buffer destination,
 		return;
 	}
 	EndRendering();
+	FlushReads();
 	// The copies of a run, their scatter dispatch included, are the buffer uploads' time.
 	if (m_profile_open != GpuProfile::BufferUploads) {
 		ProfileClose();
@@ -599,6 +633,7 @@ void CommandBuffer::Begin() {
 
 void CommandBuffer::End() const {
 	EndRendering();
+	FlushReads();
 	// The deferred barriers after the last copies and dispatches stay in this submission.
 	OrderDispatches();
 	ProfileMark(GpuProfile::Other);

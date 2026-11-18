@@ -244,6 +244,18 @@ unmodified `saros` branch gave 37 fps and the first batch of changes below 47.9.
   three draws a frame are found without waiting. Waiting for the arguments finds all of them
   (draws 604 to 433 a frame, dispatches 812 to 673) and costs more than it saves: seven more
   waits a frame, 49.5 to 45.0 fps (`skip_empty_indirect 2`, for measuring).
+- **An option that guesses which GPU-driven draws are empty** (`predict_empty_draws`, off by
+  default; `KYTY_PREDICT_EMPTY_DRAWS=1` in the launcher's Environment field turns it on). It is
+  not exact: a draw whose record the GPU still holds is left out when the same draw (same
+  shaders, index buffer, targets, viewport and place in the frame) had nothing to draw the last
+  four times it was checked and nothing in the last 90 frames. Every such draw's record is
+  still read each frame, by a copy at the draw's place in the command stream that arrives
+  without a wait, so a draw that gets something to draw is recorded again a frame or two
+  later. At the heavy spot about 125 of the 170 empty draws a frame are left out, draws 604
+  to 482, the render thread's own work 16.1 to 14.4 ms a frame; about one draw in ten frames
+  is left out wrongly, standing, turning or walking, and stills with it on and off do not
+  differ. Most of the saved time comes back as waiting for the GPU: 50.0 to 51.3 fps in one
+  session, 50.5 to 51.2 in another.
 - The GPU thread runs above the game's own threads.
 
 ### Readbacks (the game reading what the GPU wrote)

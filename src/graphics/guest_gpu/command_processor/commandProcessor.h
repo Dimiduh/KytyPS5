@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -53,6 +54,8 @@ private:
 	bool                      m_suspended     = false;
 	bool                      m_made_progress = false;
 };
+
+class EmptyDrawPredictor;
 
 class CommandProcessor {
 public:
@@ -190,6 +193,9 @@ private:
 	// be read without waiting for the GPU (TryReadSettled); false otherwise.
 	bool IndirectDrawsNothing(uint64_t args_address, uint32_t max_count,
 	                          const volatile uint32_t* count_addr, uint32_t stride_in_bytes);
+	// What tells one GPU-driven draw from another in a frame without its record: its shaders,
+	// its index buffer, its targets and its viewport (EmptyDrawPredictor).
+	uint64_t IndirectDrawKey(bool indexed) const;
 	// Reads back the arguments the draws recorded by DrawIndirectOnGpu left the persistent state
 	// in: with `registers` the user SGPRs they wrote, with `num_instances` the instance count.
 	void                SettleIndirectDrawState(bool registers, bool num_instances);
@@ -201,6 +207,8 @@ private:
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 
 	RenderContext& m_renderer;
+	// Made at the first use of predict_empty_draws.
+	std::shared_ptr<EmptyDrawPredictor> m_empty_draws;
 	HW::Context    m_ctx;
 	std::optional<HW::Context> m_saved_ctx;
 	HW::UserConfig m_ucfg;
