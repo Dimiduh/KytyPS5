@@ -315,7 +315,18 @@ void AppendExtensions(std::vector<const char*>&                   out,
 	    !Succeeded(g_api.required_extensions(&counts[0], &names[0], &counts[1], &names[1]))) {
 		return;
 	}
+	if (names[device] == nullptr) {
+		return;
+	}
+	// (What NGX asked for goes into the log: it differs by driver, and a start that fails while
+	// the device is made is read from the log alone.)
+	std::string asked;
 	for (const char* name: std::span(names[device], counts[device])) {
+		if (name == nullptr) {
+			continue;
+		}
+		asked += asked.empty() ? "" : ", ";
+		asked += name;
 		const auto same = [&](std::string_view other) { return other == name; };
 		if (std::ranges::any_of(available, same,
 		                        [](const auto& properties) {
@@ -325,6 +336,8 @@ void AppendExtensions(std::vector<const char*>&                   out,
 			out.push_back(name);
 		}
 	}
+	LOGF("DLSS: NGX asks for the %s extensions: %s\n", device ? "device" : "instance",
+	     asked.empty() ? "none" : asked.c_str());
 }
 
 void Init(const GraphicContext& graphics, PFN_vkGetInstanceProcAddr get_instance_proc_addr,

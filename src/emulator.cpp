@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/hostException.h"
 #include "common/liveControl.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -108,6 +109,7 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 	subsystems.Initialize<Log::Lifecycle>();
 	// (The first line of every log: a report is read with it, also one that ends early.)
 	LOGF("Build: %s\n", KYTY_BUILD_LABEL);
+	Common::HostException::CrashTest();
 
 	if (Common::File::IsFileExisting(param_json)) {
 		Loader::SystemContentLoadParamSfo(param_json);

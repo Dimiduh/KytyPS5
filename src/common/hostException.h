@@ -54,6 +54,12 @@ bool InstallUnhandledReporter(Reporter report);
 // graphics driver or a library loaded for one, used to end the process without a word.
 void InstallCrashNote();
 
+// KYTY_CRASH_TEST=1 ends the start here with an access violation made on purpose, inside a
+// callback of a Windows function: what the crash note then holds (registers, the instruction's
+// bytes, the callers by module, the modules that are not Windows' own) can be checked on any
+// PC. Does nothing without the variable.
+void CrashTest();
+
 // Whether a handler should leave an exception it cannot resolve to the structured exception
 // handlers of the code that raised it instead of ending the process: a host thread that faults
 // inside a loaded module other than the executable (a GPU driver, a system DLL) may be inside

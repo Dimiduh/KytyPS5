@@ -32,6 +32,17 @@ The console says what happened: `Frame generation: DLSS-G ready`, then `DLSS-G o
 game's 3D view has run for ten frames, and `DLSS-G off` after thirty frames without it (menus,
 movies and loading screens are shown as they are).
 
+If a start ends while the device is made (the log's last lines are Streamline's `vkCreateDevice`
+lines, or a `--- Crash ---` note that names `vulkan-1.dll`): other programs put a Vulkan layer of
+their own into every game, among them the overlays of Steam, Epic, GOG Galaxy and RTSS (MSI
+Afterburner) and OBS's capture, and each of them runs inside that call.
+`VK_LOADER_LAYERS_DISABLE=~implicit~` in the launcher's Environment field (or
+`-Set VK_LOADER_LAYERS_DISABLE=~implicit~`) starts the game without any of them; it is a switch
+of the Vulkan loader. Frame generation and DLSS upscaling run with it on the PC this was made
+on. Whether it cures such a start is not known yet: there is one player's report of one, and it
+does not happen here. The lines of the crash note (the callers, and the modules that are not
+Windows' own) say more.
+
 ## How it works
 
 Streamline's `sl.interposer.dll` becomes the process' Vulkan loader (SDL is pointed at it), so

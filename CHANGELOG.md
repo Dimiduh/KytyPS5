@@ -193,6 +193,20 @@ with them; other places and machines will differ.
   asked for) before the call, is written out at least once a second and at every message of
   Streamline, and an exception nobody handles is named from the process' first moment:
   `--- Crash ---` with its code and the module it happened in.
+- **The crash note names the callers.** The same player's next start, with frame generation and
+  DLSS upscaling, ended with that note: an access violation inside the Vulkan loader
+  (`vulkan-1.dll`, a read through an invalid pointer) while the device was made. The emulator's
+  request and every line of Streamline up to there are the same as in a start that works here,
+  so what failed ran inside the call on that PC: the loader, the driver, or another program's
+  Vulkan layer (that PC has the layers of Epic's overlay and of RTSS, which this PC has not).
+  One address cannot say which. The note now also holds the registers, the bytes of the failing
+  instruction, the callers up the stack by module and offset, and the modules in the process
+  that are not Windows' own (overlays and hooks of other programs show there).
+  `KYTY_CRASH_TEST=1` ends a start with a crash made on purpose, to check the note on any PC.
+  The log also says which Vulkan extensions NVIDIA's NGX asked for. To try on such a PC:
+  `VK_LOADER_LAYERS_DISABLE=~implicit~` in the launcher's Environment field starts the game
+  without any other program's Vulkan layer (frame generation and DLSS upscaling run with it
+  here; whether it cures that start is not known).
 - **The emulator's log is written by default.** The launchers' Log setting and
   `run-windows.ps1` without `-Log` now choose the file (`logs\<time>.log` in the data folder),
   so a report of a crash has the log without a second try. Measured at one spot of Saros: no

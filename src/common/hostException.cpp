@@ -2,16 +2,17 @@
 
 #include "common/logging/log.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
 #else
-#include <algorithm>
 #include <csignal>
-#include <cstdlib>
 #include <initializer_list>
 #include <unistd.h>
 #if defined(__APPLE__)
@@ -169,6 +170,141 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// The module an address lies in (its file name) and the offset into it.
+static void NameAddress(uint64_t address, char* name, size_t size, uint64_t* offset) noexcept {
+	std::snprintf(name, size, "no module");
+	*offset        = 0;
+	HMODULE module = nullptr;
+	if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+	                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                       reinterpret_cast<LPCWSTR>(address), &module) != 0 &&
+	    module != nullptr) {
+		char path[MAX_PATH] = "";
+		if (GetModuleFileNameA(module, path, MAX_PATH) != 0) {
+			const char* file = std::strrchr(path, '\\');
+			std::snprintf(name, size, "%s", file != nullptr ? file + 1 : path);
+		}
+		*offset = address - reinterpret_cast<uint64_t>(module);
+	}
+}
+
+static bool Readable(uint64_t address, size_t size) noexcept {
+	MEMORY_BASIC_INFORMATION page {};
+	if (VirtualQuery(reinterpret_cast<const void*>(address), &page, sizeof(page)) != sizeof(page)) {
+		return false;
+	}
+	constexpr DWORD NoRead = PAGE_NOACCESS | PAGE_GUARD;
+	return page.State == MEM_COMMIT && (page.Protect & NoRead) == 0 && page.Protect != 0 &&
+	       address + size <=
+	           reinterpret_cast<uint64_t>(page.BaseAddress) + static_cast<uint64_t>(page.RegionSize);
+}
+
+// The registers, the bytes of the instruction that failed and the callers by module: a crash
+// in the Vulkan loader says nothing about whose call it was (the driver's, an overlay layer's,
+// NVIDIA's runtime's), the frames above it do. `text` is filled as far as the walk gets, so a
+// second fault in here (the caller guards it) loses only the rest.
+struct CrashText {
+	char*  data = nullptr;
+	size_t size = 0;
+	size_t used = 0;
+};
+
+#if defined(__clang__) || defined(__GNUC__)
+__attribute__((format(printf, 2, 3)))
+#endif
+static void Append(CrashText* text, const char* format, ...) noexcept {
+	if (text->used + 1 >= text->size) {
+		return;
+	}
+	va_list values;
+	va_start(values, format);
+	const int written = std::vsnprintf(text->data + text->used, text->size - text->used, format, values);
+	va_end(values);
+	if (written > 0) {
+		text->used = std::min(text->used + static_cast<size_t>(written), text->size - 1);
+	}
+}
+
+static void DescribeCrash(const CONTEXT* at, CrashText* text) noexcept {
+	const auto wide = [](DWORD64 value) { return static_cast<unsigned long long>(value); };
+	Append(text, "rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx\n", wide(at->Rax), wide(at->Rbx),
+	       wide(at->Rcx), wide(at->Rdx));
+	Append(text, "rsi=%016llx rdi=%016llx rbp=%016llx rsp=%016llx\n", wide(at->Rsi), wide(at->Rdi),
+	       wide(at->Rbp), wide(at->Rsp));
+	Append(text, "r8 =%016llx r9 =%016llx r10=%016llx r11=%016llx\n", wide(at->R8), wide(at->R9),
+	       wide(at->R10), wide(at->R11));
+	Append(text, "r12=%016llx r13=%016llx r14=%016llx r15=%016llx\n", wide(at->R12), wide(at->R13),
+	       wide(at->R14), wide(at->R15));
+	if (Readable(at->Rip, 16)) {
+		Append(text, "code:");
+		for (int index = 0; index < 16; ++index) {
+			Append(text, " %02x", reinterpret_cast<const uint8_t*>(at->Rip)[index]);
+		}
+		Append(text, "\n");
+	}
+	CONTEXT context = *at;
+	for (int frame = 0; frame < 40 && context.Rip != 0; ++frame) {
+		char     name[MAX_PATH];
+		uint64_t offset = 0;
+		NameAddress(context.Rip, name, sizeof(name), &offset);
+		Append(text, "#%-2d 0x%llx (%s+0x%llx)\n", frame, wide(context.Rip), name, wide(offset));
+		if (!Readable(context.Rsp, 8)) {
+			break;
+		}
+		DWORD64 image = 0;
+		if (auto* function = RtlLookupFunctionEntry(context.Rip, &image, nullptr); function != nullptr) {
+			void*   handler_data = nullptr;
+			DWORD64 establisher  = 0;
+			RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, context.Rip, function, &context, &handler_data,
+			                 &establisher, nullptr);
+		} else if (frame == 0) {
+			// A leaf function: the return address is on top of the stack. (Further up, code
+			// without unwind data is the guest's or generated: the walk ends there.)
+			context.Rip = *reinterpret_cast<const DWORD64*>(context.Rsp);
+			context.Rsp += 8;
+		} else {
+			break;
+		}
+	}
+}
+
+// The modules in the process that are not Windows' own (its driver store counts as not its
+// own: the graphics driver and NVIDIA's NGX live there), by file name: overlays and hooks of
+// other programs show here.
+static void ListForeignModules(CrashText* text) noexcept {
+	using Enumerate = BOOL(WINAPI*)(HANDLE, HMODULE*, DWORD, LPDWORD);
+	const auto enumerate = reinterpret_cast<Enumerate>(reinterpret_cast<void*>(
+	    GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "K32EnumProcessModules")));
+	static HMODULE modules[1024];
+	DWORD          bytes = 0;
+	if (enumerate == nullptr || enumerate(GetCurrentProcess(), modules, sizeof(modules), &bytes) == 0) {
+		return;
+	}
+	char       windows[MAX_PATH] = "";
+	const auto windows_length    = GetWindowsDirectoryA(windows, MAX_PATH);
+	for (DWORD index = 0; index < bytes / sizeof(HMODULE) && index < 1024; ++index) {
+		char path[MAX_PATH] = "";
+		if (GetModuleFileNameA(modules[index], path, MAX_PATH) == 0) {
+			continue;
+		}
+		const bool in_windows = windows_length != 0 && _strnicmp(path, windows, windows_length) == 0;
+		if (in_windows && std::strstr(path, "DriverStore") == nullptr) {
+			continue;
+		}
+		const char* file = std::strrchr(path, '\\');
+		Append(text, "%s%s", text->used == 0 ? "" : ", ", file != nullptr ? file + 1 : path);
+	}
+}
+
+// (Its own function: a function with a __try holds no object with a destructor.)
+static void DescribeCrashGuarded(const CONTEXT* at, CrashText* text, CrashText* modules) noexcept {
+	__try {
+		DescribeCrash(at, text);
+		ListForeignModules(modules);
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+	}
+}
+
 // What ended the process and in which module, to the console and the log (flushed): a crash
 // inside a graphics driver, an overlay or NVIDIA's runtime while the emulator starts otherwise
 // leaves a log that stops without a reason. Once.
@@ -179,20 +315,9 @@ static void WriteCrashNote(PEXCEPTION_POINTERS exception) noexcept {
 	}
 	const auto* record  = exception->ExceptionRecord;
 	const auto  address = reinterpret_cast<uint64_t>(record->ExceptionAddress);
-	char        name[MAX_PATH] = "no module";
-	uint64_t    offset         = 0;
-	HMODULE     module         = nullptr;
-	if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-	                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-	                       static_cast<LPCWSTR>(record->ExceptionAddress), &module) != 0 &&
-	    module != nullptr) {
-		char path[MAX_PATH] = "";
-		if (GetModuleFileNameA(module, path, MAX_PATH) != 0) {
-			const char* file = std::strrchr(path, '\\');
-			std::snprintf(name, sizeof(name), "%s", file != nullptr ? file + 1 : path);
-		}
-		offset = address - reinterpret_cast<uint64_t>(module);
-	}
+	char        name[MAX_PATH];
+	uint64_t    offset = 0;
+	NameAddress(address, name, sizeof(name), &offset);
 	char access[96] = "";
 	if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2) {
 		std::snprintf(access, sizeof(access), ", %s 0x%llx",
@@ -207,6 +332,18 @@ static void WriteCrashNote(PEXCEPTION_POINTERS exception) noexcept {
 	              record->ExceptionCode, static_cast<unsigned long long>(address), name,
 	              static_cast<unsigned long long>(offset), access, GetCurrentThreadId());
 	Log::WriteToConsoleAndLog(text);
+	// (After the line above is on disk: static, a crash may come with little stack left.)
+	static char detail[8192];
+	static char modules[8192];
+	CrashText   detail_text {.data = detail, .size = sizeof(detail)};
+	CrashText   modules_text {.data = modules, .size = sizeof(modules)};
+	DescribeCrashGuarded(exception->ContextRecord, &detail_text, &modules_text);
+	Log::WriteToConsoleAndLog(detail);
+	if (modules[0] != '\0') {
+		Log::WriteToConsoleAndLog("Modules not Windows' own: ");
+		Log::WriteToConsoleAndLog(modules);
+		Log::WriteToConsoleAndLog("\n");
+	}
 }
 
 static LONG WINAPI CrashNoteFilter(PEXCEPTION_POINTERS exception) noexcept {
@@ -216,6 +353,20 @@ static LONG WINAPI CrashNoteFilter(PEXCEPTION_POINTERS exception) noexcept {
 
 void InstallCrashNote() {
 	SetUnhandledExceptionFilter(CrashNoteFilter);
+}
+
+void CrashTest() {
+	if (std::getenv("KYTY_CRASH_TEST") == nullptr) {
+		return;
+	}
+	// (Windows calls back from its own module: a foreign frame between the fault and its caller,
+	// as with a driver's or a layer's call.)
+	EnumSystemLocalesEx(
+	    [](LPWSTR, DWORD, LPARAM) -> BOOL {
+		    const volatile auto* invalid = reinterpret_cast<const volatile int*>(0xdead0000beef0000ull);
+		    return *invalid;
+	    },
+	    LOCALE_ALL, 0, nullptr);
 }
 
 // The top-level filter: runs once the structured exception handler search found no handler.
@@ -363,6 +514,8 @@ bool InstallUnhandledReporter(Reporter /*report*/) {
 }
 
 void InstallCrashNote() {}
+
+void CrashTest() {}
 
 bool LeaveToModuleHandlers(const ExceptionInfo& /*info*/, bool /*guest_thread*/) {
 	return false;
