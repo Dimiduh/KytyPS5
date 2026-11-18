@@ -1,6 +1,7 @@
 #include "kernel/memory.h"
 
 #include "common/assert.h"
+#include "common/driverAddressSpace.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -791,11 +792,11 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 	};
 
 	if (search_addr != 0) {
-		return find_in(search_addr, HOST_USER_MAX + 1u);
+		return find_in(search_addr, HostUserMax() + 1u);
 	}
 	auto addr = find_in(GUEST_DEFAULT_MAP_BASE, HOST_SYSTEM_MANAGED_MAX + 1u);
 	if (addr == 0) {
-		addr = find_in(HOST_USER_MIN, HOST_USER_MAX + 1u);
+		addr = find_in(HOST_USER_MIN, HostUserMax() + 1u);
 	}
 	return addr;
 }

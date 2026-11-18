@@ -216,10 +216,26 @@ with them; other places and machines will differ.
   that are not Windows' own (overlays and hooks of other programs show there).
   `KYTY_CRASH_TEST=1` ends a start with a crash made on purpose, to check the note on any PC.
   The log also says which Vulkan extensions NVIDIA's NGX asked for.
+- **The graphics driver gets 64 GB of address space where it had 16.** With the layers left out
+  (next entry), that player's start no longer crashed: the log now says what was underneath,
+  `Could not create the Vulkan device ... ErrorInitializationFailed`. The NVIDIA driver makes
+  the device that DLSS and frame generation ask for only when it finds address space below
+  1 TB, and the emulator, which reserves the game's address space up to 1008 GB, left it the
+  16 GB above that. Measured on an RTX 4090: the driver reserves two blocks there, each as
+  large as it finds. Of 16 GB it gets one block of 8.5 GB and no second, of 64 GB 34 + 17 GB.
+  One block is enough for that card; an RTX 5070 on a newer driver was refused. With DLSS or
+  frame generation asked for, the game's address space now ends at 960 GB (the game maps
+  nothing above 832 GB) and the 64 GB above it are kept free for the driver until the device
+  is made. `KYTY_DRIVER_SPACE_GB=<16 to 128>` chooses another size. The log says how much was
+  free before the call and how much the call took (`Address space below 1 TB ...`), and the
+  error message of a refused device carries the numbers. Not shown yet on the card that was
+  refused.
 - **With frame generation, other programs' Vulkan layers are left out.** The overlays of Steam,
   Epic, GOG Galaxy and RTSS (MSI Afterburner) and OBS's game capture each put a layer into every
-  game, and with frame generation they run between NVIDIA's runtime and the driver. They are
-  the suspects of the start above, not shown to be its cause; leaving them out is the
+  game, and with frame generation they run between NVIDIA's runtime and the driver. In the
+  start above the driver had refused the device, and the crash in the loader is what a layer
+  going on with a device that was never made looks like: with the layers left out the same
+  start ends with the driver's refusal in plain words. Leaving them out is the
   loader's own switch (`VK_LOADER_LAYERS_DISABLE`, with the graphics vendors' own layers kept),
   set by the emulator when frame generation is on and the environment names no filter itself.
   The log says `Vulkan layers left out` when it applies. What it costs: those overlays and

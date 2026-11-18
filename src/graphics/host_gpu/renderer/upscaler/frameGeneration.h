@@ -75,8 +75,29 @@ struct FrameInputs {
 // before anything maps memory) until right before vkCreateDevice (ReleaseDriverAddressSpace).
 // The device DLSS asks for (NGX's extensions, without Streamline) is refused the same way:
 // `upscaler` keeps them aside for it too.
+//
+// How much the driver takes (RTX 4090, driver 621.01, measured with MeasureDriverAddressSpace
+// and a listing of the process' allocations): two reservations, each as large as it finds, at
+// multiples of 4 GB. Of 16 GB it gets one of 8.5 GB and no second; of 32 GB 17 + 4.25; of 64 GB
+// 34 + 17; of 128 GB 68 + 28. A device made with one block works on that card. A player's RTX
+// 5070 (driver 621.14) was refused the device with the 16 GB. So the hold also lowers the
+// guest's ceiling (common/driverAddressSpace.h): 64 GB are left to the driver, and
+// KYTY_DRIVER_SPACE_GB=<16 to 128> chooses another size.
 void HoldDriverAddressSpace(bool upscaler);
 void ReleaseDriverAddressSpace();
+// The address space below 1 TB as it is now, for the log around vkCreateDevice: a refused
+// device is read from these numbers. `top` is what lies above the guest's ceiling, `below`
+// everything under it (the guest's own reservation, so nearly nothing is free there).
+struct DriverSpace {
+	bool     asked         = false; // HoldDriverAddressSpace had reason to keep the top aside
+	uint64_t held          = 0;     // ... and how much of it it got
+	uint64_t room          = 0;     // the size of the top (16 GB, or more with the hold)
+	uint64_t free_top      = 0;
+	uint64_t largest_top   = 0;
+	uint64_t free_below    = 0;
+	uint64_t largest_below = 0;
+};
+[[nodiscard]] DriverSpace MeasureDriverAddressSpace();
 // Process start, before the window: loads Streamline when KYTY_FRAMEGEN is set.
 void Initialize();
 // After Initialize: the library SDL has to load as the Vulkan loader (Streamline's interposer),

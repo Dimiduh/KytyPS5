@@ -848,6 +848,22 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	// device says nothing itself.)
 	const std::string frame_gen_problem = FrameGen::SupportProblem(physical_device);
 	FrameGen::ReleaseDriverAddressSpace();
+	// The driver refuses the device (ErrorInitializationFailed) when it does not find the
+	// address space it wants below 1 TB: what is there before and after the call goes into
+	// the log, so a refusal on another PC can be read from it.
+	constexpr double GiB       = 1024.0 * 1024.0 * 1024.0;
+	const auto       space     = FrameGen::MeasureDriverAddressSpace();
+	const auto       room_text = [&](const FrameGen::DriverSpace& s) {
+        return fmt::format("{:.2f} GB free above the guest's ceiling (largest block {:.2f} GB), {:.2f} GB free "
+		                   "under it (largest {:.2f} GB)",
+		                   static_cast<double>(s.free_top) / GiB, static_cast<double>(s.largest_top) / GiB,
+		                   static_cast<double>(s.free_below) / GiB, static_cast<double>(s.largest_below) / GiB);
+	};
+	if (space.asked) {
+		LOGF("Address space below 1 TB before the device: %s; %.2f of %.0f GB were kept aside since the start\n",
+		     room_text(space).c_str(), static_cast<double>(space.held) / GiB,
+		     static_cast<double>(space.room) / GiB);
+	}
 	// (The driver, its layers and overlays, and NVIDIA's runtime all run inside this call.)
 	LOGF("Creating the Vulkan device%s%s\n", FrameGen::Requested() ? " through NVIDIA Streamline" : "",
 	     Config::GetPssrUpscaler() == Config::PssrUpscaler::DLSS ? ", with DLSS upscaling asked for" : "");
@@ -856,10 +872,19 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	if (const auto result = physical_device.createDevice(&create.get(), nullptr, &device);
 	    result != vk::Result::eSuccess && FrameGen::Requested()) {
 		EXIT("Could not create the Vulkan device with DLSS frame generation (NVIDIA Streamline), %s%s%s: start "
-		     "without frame generation. KYTY_FRAMEGEN_VERBOSE=1 logs why the driver refused it.\n",
-		     vk::to_string(result).c_str(), frame_gen_problem.empty() ? "" : ": ", frame_gen_problem.c_str());
+		     "without frame generation. KYTY_FRAMEGEN_VERBOSE=1 logs why the driver refused it. Address space "
+		     "below 1 TB before the call: %s; %.2f of %.0f GB kept aside since the start.\n",
+		     vk::to_string(result).c_str(), frame_gen_problem.empty() ? "" : ": ", frame_gen_problem.c_str(),
+		     room_text(space).c_str(), static_cast<double>(space.held) / GiB,
+		     static_cast<double>(space.room) / GiB);
 	} else {
 		RequireVulkanSuccess(result, "vkCreateDevice");
+	}
+	if (space.asked) {
+		const auto after = FrameGen::MeasureDriverAddressSpace();
+		LOGF("Address space below 1 TB after the device: %s; the call took %.2f GB above the ceiling\n",
+		     room_text(after).c_str(),
+		     (static_cast<double>(space.free_top) - static_cast<double>(after.free_top)) / GiB);
 	}
 	return device;
 }

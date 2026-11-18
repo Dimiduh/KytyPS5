@@ -10,7 +10,10 @@ static constexpr uint64_t HOST_USER_MIN            = 0x7000000000ull;
 static constexpr uint64_t HOST_SYSTEM_RESERVED_MAX = 0x0fffffffffull;
 static constexpr uint64_t HOST_USER_MIN            = 0x1000000000ull;
 #endif
-static constexpr uint64_t HOST_USER_MAX = 0xfbffffffffull;
+// (Lower with DLSS or frame generation asked for: common/driverAddressSpace.h.)
+static uint64_t HostUserMax() noexcept {
+	return Common::DriverAddressSpace::Base() - 1u;
+}
 
 static bool GuestFreeRangeContains(uint64_t base, uint64_t range_size, uint64_t candidate,
                                    uint64_t size) {
@@ -746,7 +749,7 @@ public:
 		auto addr = FindFreeAligned(HOST_SYSTEM_MANAGED_MIN, HOST_SYSTEM_MANAGED_MAX + 1u,
 		                            PageSize(), PageSize());
 		if (addr == 0) {
-			addr = FindFreeAligned(HOST_USER_MIN, HOST_USER_MAX + 1u, PageSize(), PageSize());
+			addr = FindFreeAligned(HOST_USER_MIN, HostUserMax() + 1u, PageSize(), PageSize());
 		}
 		if (addr == 0) {
 			LOGF_COLOR(Log::Color::Red,
@@ -946,7 +949,7 @@ private:
 	void ReserveGuestRegions() {
 		const std::array<std::pair<uint64_t, uint64_t>, 3> regions {{
 		    {HOST_SYSTEM_MANAGED_MIN, HOST_SYSTEM_RESERVED_MAX + 1u},
-		    {HOST_USER_MIN, HOST_USER_MAX + 1u},
+		    {HOST_USER_MIN, HostUserMax() + 1u},
 		    {kExtendedMemoryBase, kExtendedMemoryBase + kExtendedMemorySize},
 		}};
 

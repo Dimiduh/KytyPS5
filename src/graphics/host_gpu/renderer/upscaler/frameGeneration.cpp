@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/upscaler/frameGeneration.h"
 
 #include "common/assert.h"
+#include "common/driverAddressSpace.h"
 #include "common/liveControl.h"
 #include "common/logging/log.h"
 #include "gpu_blit_shaders/gpu_framegen_motion_spv.h"
@@ -14,6 +15,7 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cinttypes>
 #include <cmath>
@@ -622,18 +624,56 @@ void BypassCommandHooks(vk::Device device) {
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-static void* g_driver_space = nullptr;
+// From the guest's ceiling (kernel/memoryAddressSpace.inc, HostUserMax() + 1) to 2^40.
+constexpr uint64_t DriverSpaceEnd = Common::DriverAddressSpace::End;
+// What is kept aside: one block, or the free pieces when something sat in the range already
+// (a library another program put into the process at its start). No heap here: nothing may
+// map memory before the hold.
+static std::array<void*, 64> g_driver_blocks {};
+static uint32_t              g_driver_block_count = 0;
+static uint64_t              g_driver_held        = 0;
+static bool                  g_driver_hold_asked  = false;
 #endif
 
 void HoldDriverAddressSpace(bool upscaler) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	const char* value = std::getenv("KYTY_FRAMEGEN");
-	if (!(upscaler || (value != nullptr && std::atoi(value) > 0)) || g_driver_space != nullptr) {
+	if (!(upscaler || (value != nullptr && std::atoi(value) > 0)) || g_driver_hold_asked) {
 		return;
 	}
-	// From the guest's ceiling (kernel/memoryAddressSpace.inc, HOST_USER_MAX + 1) to 2^40.
-	constexpr uint64_t Base = 0xfc00000000ull, End = 0x10000000000ull;
-	g_driver_space = VirtualAlloc(reinterpret_cast<void*>(Base), End - Base, MEM_RESERVE, PAGE_NOACCESS);
+	g_driver_hold_asked = true;
+	// The guest's ceiling comes down with it (before the guest's memory is set up), 64 GB
+	// below 1 TB where 16 are left otherwise. KYTY_DRIVER_SPACE_GB=<16 to 128> chooses.
+	const char* room = std::getenv("KYTY_DRIVER_SPACE_GB");
+	Common::DriverAddressSpace::SetRoomGiB(room != nullptr && room[0] != '\0'
+	                                           ? std::strtoull(room, nullptr, 10)
+	                                           : Common::DriverAddressSpace::DefaultRoomGiB);
+	const uint64_t DriverSpaceBase = Common::DriverAddressSpace::Base();
+	if (void* whole = VirtualAlloc(reinterpret_cast<void*>(DriverSpaceBase), DriverSpaceEnd - DriverSpaceBase,
+	                               MEM_RESERVE, PAGE_NOACCESS);
+	    whole != nullptr) {
+		g_driver_blocks[g_driver_block_count++] = whole;
+		g_driver_held                           = DriverSpaceEnd - DriverSpaceBase;
+		return;
+	}
+	for (uint64_t at = DriverSpaceBase; at < DriverSpaceEnd && g_driver_block_count < g_driver_blocks.size();) {
+		MEMORY_BASIC_INFORMATION region {};
+		if (VirtualQuery(reinterpret_cast<const void*>(at), &region, sizeof(region)) != sizeof(region)) {
+			break;
+		}
+		const auto begin = reinterpret_cast<uint64_t>(region.BaseAddress);
+		const auto end   = std::min<uint64_t>(begin + region.RegionSize, DriverSpaceEnd);
+		// (Reservations start at multiples of 64 KiB.)
+		const auto from = (std::max(begin, at) + 0xffffull) & ~0xffffull;
+		if (region.State == MEM_FREE && from < end) {
+			if (void* piece = VirtualAlloc(reinterpret_cast<void*>(from), end - from, MEM_RESERVE, PAGE_NOACCESS);
+			    piece != nullptr) {
+				g_driver_blocks[g_driver_block_count++] = piece;
+				g_driver_held += end - from;
+			}
+		}
+		at = std::max(end, at + 0x10000ull);
+	}
 #else
 	(void)upscaler;
 #endif
@@ -641,11 +681,43 @@ void HoldDriverAddressSpace(bool upscaler) {
 
 void ReleaseDriverAddressSpace() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	if (g_driver_space != nullptr) {
-		VirtualFree(g_driver_space, 0, MEM_RELEASE);
-		g_driver_space = nullptr;
+	for (uint32_t index = 0; index < g_driver_block_count; ++index) {
+		VirtualFree(g_driver_blocks[index], 0, MEM_RELEASE);
 	}
+	g_driver_block_count = 0;
 #endif
+}
+
+DriverSpace MeasureDriverAddressSpace() {
+	DriverSpace space {};
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	space.asked = g_driver_hold_asked;
+	space.held  = g_driver_held;
+	const auto walk = [](uint64_t from, uint64_t to, uint64_t* free, uint64_t* largest) {
+		uint64_t run = 0;
+		for (uint64_t at = from; at < to;) {
+			MEMORY_BASIC_INFORMATION region {};
+			if (VirtualQuery(reinterpret_cast<const void*>(at), &region, sizeof(region)) != sizeof(region)) {
+				break;
+			}
+			const auto begin = reinterpret_cast<uint64_t>(region.BaseAddress);
+			const auto end   = std::min<uint64_t>(begin + region.RegionSize, to);
+			if (region.State == MEM_FREE) {
+				*free += end - std::max(begin, at);
+				run += end - std::max(begin, at);
+				*largest = std::max(*largest, run);
+			} else {
+				run = 0;
+			}
+			at = std::max(end, at + 0x1000ull);
+		}
+	};
+	const uint64_t DriverSpaceBase = Common::DriverAddressSpace::Base();
+	space.room                     = DriverSpaceEnd - DriverSpaceBase;
+	walk(DriverSpaceBase, DriverSpaceEnd, &space.free_top, &space.largest_top);
+	walk(0x10000ull, DriverSpaceBase, &space.free_below, &space.largest_below);
+#endif
+	return space;
 }
 
 void Initialize() {
