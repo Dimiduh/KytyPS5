@@ -164,6 +164,15 @@ with them; other places and machines will differ.
 - **The log names the PC's memory**: RAM, free RAM and what can still be committed, at the
   start and again with a fatal error. Running out of memory shows as many things (a lost
   graphics device, a crash inside the game); a report can now be checked for it.
+- **Much RAM is not much memory to spare, and the emulator now looks at the second.** A
+  session here lost the graphics device three minutes into play on a PC with 64 GB: it had
+  started with 18.5 GB that Windows could still give out (a web browser alone held 36 GB in 192
+  processes) and stopped holding 23.6 GB with 0.6 GB left. Three things follow. The shader
+  preparation that holds 6.6 GB steps back when less than 28 GB can be committed at the start,
+  not only on a PC with little RAM (so that session would have held about 17 GB). A start with
+  less than 24 GB to spare says so (`WARNING: Windows can give out only ...`) in the console
+  and the launcher's log. And a fatal error with less than 2 GB left says that Windows was out
+  of memory when it happened, the likely reason.
 - **A fatal error where the game reuses the address of a 3D render target is fixed** (from a
   player's report, `unresolvable equal-address image overlap`). Saros places a deeper 3D render
   target of another width where a smaller one was, with the same row length; the emulator knew

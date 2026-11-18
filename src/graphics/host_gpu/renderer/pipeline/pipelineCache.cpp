@@ -69,11 +69,16 @@ Common::LiveControl::Switch g_warm_pipelines("warm_pipelines", 1);
 // are translated in the background from the boot and kept for their first use
 // (ProgramCache::StartPreparation); 0: such a shader is translated at its first use (about
 // 13 ms then, its pipeline comes from the driver cache either way). 2, the default: as 1 on a PC
-// with more than PrepareCreatedMemoryMiB of RAM, as 0 on one with less. The translations of a
+// with more than PrepareCreatedMemoryMiB of RAM that can still commit more than
+// PrepareCreatedCommitMiB when the session starts, as 0 otherwise. The translations of a
 // whole game stay in memory until they are used: for the 12,700 of Saros a session holds 6.6 GB
-// more (23.1 GB against 16.5 GB at one spot), which a PC with 32 GB does not have to spare.
+// more (23.1 GB against 16.5 GB at one spot), which a PC with 32 GB does not have to spare, nor
+// one with 64 GB whose other programs have committed most of RAM and page file (a session then
+// held 23.6 GB with 0.6 GB left to commit and lost the graphics device; it had started with
+// 18.5 GB to spare and 5.5 GB held).
 Common::LiveControl::Switch g_prepare_created("prepare_created", 2);
 constexpr uint64_t          PrepareCreatedMemoryMiB = 40ull * 1024;
+constexpr uint64_t          PrepareCreatedCommitMiB = 28ull * 1024;
 // 1: a compute dispatch that a module reading its formats at run time serves (a shader's
 // code-only module, which the precompile built for every shader of the game) gets the module of
 // its own formats translated and its pipeline built in the background, and later dispatches
@@ -886,15 +891,18 @@ struct PipelineCache::ProgramCache {
 		// by the game, or imported from its files): their code-only module is translated too,
 		// after everything recorded, so that a first use it serves takes it instead of
 		// translating the shader then.
+		// (Both: a PC with 64 GB whose other programs hold 80 GB of RAM and page file has as
+		// little to spare as one with 32 GB.)
 		const auto memory          = Common::PhysicalMemoryMiB();
-		const bool prepare_created = g_prepare_created.Get() == 2
-		                                 ? memory == 0 || memory > PrepareCreatedMemoryMiB
-		                                 : g_prepare_created.On();
+		const auto committable     = Common::CommitAvailableMiB();
+		const bool room            = (memory == 0 || memory > PrepareCreatedMemoryMiB) &&
+		                             (committable == 0 || committable > PrepareCreatedCommitMiB);
+		const bool prepare_created = g_prepare_created.Get() == 2 ? room : g_prepare_created.On();
 		if (code_only_records && !prepare_created && g_prepare_created.Get() == 2) {
 			PipelineCacheLog("Programs prepared ahead: the compute shaders no session has used are "
-			                 "translated at their first use on this PC ({} GB of RAM; "
-			                 "KYTY_PREPARE_CREATED=1 translates them all ahead)",
-			                 memory / 1024);
+			                 "translated at their first use on this PC ({} GB of RAM, {} GB can still "
+			                 "be committed; KYTY_PREPARE_CREATED=1 translates them all ahead)",
+			                 memory / 1024, committable / 1024);
 		}
 		if (code_only_records && prepare_created) {
 			uint64_t position = uint64_t {1} << 32u;

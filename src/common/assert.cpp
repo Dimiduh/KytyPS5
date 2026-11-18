@@ -18,6 +18,10 @@
 
 namespace Common {
 
+// With less than this left to commit when a fatal error comes, the error is called a likely
+// result of it.
+constexpr uint64_t OutOfMemoryMiB = 2048;
+
 void FatalExit(int status) noexcept {
 #if defined(_WIN32)
 	// Not ExitProcess (std::_Exit): it kills the other threads wherever they are and then runs
@@ -70,6 +74,11 @@ RecoverableFatalScope::~RecoverableFatalScope() {
 	// Out of memory shows as many things (a lost graphics device, a null pointer in the guest).
 	if (const auto memory = HostMemoryText(); !memory.empty()) {
 		Log::WriteToConsoleAndLog(fmt::format("--- Memory ---\n{}\n", memory));
+	}
+	// (Seen here: a lost graphics device three minutes into a session, with 0.6 GB left to
+	// commit while a web browser held 36 GB.)
+	if (const auto low = LowCommitText(OutOfMemoryMiB); !low.empty()) {
+		Log::WriteToConsoleAndLog(fmt::format("Windows was out of memory when this happened: the likely reason. {}.\n", low));
 	}
 	Subsystems::EmergencyShutdownActive();
 	std::fflush(nullptr);
