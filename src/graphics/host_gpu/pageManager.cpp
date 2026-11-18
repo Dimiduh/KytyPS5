@@ -339,6 +339,29 @@ bool PageManager::TryWriteUnwatchedWords(uint64_t vaddr, const uint64_t* words, 
 	});
 }
 
+size_t PageManager::SoleWriteWatcherRun(uint64_t vaddr, size_t pages) {
+	if (pages == 0 || vaddr >= ADDRESS_SIZE) {
+		return 0;
+	}
+	auto* region = m_impl->FindRegion(vaddr);
+	if (region == nullptr) {
+		// Nothing watches a page there.
+		return pages;
+	}
+	const auto region_base = Common::AlignDown(vaddr, REGION_SIZE);
+	const auto first       = static_cast<size_t>((vaddr - region_base) / PAGE_SIZE);
+	const auto last        = std::min(first + pages, static_cast<size_t>(REGION_PAGES));
+	SpinGuard  lock(region->lock);
+	size_t     run = 0;
+	for (auto page = first; page < last; page++, run++) {
+		const auto& state = region->pages[page];
+		if (state.write_watchers > 1 || state.access_watchers != 0) {
+			break;
+		}
+	}
+	return run;
+}
+
 bool PageManager::IsUnwatched(uint64_t vaddr, uint64_t size) {
 	return WithUnwatched(vaddr, size, [] { return true; });
 }

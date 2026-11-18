@@ -248,6 +248,43 @@ public:
 	}
 	static constexpr size_t MaxProtectionGap = 64;
 
+	// The pages after the page of a guest write fault at `offset`, up to `pages` of them: the
+	// clean ones become CPU-modified and writable with one protection update, as their own write
+	// faults would make them one at a time. CPU-modified says "may have changed, upload before
+	// the GPU uses it", so a page marked early costs an upload of bytes that did not change and
+	// nothing else. The window ends before a page the GPU owns (its bytes are not the guest's),
+	// before one that another cache watches too, and at the region's end. Returns the pages it
+	// covers, those modified already included; 0 when the faulting page is not CPU-modified
+	// (the GPU owns it). Under `lock`.
+	[[nodiscard]] size_t MarkCpuModifiedAhead(uint64_t offset, size_t pages) {
+		const auto page = static_cast<size_t>(offset / TRACKER_PAGE_SIZE);
+		if (!m_cpu_dirty.Get(page)) {
+			return 0;
+		}
+		const auto first = page + 1;
+		auto       end   = std::min(first + pages, TRACKER_REGION_PAGES);
+		end              = std::min(end, m_gpu_dirty.FirstRangeFrom(first).first);
+		if (end <= first) {
+			return 0;
+		}
+		// Nor past a page another cache watches (an image's): it keeps its protection whatever
+		// this tracker does, and its bytes in a buffer may be the image's, not the guest's.
+		end = first + m_page_manager.SoleWriteWatcherRun(m_cpu_addr + first * TRACKER_PAGE_SIZE,
+		                                                 end - first);
+		if (end <= first) {
+			return 0;
+		}
+		RegionBits window;
+		window.SetRange(first, end);
+		const auto clean = window & ~m_cpu_dirty;
+		if (!clean.None()) {
+			const StateChange change(*this);
+			m_cpu_dirty |= clean;
+			UpdateProtection<false, false>();
+		}
+		return end - first;
+	}
+
 	TrackingSpinLock lock;
 
 private:

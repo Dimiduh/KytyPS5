@@ -207,6 +207,17 @@ public:
 		release();
 	}
 
+	// RegionManager::MarkCpuModifiedAhead for the pages after the page of `vaddr`: the bytes the
+	// window covers. Safe from any thread.
+	[[nodiscard]] uint64_t MarkCpuModifiedAhead(uint64_t vaddr, size_t pages) {
+		auto* manager = m_regions[vaddr / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
+		if (manager == nullptr) {
+			return 0;
+		}
+		std::scoped_lock lock(manager->lock);
+		return manager->MarkCpuModifiedAhead(vaddr % TRACKER_REGION_SIZE, pages) * TRACKER_PAGE_SIZE;
+	}
+
 	// Write-protects the pages of a region that TakeUploadRanges took. Safe from any thread.
 	static void ProtectTaken(RegionManager* region) {
 		std::scoped_lock lock(region->lock);

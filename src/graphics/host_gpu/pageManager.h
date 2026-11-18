@@ -34,6 +34,11 @@ public:
 	// another way.
 	[[nodiscard]] bool TryWriteUnwatchedWords(uint64_t vaddr, const uint64_t* words, uint32_t count,
 	                                          uint32_t stride);
+	// Of the `pages` pages from `vaddr` (all in one tracking region), those before the first one
+	// that has more than a single write watcher: a second write watcher or an access watcher. A
+	// cache that holds one write watcher on each of its clean pages learns from it how far it
+	// alone decides the pages' protection.
+	[[nodiscard]] size_t SoleWriteWatcherRun(uint64_t vaddr, size_t pages);
 	// Whether TryWriteUnwatched would find no watcher on the range now.
 	[[nodiscard]] bool IsUnwatched(uint64_t vaddr, uint64_t size);
 

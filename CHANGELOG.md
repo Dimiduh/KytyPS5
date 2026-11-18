@@ -255,6 +255,21 @@ unmodified `saros` branch gave 37 fps and the first batch of changes below 47.9.
   are values the host needs itself: two counts that go into a buffer's address, the thread
   counts of two indirect dispatches, and a command list the game builds on the GPU.
 
+### The game's stores into tracked memory
+
+- **A store that walks through tracked pages opens them a window at a time** (after the
+  fault-ahead of the Jetsku fork). Saros took about 1,700 write faults a frame on pages the
+  buffer cache had write-protected, three in four of them beside another one: game threads
+  filling a buffer page after page, each page an exception and a protection change, and
+  another protection change when the page is uploaded. A thread that faults on the page after
+  its last fault now gets the following pages opened with it, 2, 4, 8 and then 16 at a time; a
+  single fault opens nothing, so scattered stores cost no extra uploads. The window stops at a
+  page the GPU owns and at one an image watches too. At the heavy spot with DLSS at 1440p:
+  faults 1,720 to 585 a frame, protection changes 2,730 to 1,785, the emulator's CPU time 111
+  to 104 ms a frame, buffer uploads +3%. The frame rate there is held by the thread that feeds
+  the GPU and moved from 51.8 to 52.2 fps; the picture is the same (`fault_ahead`: the most
+  pages a fault opens, 0 for none).
+
 ### Textures
 
 - **A rendered image is no longer uploaded again from stale memory when a small unrelated buffer
@@ -274,7 +289,7 @@ unmodified `saros` branch gave 37 fps and the first batch of changes below 47.9.
 Most of the changes above can be turned off while the game runs, through the live channel below:
 `vulkan_recording`, `bda_lazy`, `stream_share`, `heap_by_content`, `lookahead_replan`,
 `guest_image_writes`, `image_buffer_writes`, `guest_copy`, `readback_narrow`, `gpu_scalars`,
-`game_upscaler`, `game_upscaler_skip`. Each also reads an environment variable `KYTY_<NAME>` at
+`fault_ahead`, `game_upscaler`, `game_upscaler_skip`. Each also reads an environment variable `KYTY_<NAME>` at
 start. `present_crop` 1 to 9 shows a part of the picture pixel for pixel in the window.
 
 ## Tools for measuring

@@ -91,7 +91,9 @@ public:
 
 	// A store of the guest CPU (guest_store) reaches BDA accesses at the next ordering point of
 	// the command stream, any other write at the next access (see BdaSyncQueue).
-	void InvalidateMemory(uint64_t vaddr, uint64_t size, bool guest_store = false);
+	// write_fault: the store is a guest write fault on the page of `vaddr` (see FaultAhead).
+	void InvalidateMemory(uint64_t vaddr, uint64_t size, bool guest_store = false,
+	                      bool write_fault = false);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	// Reads back the GPU-modified range containing vaddr, from its page to at most window
 	// bytes past vaddr, or just the byte at vaddr when no GPU-modified range contains it.
@@ -183,6 +185,9 @@ public:
 	void               SynchronizeBda(const RangeSet& mapped);
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
 	void QueueBdaSync(uint64_t vaddr, uint64_t size, bool at_ordering_point = false);
+	// After a guest thread's write fault on the page of `vaddr`: when the thread faulted on the
+	// page before it last (a store walking upwards), the pages after it are opened with it.
+	void FaultAhead(uint64_t vaddr);
 	// A guest submission begins a store epoch (see BdaSyncQueue). Safe from any thread.
 	[[nodiscard]] uint64_t BeginBdaStoreEpoch();
 	// The upload worker's jobs so far, and a wait for those up to a sequence: a submission is

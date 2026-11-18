@@ -145,7 +145,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (access == PageFaultAccess::Write) {
 		// A store of the emulated command processor (on the GPU thread) is part of the current
 		// work; anything else stores for the guest CPU.
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size, !GuestGpu::IsGpuThread());
+		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size, !GuestGpu::IsGpuThread(), true);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
 	} else {

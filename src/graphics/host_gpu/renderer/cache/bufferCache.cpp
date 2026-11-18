@@ -129,6 +129,12 @@ Common::LiveControl::Counter g_stream_shared("stream_shared");
 // The buffer parts a BDA synchronization left to their bindings.
 Common::LiveControl::Counter g_bda_unread("bda_unread");
 
+// The most pages a guest write fault opens after its own (BufferCache::FaultAhead); 0: none,
+// every page of a walk takes its own fault.
+Common::LiveControl::Switch  g_fault_ahead("fault_ahead", 16);
+Common::LiveControl::Counter g_fault_ahead_pages("fault_ahead_pages");
+Common::LiveControl::Counter g_fault_ahead_windows("fault_ahead_windows");
+
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
                                         vk::BufferUsageFlags usage, const auto& write) {
@@ -678,7 +684,42 @@ BufferCache::StreamCopyStamp BufferCache::StreamCopyStores(uint64_t vaddr, uint6
 	        .last  = count((vaddr + size - 1) >> PageTable::kPageBits)};
 }
 
-void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size, bool guest_store) {
+void BufferCache::FaultAhead(uint64_t vaddr) {
+	const auto limit = g_fault_ahead.Get();
+	if (limit == 0) {
+		return;
+	}
+	// Saros takes about 1,700 write faults a frame on pages the buffer cache write-protected, and
+	// three in four of them fall beside another one: guest threads filling a buffer walk through
+	// its pages, each page costing an exception, a protection change by the faulting thread and
+	// another by the GPU thread when the page is uploaded. A thread that faults on the page after
+	// its last fault (or after the window that fault opened) is such a walk: the window after the
+	// page doubles each time, up to the limit. A single fault opens nothing, so stores scattered
+	// over memory make no page CPU-modified that they do not write.
+	thread_local uint64_t next_page = 0;
+	thread_local uint32_t window    = 0;
+	const auto            page      = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto            after     = page + TRACKER_PAGE_SIZE;
+	if (page != next_page) {
+		next_page = after;
+		window    = 0;
+		return;
+	}
+	window            = std::min<uint32_t>(window == 0 ? 2u : window * 2u, limit);
+	const auto opened = m_memory_tracker.MarkCpuModifiedAhead(page, window);
+	next_page         = after + opened;
+	if (opened == 0) {
+		return;
+	}
+	// What a fault on each of the pages would have told the cache.
+	NoteStreamCopyStore(after, opened);
+	QueueBdaSync(after, opened, true);
+	g_fault_ahead_windows.Add();
+	g_fault_ahead_pages.Add(opened / TRACKER_PAGE_SIZE);
+}
+
+void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size, bool guest_store,
+                                   bool write_fault) {
 	NoteStreamCopyStore(vaddr, size);
 	if (!guest_store) {
 		// A store of the emulated command processor, a write-back or an unmap: an upload the
@@ -697,6 +738,9 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size, bool guest_sto
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 	QueueBdaSync(vaddr, size, guest_store);
+	if (write_fault && guest_store) {
+		FaultAhead(vaddr);
+	}
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {

@@ -772,6 +772,100 @@ void TestCpuDirtyUpload() {
   Release(memory);
 }
 
+// The pages a guest write fault opens after its own (MarkCpuModifiedAhead).
+void TestFaultAhead() {
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto *memory = AllocateFixedGuestRange(region_size * 2, region_size);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto page = [&](uint64_t index) { return address + index * page_size; };
+  const auto clean = [&](uint64_t index) {
+    return !tracker.IsRegionCpuModified(page(index), page_size);
+  };
+  const auto writable = [&](uint64_t index) {
+    return IsWritable(reinterpret_cast<void *>(page(index)));
+  };
+  // What a write fault on a page does before it looks ahead.
+  const auto fault = [&](uint64_t index) {
+    tracker.InvalidateRegion(page(index), 1, [] {});
+  };
+  // Every page clean and write-protected.
+  tracker.ForEachUploadRange(address, region_size * 2, false,
+                             [](uint64_t, uint64_t) noexcept {},
+                             []() noexcept {});
+  Check(clean(10) && !writable(10) && clean(11) && !writable(11),
+        "fault-ahead setup did not protect the pages");
+
+  // Not from a page that is still clean: its own fault comes first.
+  Check(tracker.MarkCpuModifiedAhead(page(10), 4) == 0 && clean(11) &&
+            !writable(11),
+        "a window opened after a page that did not fault");
+
+  // The window: the pages after the faulting one, with one protection call.
+  fault(10);
+  ResetProtectionLog();
+  Check(tracker.MarkCpuModifiedAhead(page(10) + 123, 4) == 4 * page_size,
+        "the window does not cover the pages asked for");
+  Check(g_protection_calls == 1 && !clean(11) && !clean(14) && clean(15) &&
+            writable(11) && writable(14) && !writable(15) && clean(9) &&
+            !writable(9),
+        "the window's pages are not CPU-modified and writable, or others are");
+
+  // Pages modified already count, and nothing is asked of the host for them.
+  ResetProtectionLog();
+  Check(tracker.MarkCpuModifiedAhead(page(10), 4) == 4 * page_size &&
+            g_protection_calls == 0,
+        "an open window was opened again");
+
+  // An uploaded page of the window is clean and protected again: the next
+  // store into it faults as before.
+  tracker.ForEachUploadRange(page(12), page_size, false,
+                             [](uint64_t, uint64_t) noexcept {},
+                             []() noexcept {});
+  Check(clean(12) && !writable(12) && !clean(13) && writable(13),
+        "an upload did not take a page of the window back");
+
+  // It ends before a page the GPU owns, and none opens after such a page.
+  fault(20);
+  tracker.ForEachUploadRange(page(23), page_size, true,
+                             [](uint64_t, uint64_t) noexcept {},
+                             []() noexcept {});
+  Check(tracker.MarkCpuModifiedAhead(page(20), 8) == 2 * page_size &&
+            !clean(21) && !clean(22) &&
+            tracker.IsRegionGpuModified(page(23), page_size) &&
+            Protection(reinterpret_cast<void *>(page(23))) == PAGE_NOACCESS &&
+            clean(24) && !writable(24),
+        "the window passed a GPU-modified page");
+  Check(tracker.MarkCpuModifiedAhead(page(23), 4) == 0 && clean(24),
+        "a window opened after a GPU-modified page");
+  tracker.UnmarkRegionAsGpuModified(page(23), page_size);
+
+  // It ends before a page another cache watches too: that page stays
+  // protected and clean.
+  fault(40);
+  harness.page_manager.UpdatePageWatchers<true, false>(page(42), page_size);
+  Check(tracker.MarkCpuModifiedAhead(page(40), 8) == page_size && !clean(41) &&
+            writable(41) && clean(42) && !writable(42) && clean(43),
+        "the window passed a page with another watcher");
+  harness.page_manager.UpdatePageWatchers<false, false>(page(42), page_size);
+  Check(clean(42) && !writable(42),
+        "the other watcher's release changed this tracker's page");
+
+  // It ends at the region's end.
+  const auto last = region_size / page_size - 1;
+  fault(last - 1);
+  Check(tracker.MarkCpuModifiedAhead(page(last - 1), 8) == page_size &&
+            !clean(last) && clean(last + 1) && !writable(last + 1),
+        "the window crossed the tracking region's end");
+  Check(tracker.MarkCpuModifiedAhead(page(last), 8) == 0 && clean(last + 1),
+        "a window opened in the next tracking region");
+
+  tracker.MarkRegionAsCpuModified(address, region_size * 2);
+  Release(memory);
+}
+
 void TestCleanUploadPreservesOwnership() {
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
@@ -1929,6 +2023,7 @@ int main(int argc, char **argv) {
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
+  TestFaultAhead();
   TestCleanUploadPreservesOwnership();
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();
