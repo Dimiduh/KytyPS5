@@ -383,11 +383,16 @@ std::array<uint32_t, 4> LoadBdaDwords(EmitterState& state, std::span<const uint3
 	// A page that no buffer backs yet reads as zero, except in BVH traversal shaders: there it
 	// reads as all ones, the absent-node link bvh_intersect returns, because guest list walks end
 	// on negative links and would advance over zero entries forever. Unwanted addresses read zero.
+	// (A watched page is among the misses, for its report, and is read all the same: only a page
+	// that is not resident reads as the absent link. Taken for absent, the nodes of a watched
+	// buffer ended every traversal for the frames the watch lasted: rays hit nothing, and the
+	// picture lost its shadows for a frame each time the buffer cache watched the BVH.)
 	const bool              all_ones = state.program.info.bvh;
 	std::array<uint32_t, 4> result {};
 	if (count == 1u) {
-		result[0] = all_ones ? Select(state, TypeU32(state), misses[0], ConstantU32(state, ~0u),
-		                              loaded)
+		result[0] = all_ones ? Select(state, TypeU32(state), hits[0], loaded,
+		                              Select(state, TypeU32(state), misses[0],
+		                                     ConstantU32(state, ~0u), ConstantU32(state, 0)))
 		                     : loaded;
 		return result;
 	}

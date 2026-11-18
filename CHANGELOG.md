@@ -182,6 +182,12 @@ with them; other places and machines will differ.
 
 ### Smaller things
 
+- **A white flash every ten seconds or so is gone.** For one frame the scene lost its
+  ray-traced shadowing and showed raw, speckled, over-bright lighting, every 608 frames. A
+  shader that walks the game's ray tracing structure read "no node here" from a page of it
+  while the buffer cache was watching that page (it does so to learn whether the page is still
+  read), so every ray hit nothing for the frame or two the watch lasted. The watch is as old as
+  the Saros fork; this branch made it regular. Every build of this branch had the flash.
 - `KYTY_HOST_GAMEPADS=0` makes the emulator ignore the PC's gamepads.
 - A fatal error ends the process at once instead of hanging in library shutdown.
 - The emulator opts out of Windows power throttling.
