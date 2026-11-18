@@ -1144,6 +1144,74 @@ void CommandProcessor::SettleMemoryRead(const volatile void* address, uint64_t s
 	const std::pair<uint64_t, uint64_t> range {reinterpret_cast<uint64_t>(address), size};
 	LibKernel::Memory::ReadGpuDirtyBytes(std::span {&range, 1u});
 }
+
+bool CommandProcessor::TryReadSettled(uint64_t address, void* data, uint64_t size) {
+	SettleLabelAccess(reinterpret_cast<const void*>(address), size);
+	if (m_renderer.GetBufferCache().HasGpuDirtyBytes(address, size)) {
+		return false;
+	}
+	// The backing holds the bytes; the guest mapping of their page may still fault on other
+	// GPU-written bytes.
+	if (!LibKernel::Memory::TryReadBacking(address, data, size)) {
+		std::memcpy(data, reinterpret_cast<const void*>(address), size);
+	}
+	return true;
+}
+
+// 1: a GPU-driven draw or dispatch whose arguments say that it does nothing, and can be read
+// without waiting for the GPU, is left out; 0: every one is prepared and recorded; 2: a draw's
+// arguments are waited for (see IndirectDrawsNothing).
+static Common::LiveControl::Switch  g_skip_empty_indirect("skip_empty_indirect", 1);
+static Common::LiveControl::Counter g_empty_draws("empty_draws");
+static Common::LiveControl::Counter g_empty_dispatches("empty_dispatches");
+
+bool CommandProcessor::IndirectDrawsNothing(uint64_t args_address, uint32_t max_count,
+                                            const volatile uint32_t* count_addr,
+                                            uint32_t                 stride_in_bytes) {
+	// Saros draws its scene with GPU-driven draws: a compute pass culls the instances and writes
+	// each draw's record, and the game then issues every draw, also the ones the culling left
+	// without an instance: 170 of 310 such draws a frame at one spot. Each takes the whole
+	// preparation of a draw (pipeline, resources, bindings, render pass) to make the GPU draw
+	// nothing, and an empty draw has no effect on the console either. But the culling pass
+	// was recorded just before its draws, so the records are with the GPU when the packet comes:
+	// only the few that are in guest memory already (two or three a frame there) are known to be
+	// empty without a wait, and those are left out.
+	constexpr uint32_t MaxRecords = 64;
+	if (!g_skip_empty_indirect.On()) {
+		return false;
+	}
+	uint32_t count = max_count;
+	if (count_addr != nullptr) {
+		uint32_t selected = 0;
+		if (!TryReadSettled(reinterpret_cast<uint64_t>(count_addr), &selected, sizeof(selected))) {
+			return false;
+		}
+		count = std::min(selected, max_count);
+	}
+	if (count > MaxRecords) {
+		return false;
+	}
+	// 2 (for measuring, slower): the records are waited for. Then every empty draw is found,
+	// 170 a frame at that spot, and the waits cost more than the draws: 49.5 to 45.0 fps.
+	if (g_skip_empty_indirect.Get() >= 2 && count != 0) {
+		SettleMemoryRead(reinterpret_cast<const void*>(args_address),
+		                 static_cast<uint64_t>(count - 1u) * stride_in_bytes + 2 * sizeof(uint32_t));
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		// Both kinds of record begin with the vertex or index count and the instance count.
+		std::array<uint32_t, 2> counts {};
+		static_assert(offsetof(vk::DrawIndirectCommand, instanceCount) == sizeof(uint32_t) &&
+		              offsetof(vk::DrawIndexedIndirectCommand, instanceCount) == sizeof(uint32_t));
+		if (!TryReadSettled(args_address + static_cast<uint64_t>(i) * stride_in_bytes,
+		                    counts.data(), sizeof(counts))) {
+			return false;
+		}
+		if (counts[0] != 0 && counts[1] != 0) {
+			return false;
+		}
+	}
+	return true;
+}
 uint32_t CommandProcessor::NumInstances() {
 	if (m_num_instances_addr != 0) {
 		SettleMemoryRead(reinterpret_cast<const void*>(m_num_instances_addr), sizeof(uint32_t));
@@ -1413,8 +1481,16 @@ bool CommandProcessor::DrawIndirectOnGpu(uint32_t data_offset, uint32_t max_coun
 	    .instance_offset_slot = *instance_slot,
 	    .stale_slots          = stale_slots,
 	};
+	// A packet that draws nothing is done as the GPU would have done it: the state it leaves for
+	// later packets (below) is the same.
+	const bool nothing =
+	    IndirectDrawsNothing(args.args_address, max_count_or_count, count_addr, stride_in_bytes);
+	if (nothing) {
+		g_empty_draws.Add();
+	}
 	auto& executor = m_renderer.GetRenderExecutor();
-	auto  result   = executor.DrawIndirect(CurrentBuffer(), args);
+	auto  result =
+	    nothing ? DrawIndirectResult::Done : executor.DrawIndirect(CurrentBuffer(), args);
 	if (result == DrawIndirectResult::SettleRegisters) {
 		SettleIndirectDrawState(true, false);
 		args.stale_slots = 0;
@@ -1533,6 +1609,17 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 		return;
 	}
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+	// A dispatch of no workgroups runs nothing (Saros: 180 of 420 indirect dispatches a frame at
+	// one spot): left out when its arguments say so without a wait, as an empty draw is. Here
+	// too the arguments are mostly with the GPU still (one dispatch a frame is found).
+	if (g_skip_empty_indirect.On()) {
+		vk::DispatchIndirectCommand args {};
+		if (TryReadSettled(args_addr, &args, sizeof(args)) &&
+		    (args.x == 0 || args.y == 0 || args.z == 0)) {
+			g_empty_dispatches.Add();
+			return;
+		}
+	}
 	m_renderer.GetRenderExecutor().DispatchIndirect(CurrentBuffer(), args_addr, mode,
 	                                                IsAsyncComputeQueue());
 }

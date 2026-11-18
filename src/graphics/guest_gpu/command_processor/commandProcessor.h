@@ -135,6 +135,10 @@ public:
 	// runs after that work, but a page with a pending GPU write may keep its old bytes readable
 	// for the guest's CPU threads (BufferCache::NoteGpuWrite), so a plain read can be stale.
 	void SettleMemoryRead(const volatile void* address, uint64_t size);
+	// Reads a packet input when that takes no wait: pending labels are settled, and the bytes
+	// are read only if no recorded GPU work holds one of them (they are then the guest's and
+	// current). False, with nothing read, when the GPU holds some: the caller does without.
+	bool TryReadSettled(uint64_t address, void* data, uint64_t size);
 	void WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num, uint32_t write_control);
 	void WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes);
 	void GetLodStats(volatile uint32_t* dst, uint32_t size, bool reset);
@@ -181,6 +185,11 @@ private:
 	bool DrawIndirectOnGpu(uint32_t data_offset, uint32_t max_count_or_count,
 	                       const volatile uint32_t* count_addr, uint32_t stride_in_bytes,
 	                       IndirectDrawRegisters registers, bool indexed);
+	// Whether an indirect draw packet draws nothing: its count is 0, or every record it selects
+	// has no vertices (indices) or no instances. Known only when the count and the records can
+	// be read without waiting for the GPU (TryReadSettled); false otherwise.
+	bool IndirectDrawsNothing(uint64_t args_address, uint32_t max_count,
+	                          const volatile uint32_t* count_addr, uint32_t stride_in_bytes);
 	// Reads back the arguments the draws recorded by DrawIndirectOnGpu left the persistent state
 	// in: with `registers` the user SGPRs they wrote, with `num_instances` the instance count.
 	void                SettleIndirectDrawState(bool registers, bool num_instances);

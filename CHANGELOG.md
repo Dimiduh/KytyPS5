@@ -235,6 +235,15 @@ unmodified `saros` branch gave 37 fps and the first batch of changes below 47.9.
   the sets of GPU-written, pending and mapped ranges took 3.3% of the GPU thread at the heavy
   spot and take 1.1%; 24.3 to 23.6–24.0 ms of that thread a frame at 50%. The frame rate moved
   within what two runs differ by (40.4–40.7 before, 40.1–41.6 after).
+- **A GPU-driven draw or dispatch that does nothing is left out when that is known without a
+  wait** (`skip_empty_indirect`; the fork of Jetsku skips empty indirect dispatches the same
+  way). It rarely is in Saros, and that is the finding: at the heavy spot 170 of 310 GPU-driven
+  draws a frame draw no instance and 180 of 420 indirect dispatches run no workgroup, each
+  with the full preparation of a draw or dispatch, but their arguments are written by a culling
+  pass recorded just before them and are still with the GPU when the packet comes. Two or
+  three draws a frame are found without waiting. Waiting for the arguments finds all of them
+  (draws 604 to 433 a frame, dispatches 812 to 673) and costs more than it saves: seven more
+  waits a frame, 49.5 to 45.0 fps (`skip_empty_indirect 2`, for measuring).
 - The GPU thread runs above the game's own threads.
 
 ### Readbacks (the game reading what the GPU wrote)
