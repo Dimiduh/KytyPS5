@@ -1,7 +1,10 @@
 #include "common/hostException.h"
 
+#include "common/logging/log.h"
+
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
@@ -166,8 +169,58 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// What ended the process and in which module, to the console and the log (flushed): a crash
+// inside a graphics driver, an overlay or NVIDIA's runtime while the emulator starts otherwise
+// leaves a log that stops without a reason. Once.
+static void WriteCrashNote(PEXCEPTION_POINTERS exception) noexcept {
+	static std::atomic<bool> written {false};
+	if (written.exchange(true)) {
+		return;
+	}
+	const auto* record  = exception->ExceptionRecord;
+	const auto  address = reinterpret_cast<uint64_t>(record->ExceptionAddress);
+	char        name[MAX_PATH] = "no module";
+	uint64_t    offset         = 0;
+	HMODULE     module         = nullptr;
+	if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+	                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                       static_cast<LPCWSTR>(record->ExceptionAddress), &module) != 0 &&
+	    module != nullptr) {
+		char path[MAX_PATH] = "";
+		if (GetModuleFileNameA(module, path, MAX_PATH) != 0) {
+			const char* file = std::strrchr(path, '\\');
+			std::snprintf(name, sizeof(name), "%s", file != nullptr ? file + 1 : path);
+		}
+		offset = address - reinterpret_cast<uint64_t>(module);
+	}
+	char access[96] = "";
+	if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2) {
+		std::snprintf(access, sizeof(access), ", %s 0x%llx",
+		              record->ExceptionInformation[0] == 1   ? "writing"
+		              : record->ExceptionInformation[0] == 8 ? "executing"
+		                                                     : "reading",
+		              static_cast<unsigned long long>(record->ExceptionInformation[1]));
+	}
+	char text[512];
+	std::snprintf(text, sizeof(text),
+	              "--- Crash ---\nUnhandled exception 0x%08lx at 0x%llx (%s+0x%llx)%s on thread %lu\n",
+	              record->ExceptionCode, static_cast<unsigned long long>(address), name,
+	              static_cast<unsigned long long>(offset), access, GetCurrentThreadId());
+	Log::WriteToConsoleAndLog(text);
+}
+
+static LONG WINAPI CrashNoteFilter(PEXCEPTION_POINTERS exception) noexcept {
+	WriteCrashNote(exception);
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void InstallCrashNote() {
+	SetUnhandledExceptionFilter(CrashNoteFilter);
+}
+
 // The top-level filter: runs once the structured exception handler search found no handler.
 static LONG WINAPI UnhandledExceptionFilterReport(PEXCEPTION_POINTERS exception) noexcept {
+	WriteCrashNote(exception);
 	ExceptionInfo info {};
 	if (const auto report = g_reporter.load(std::memory_order_acquire);
 	    report != nullptr && ReadException(exception, &info)) {
@@ -308,6 +361,8 @@ static bool InstallPlatformHandler() {
 bool InstallUnhandledReporter(Reporter /*report*/) {
 	return false;
 }
+
+void InstallCrashNote() {}
 
 bool LeaveToModuleHandlers(const ExceptionInfo& /*info*/, bool /*guest_thread*/) {
 	return false;

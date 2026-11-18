@@ -461,6 +461,9 @@ uint64_t ErrorRepeats(const char* message) {
 
 void LogMessage(sl::LogType type, const char* message) {
 	LOGF("Streamline[%d]: %s", static_cast<int>(type), message);
+	// (Streamline speaks while the device is made and its plugins start: where a start that dies
+	// inside NVIDIA's libraries stops is the last thing the log can say.)
+	Log::Flush();
 	// KYTY_FRAMEGEN_VERBOSE: every message on stdout, not only errors.
 	static const bool verbose = std::getenv("KYTY_FRAMEGEN_VERBOSE") != nullptr;
 	if (type != sl::LogType::eError && !verbose) return;

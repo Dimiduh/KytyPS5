@@ -2,6 +2,8 @@
 
 #include "common/emulatorConfig.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -54,8 +56,18 @@ void Initialize() {
 	}
 }
 
+// When the log was last flushed, in milliseconds of the steady clock.
+static std::atomic<int64_t> g_flushed_ms {0};
+
+static int64_t NowMs() {
+	return std::chrono::duration_cast<std::chrono::milliseconds>(
+	           std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
+
 void Flush() {
 	if (g_logger != nullptr) {
+		g_flushed_ms.store(NowMs(), std::memory_order_relaxed);
 		g_logger->flush();
 	}
 }
@@ -79,6 +91,12 @@ void Write(fmt::text_style style, std::string_view text) {
 		g_logger->log(spdlog::level::info, spdlog::string_view_t(styled.data(), styled.size()));
 	} else {
 		g_logger->log(spdlog::level::info, spdlog::string_view_t(text.data(), text.size()));
+	}
+	// A process that dies without a word (a crash inside a driver, a hang, a kill) leaves a log
+	// that ends at most a second before it, not at the last full block of the file's buffer: a
+	// player's log once ended in the middle of the device's creation, 4 KiB short of the reason.
+	if (NowMs() - g_flushed_ms.load(std::memory_order_relaxed) >= 1000) {
+		Flush();
 	}
 }
 

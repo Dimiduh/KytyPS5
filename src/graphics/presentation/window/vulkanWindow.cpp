@@ -847,6 +847,10 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	// device says nothing itself.)
 	const std::string frame_gen_problem = FrameGen::SupportProblem(physical_device);
 	FrameGen::ReleaseDriverAddressSpace();
+	// (The driver, its layers and overlays, and NVIDIA's runtime all run inside this call.)
+	LOGF("Creating the Vulkan device%s%s\n", FrameGen::Requested() ? " through NVIDIA Streamline" : "",
+	     Config::GetPssrUpscaler() == Config::PssrUpscaler::DLSS ? ", with DLSS upscaling asked for" : "");
+	Log::Flush();
 	vk::Device        device            = nullptr;
 	if (const auto result = physical_device.createDevice(&create.get(), nullptr, &device);
 	    result != vk::Result::eSuccess && FrameGen::Requested()) {

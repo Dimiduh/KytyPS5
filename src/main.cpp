@@ -2,6 +2,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/file.h"
+#include "common/hostException.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "emulator.h"
@@ -737,6 +738,7 @@ static void UsePrivateDriverDiskCache() {
 
 int wmain(int argc, wchar_t* argv[]) {
     Common::RegisterQuickExit();
+    Common::HostException::InstallCrashNote();
     // (Before the options are read: nothing may map memory first.)
     bool dlss = false;
     for (int index = 1; index + 1 < argc; index++) {

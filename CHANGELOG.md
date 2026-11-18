@@ -177,6 +177,14 @@ with them; other places and machines will differ.
   upscaler's commands were in the lost submission. Two records so far: a player's (a write
   through an invalid address, hours into a session) and one here (a read through an address of
   no buffer, during the load into a save, with DLSS upscaling on).
+- **A start that dies inside a driver says where.** A player's log of a start with frame
+  generation ended in the middle of the Vulkan device's creation, without an error: the
+  process had crashed inside a library that is not the emulator's, before the emulator's crash
+  report is set up, and the file's last 4 KiB were never written. Now a log begins with the
+  build, says `Creating the Vulkan device` (through NVIDIA Streamline, with DLSS upscaling
+  asked for) before the call, is written out at least once a second and at every message of
+  Streamline, and an exception nobody handles is named from the process' first moment:
+  `--- Crash ---` with its code and the module it happened in.
 - With 12 GB of video memory or 16 GB of RAM Saros is still at the edge; a lower 3D resolution
   and no frame generation leave more room.
 

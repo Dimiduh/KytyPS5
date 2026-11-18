@@ -106,6 +106,8 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 	subsystems.Initialize<Config::Lifecycle>();
 	Config::Load(cfg);
 	subsystems.Initialize<Log::Lifecycle>();
+	// (The first line of every log: a report is read with it, also one that ends early.)
+	LOGF("Build: %s\n", KYTY_BUILD_LABEL);
 
 	if (Common::File::IsFileExisting(param_json)) {
 		Loader::SystemContentLoadParamSfo(param_json);

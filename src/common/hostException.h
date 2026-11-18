@@ -48,6 +48,12 @@ using Reporter = void (*)(const ExceptionInfo&);
 // LeaveToModuleHandlers).
 bool InstallUnhandledReporter(Reporter report);
 
+// From the process' first moment (Windows only): an exception nobody handles is named in the
+// console and the log, with the module it happened in, before the process ends. The reporter of
+// InstallUnhandledReporter comes later, with the guest's program; a crash before that, inside a
+// graphics driver or a library loaded for one, used to end the process without a word.
+void InstallCrashNote();
+
 // Whether a handler should leave an exception it cannot resolve to the structured exception
 // handlers of the code that raised it instead of ending the process: a host thread that faults
 // inside a loaded module other than the executable (a GPU driver, a system DLL) may be inside
