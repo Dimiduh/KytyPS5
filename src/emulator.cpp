@@ -65,14 +65,15 @@ static void PrintSystemInfo() {
 	Log::WriteToConsoleAndLog(fmt::format("Host: {}, {} threads; {}\n", info.ProcessorName,
 	                                      std::thread::hardware_concurrency(),
 	                                      Common::HostMemoryText()));
-	// A session of a large game commits 17 to 29 GB (Saros, measured). Much RAM does not mean
-	// that much can be had: a session here lost the graphics device after three minutes with
-	// 0.6 GB left to commit, having started with 18.5 GB, on a PC with 64 GB.
+	// From here (the guest's memory is set up, the process holds about 5 GB) a session of Saros
+	// commits another 12 to 24 GB, measured. Much RAM does not mean that much can be had: a
+	// session here lost the graphics device after three minutes with 0.6 GB left to commit,
+	// having had 18.5 GB at this point, on a PC with 64 GB.
 	constexpr uint64_t SessionCommitMiB = 24ull * 1024;
 	if (const auto low = Common::LowCommitText(SessionCommitMiB); !low.empty()) {
 		Log::WriteToConsoleAndLog(fmt::format(
-		    "WARNING: {}: a large game takes 17 to 29 GB here and may stop with a lost graphics device "
-		    "or a crash when Windows runs out.\n",
+		    "WARNING: {}: a large game takes another 12 to 24 GB from here and may stop with a lost "
+		    "graphics device or a crash when Windows runs out.\n",
 		    low));
 	}
 }
