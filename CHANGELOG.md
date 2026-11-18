@@ -195,11 +195,14 @@ with them; other places and machines will differ.
   `--- Crash ---` with its code and the module it happened in.
 - **The crash note names the callers.** The same player's next start, with frame generation and
   DLSS upscaling, ended with that note: an access violation inside the Vulkan loader
-  (`vulkan-1.dll`, a read through an invalid pointer) while the device was made. The emulator's
-  request and every line of Streamline up to there are the same as in a start that works here,
-  so what failed ran inside the call on that PC: the loader, the driver, or another program's
-  Vulkan layer (that PC has the layers of Epic's overlay and of RTSS, which this PC has not).
-  One address cannot say which. The note now also holds the registers, the bytes of the failing
+  (`vulkan-1.dll`, a read through an invalid pointer) while the device was made. In that loader
+  version the address is the check of a device handle (`loader_get_icd_and_device`): the loader
+  was handed a device that is not one it made, before the emulator had the new device back. The
+  emulator's request and every line of Streamline up to there are the same as in a start that
+  works here, so the handle came from what runs inside the call on that PC: NVIDIA's runtime
+  asking for its functions, or another program's Vulkan layer (that PC has the layers of Epic's
+  overlay and of RTSS, which this PC has not). One address cannot say whose call it was. The
+  note now also holds the registers, the bytes of the failing
   instruction, the callers up the stack by module and offset, and the modules in the process
   that are not Windows' own (overlays and hooks of other programs show there).
   `KYTY_CRASH_TEST=1` ends a start with a crash made on purpose, to check the note on any PC.
