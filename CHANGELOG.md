@@ -206,10 +206,17 @@ with them; other places and machines will differ.
   instruction, the callers up the stack by module and offset, and the modules in the process
   that are not Windows' own (overlays and hooks of other programs show there).
   `KYTY_CRASH_TEST=1` ends a start with a crash made on purpose, to check the note on any PC.
-  The log also says which Vulkan extensions NVIDIA's NGX asked for. To try on such a PC:
-  `VK_LOADER_LAYERS_DISABLE=~implicit~` in the launcher's Environment field starts the game
-  without any other program's Vulkan layer (frame generation and DLSS upscaling run with it
-  here; whether it cures that start is not known).
+  The log also says which Vulkan extensions NVIDIA's NGX asked for.
+- **With frame generation, other programs' Vulkan layers are left out.** The overlays of Steam,
+  Epic, GOG Galaxy and RTSS (MSI Afterburner) and OBS's game capture each put a layer into every
+  game, and with frame generation they run between NVIDIA's runtime and the driver. They are
+  the suspects of the start above, not shown to be its cause; leaving them out is the
+  loader's own switch (`VK_LOADER_LAYERS_DISABLE`, with the graphics vendors' own layers kept),
+  set by the emulator when frame generation is on and the environment names no filter itself.
+  The log says `Vulkan layers left out` when it applies. What it costs: those overlays and
+  OBS's game capture do not show in a session with frame generation (OBS's window capture
+  uses no layer). `KYTY_VULKAN_LAYERS=1` keeps the layers; `=0` leaves them out without frame
+  generation too.
 - **The emulator's log is written by default.** The launchers' Log setting and
   `run-windows.ps1` without `-Log` now choose the file (`logs\<time>.log` in the data folder),
   so a report of a crash has the log without a second try. Measured at one spot of Saros: no

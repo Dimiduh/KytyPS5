@@ -33,6 +33,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
@@ -908,6 +909,18 @@ static void VulkanGetExtensions(VulkanExtensions& r) {
 	for (const auto& l: r.available_layers) {
 		LOGF("Vulkan available layer: %s, specVersion = %u, implVersion = %u, %s\n",
 		     l.layerName.data(), l.specVersion, l.implementationVersion, l.description.data());
+	}
+	// (The list above is what the loader's filter left: see LeaveOutForeignVulkanLayers in
+	// main.cpp. A report is read with the reason next to it.)
+	if (const char* disabled = std::getenv("VK_LOADER_LAYERS_DISABLE");
+	    disabled != nullptr && disabled[0] != '\0') {
+		const char* allowed = std::getenv("VK_LOADER_LAYERS_ALLOW");
+		const bool  own     = std::getenv("KYTY_VULKAN_LAYERS_LEFT_OUT") != nullptr;
+		LOGF("Vulkan layers left out: VK_LOADER_LAYERS_DISABLE=%s, VK_LOADER_LAYERS_ALLOW=%s (%s)\n",
+		     disabled, allowed != nullptr ? allowed : "",
+		     own ? "set by the emulator: other programs' overlays and capture hooks; "
+		           "KYTY_VULKAN_LAYERS=1 keeps them"
+		         : "from the environment");
 	}
 
 	if (r.enable_validation_layers && !HasLayer(r.available_layers, kValidationLayer)) {

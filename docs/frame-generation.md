@@ -32,16 +32,20 @@ The console says what happened: `Frame generation: DLSS-G ready`, then `DLSS-G o
 game's 3D view has run for ten frames, and `DLSS-G off` after thirty frames without it (menus,
 movies and loading screens are shown as they are).
 
-If a start ends while the device is made (the log's last lines are Streamline's `vkCreateDevice`
-lines, or a `--- Crash ---` note that names `vulkan-1.dll`): other programs put a Vulkan layer of
-their own into every game, among them the overlays of Steam, Epic, GOG Galaxy and RTSS (MSI
-Afterburner) and OBS's capture, and each of them runs inside that call.
-`VK_LOADER_LAYERS_DISABLE=~implicit~` in the launcher's Environment field (or
-`-Set VK_LOADER_LAYERS_DISABLE=~implicit~`) starts the game without any of them; it is a switch
-of the Vulkan loader. Frame generation and DLSS upscaling run with it on the PC this was made
-on. Whether it cures such a start is not known yet: there is one player's report of one, and it
-does not happen here. The lines of the crash note (the callers, and the modules that are not
-Windows' own) say more.
+Other programs' Vulkan layers are left out while frame generation is on. The overlays of Steam,
+Epic, GOG Galaxy and RTSS (MSI Afterburner) and OBS's game capture each put a layer of their own
+into every game, and here they would run between Streamline and the driver, inside the calls
+that make the instance and the device. One player's start ended there (a `--- Crash ---` note
+that names `vulkan-1.dll`, on a PC with Epic's and RTSS's layers); whether a layer was the cause
+is not known, and it does not happen on the PC this was made on. The emulator sets the Vulkan
+loader's own switches for it (`VK_LOADER_LAYERS_DISABLE=~implicit~`, and
+`VK_LOADER_LAYERS_ALLOW` for the graphics vendors' layers) unless the environment already names
+one of them, and the log says `Vulkan layers left out`. So those overlays and OBS's game capture
+do not show in such a session (OBS's window capture uses no layer).
+
+- `KYTY_VULKAN_LAYERS=1` (the launcher's Environment field, or `-Set`) keeps the layers.
+- `KYTY_VULKAN_LAYERS=0` leaves them out without frame generation too: something to try for any
+  start that ends while the device is made.
 
 ## How it works
 

@@ -736,9 +736,38 @@ static void UsePrivateDriverDiskCache() {
     }
 }
 
+// Other programs put a Vulkan layer of their own into every game: the overlays of Steam, Epic,
+// GOG Galaxy and RTSS, OBS's capture. Each of them runs inside the calls that make the instance
+// and the device, between NVIDIA's Streamline and the driver when frame generation is on. A
+// player's start with frame generation ended there, in the Vulkan loader, handed a device that
+// was not its own, on a PC with two such layers this code was never run with. So with frame
+// generation the loader is told to leave them out, all but the graphics vendors' own; it is the
+// loader's own switch (VK_LOADER_LAYERS_DISABLE and _ALLOW, loader 1.3.262 and newer; an older
+// loader ignores them). KYTY_VULKAN_LAYERS=1 keeps the layers, =0 leaves them out without
+// frame generation too. A filter the environment already names is kept as it is. Must run
+// before anything loads Vulkan (Streamline asks the loader about the GPU when it starts).
+static void LeaveOutForeignVulkanLayers() {
+    const wchar_t* choice           = _wgetenv(L"KYTY_VULKAN_LAYERS");
+    const wchar_t* frame_generation = _wgetenv(L"KYTY_FRAMEGEN");
+    const bool     chosen           = choice != nullptr && choice[0] != L'\0';
+    const bool     leave_out =
+        chosen ? _wtoi(choice) == 0 : frame_generation != nullptr && _wtoi(frame_generation) > 0;
+    const auto given = [](const wchar_t* name) {
+        const wchar_t* value = _wgetenv(name);
+        return value != nullptr && value[0] != L'\0';
+    };
+    if (!leave_out || given(L"VK_LOADER_LAYERS_DISABLE") || given(L"VK_LOADER_LAYERS_ALLOW")) {
+        return;
+    }
+    (void)_wputenv_s(L"VK_LOADER_LAYERS_DISABLE", L"~implicit~");
+    (void)_wputenv_s(L"VK_LOADER_LAYERS_ALLOW", L"VK_LAYER_NV_*,VK_LAYER_AMD_*,VK_LAYER_INTEL_*");
+    (void)_wputenv_s(L"KYTY_VULKAN_LAYERS_LEFT_OUT", L"1");
+}
+
 int wmain(int argc, wchar_t* argv[]) {
     Common::RegisterQuickExit();
     Common::HostException::InstallCrashNote();
+    LeaveOutForeignVulkanLayers();
     // (Before the options are read: nothing may map memory first.)
     bool dlss = false;
     for (int index = 1; index + 1 < argc; index++) {
