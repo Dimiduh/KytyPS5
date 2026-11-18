@@ -1162,8 +1162,10 @@ bool CommandProcessor::TryReadSettled(uint64_t address, void* data, uint64_t siz
 
 // 1: a GPU-driven draw or dispatch whose arguments say that it does nothing, and can be read
 // without waiting for the GPU, is left out; 0: every one is prepared and recorded; 2: a draw's
-// arguments are waited for (see IndirectDrawsNothing).
-static Common::LiveControl::Switch  g_skip_empty_indirect("skip_empty_indirect", 1);
+// arguments are waited for (see IndirectDrawsNothing). Off unless asked for
+// (KYTY_SKIP_EMPTY_INDIRECT=1), for the reason given at fault_ahead (bufferCache.cpp): it finds
+// two or three draws a frame, which is no gain to weigh against a doubt.
+static Common::LiveControl::Switch  g_skip_empty_indirect("skip_empty_indirect", 0);
 static Common::LiveControl::Counter g_empty_draws("empty_draws");
 static Common::LiveControl::Counter g_empty_dispatches("empty_dispatches");
 

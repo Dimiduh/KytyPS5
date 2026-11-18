@@ -130,8 +130,11 @@ Common::LiveControl::Counter g_stream_shared("stream_shared");
 Common::LiveControl::Counter g_bda_unread("bda_unread");
 
 // The most pages a guest write fault opens after its own (BufferCache::FaultAhead); 0: none,
-// every page of a walk takes its own fault.
-Common::LiveControl::Switch  g_fault_ahead("fault_ahead", 16);
+// every page of a walk takes its own fault. Off unless asked for (KYTY_FAULT_AHEAD=16): in a
+// loop of test starts 2 of 26 lost the graphics device with this and skip_empty_indirect on
+// against 0 of 26 with one or both off, which neither convicts nor clears it, and it saves
+// CPU time without a faster frame.
+Common::LiveControl::Switch  g_fault_ahead("fault_ahead", 0);
 Common::LiveControl::Counter g_fault_ahead_pages("fault_ahead_pages");
 Common::LiveControl::Counter g_fault_ahead_windows("fault_ahead_windows");
 

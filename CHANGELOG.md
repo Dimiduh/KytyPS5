@@ -244,8 +244,8 @@ unmodified `saros` branch gave 37 fps and the first batch of changes below 47.9.
   spot and take 1.1%; 24.3 to 23.6–24.0 ms of that thread a frame at 50%. The frame rate moved
   within what two runs differ by (40.4–40.7 before, 40.1–41.6 after).
 - **A GPU-driven draw or dispatch that does nothing is left out when that is known without a
-  wait** (`skip_empty_indirect`; the fork of Jetsku skips empty indirect dispatches the same
-  way). It rarely is in Saros, and that is the finding: at the heavy spot 170 of 310 GPU-driven
+  wait** (`skip_empty_indirect`, off by default, see `fault_ahead` below; the fork of Jetsku
+  skips empty indirect dispatches the same way). It rarely is in Saros, and that is the finding: at the heavy spot 170 of 310 GPU-driven
   draws a frame draw no instance and 180 of 420 indirect dispatches run no workgroup, each
   with the full preparation of a draw or dispatch, but their arguments are written by a culling
   pass recorded just before them and are still with the GPU when the packet comes. Two or
@@ -297,7 +297,11 @@ unmodified `saros` branch gave 37 fps and the first batch of changes below 47.9.
   faults 1,720 to 585 a frame, protection changes 2,730 to 1,785, the emulator's CPU time 111
   to 104 ms a frame, buffer uploads +3%. The frame rate there is held by the thread that feeds
   the GPU and moved from 51.8 to 52.2 fps; the picture is the same (`fault_ahead`: the most
-  pages a fault opens, 0 for none).
+  pages a fault opens, 0 for none). **Off by default** (`KYTY_FAULT_AHEAD=16` turns it on): in
+  the loop of test starts above, 2 of 26 lost the graphics device with this and
+  `skip_empty_indirect` on against 0 of 26 with one or both off. That neither convicts nor
+  clears them, the same loss was seen once before either existed, and neither makes a frame
+  faster, so they wait for the cause.
 
 ### Textures
 
