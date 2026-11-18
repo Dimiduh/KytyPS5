@@ -61,7 +61,8 @@ sealed class LauncherContext {
 	// reads the file).
 	void Normalize() {
 		Settings.Set("present_mode", Options.Pick(Options.PresentModes, Settings.Str("present_mode")));
-		Settings.Set("log", Options.Pick(Options.LogModes, Settings.Str("log")));
+		// (The log's default is the file, not the list's first choice.)
+		Settings.Set("log", Options.LogModes.FirstOrDefault(item => string.Equals(item, Settings.Str("log"), StringComparison.OrdinalIgnoreCase)) ?? "file");
 		int number;
 		Settings.Set("language", Settings.TryInt("language", out number)
 			? Math.Max(0, Math.Min(Strings.ConsoleLanguagesEnglish.Length - 1, number)) : 1);

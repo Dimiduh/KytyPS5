@@ -87,8 +87,9 @@
 #                                            release zip from github.com/NVIDIA-RTX/Streamline/releases) or its
 #                                            bin\x64. Default: a "streamline" folder next to the emulator, else the
 #                                            SDK beside a local build (_Build\deps\streamline\sdk)
-#   .\run-windows.ps1 -Log file              the emulator's own log into the logs folder (console: into the run log,
-#                                            which -Follow shows, slow; off: none)
+#   .\run-windows.ps1 -Log off               no log of the emulator's own. Default: file, into the logs folder as
+#                                            <time>.log, the file to send with a report; the five newest are kept
+#                                            (console: into the run log, which -Follow shows, slow)
 #   .\run-windows.ps1 -Set KEY=VALUE         an environment switch of the emulator (KYTY_*, SDL_*; KEY= removes one);
 #                                            several: -Set A=1,B=2
 #   .\run-windows.ps1 -ExtraArgs "--vblank-frequency 120 --hide-cursor"   more emulator options, as on its command
@@ -347,7 +348,9 @@ if ($ShaderPairs -eq 'none') {
 	Set-Option '--shader-pairs' "$PSScriptRoot\shader-pairs"
 }
 # -Log: the emulator's own log (--printf-direction). What the pipeline cache and the precompile report reaches the
-# run log (the emulator's console output, logs\<time>.out.log) in every mode.
+# run log (the emulator's console output, logs\<time>.out.log) in every mode. Without -Log: into a file, unless the
+# config's command says where.
+if (!$Log -and $options.IndexOf('--printf-direction') -lt 0) { $Log = 'file' }
 switch ($Log) {
 	'off' { Set-Option '--printf-direction' 'Silent' }
 	'file' { Set-Option '--printf-direction' 'File'; Set-Option '--printf-output-file' "$logDir\$stamp.log" }
@@ -460,6 +463,13 @@ if ($passDue) {
 
 New-Item -ItemType Directory -Force $DataDir | Out-Null
 New-Item -ItemType Directory -Force $logDir | Out-Null
+# The emulator's own log is large (some 25 MB for a start into a save): of those files (<time>.log) the five newest
+# stay beside the one this run writes, older ones are removed.
+if ($Log -eq 'file') {
+	Get-ChildItem -LiteralPath $logDir -File -Filter '*.log' -ErrorAction SilentlyContinue |
+		Where-Object { $_.Name -match '^\d{8}-\d{6}-\d{3}\.log$' } | Sort-Object Name -Descending | Select-Object -Skip 5 |
+		Remove-Item -Force -Confirm:$false -ErrorAction SilentlyContinue
+}
 $out = "$logDir\$stamp.out.log"
 # The switches for the emulator only: this shell's environment is as before once it has started.
 $before = @{}

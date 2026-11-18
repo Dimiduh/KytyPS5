@@ -22,7 +22,7 @@ sealed class Settings {
 		new object[] {"shader_pairs", true},
 		new object[] {"skip_pending_draws", true}, new object[] {"framegen", 1}, new object[] {"render_scale", 100},
 		new object[] {"dlss", "off"}, new object[] {"occlusion_queries", true},
-		new object[] {"streamline", ""}, new object[] {"log", "off"}, new object[] {"extra_args", ""},
+		new object[] {"streamline", ""}, new object[] {"log", "file"}, new object[] {"extra_args", ""},
 		new object[] {"environment", ""},
 		// (This launcher's own: the window's language, Advanced page; the precompile on the efficiency cores, Shaders page.)
 		new object[] {"ui_language", ""}, new object[] {"reopen_launcher", false}, new object[] {"ecores", false},

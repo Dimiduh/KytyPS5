@@ -28,7 +28,7 @@ $logNames = 'Off', 'File (in the logs folder)', 'Console (slow)'
 
 $settings = [ordered]@{ game = ''; data = ''; resolution = '1920x1080'; fullscreen = $false; stretch = $false; language = 1
 	gpu = -1; gpu_name = ''; present_mode = 'Mailbox'; hdr = $false; perf_overlay = $false; sound = $true
-	skip_notice_screen = $false; redzone = $false; precompile_first = $true; precompile_pipelines = $true; pipeline_lists = $true; shader_pairs = $true; skip_pending_draws = $true; framegen = 1; render_scale = 100; dlss = 'off'; occlusion_queries = $true; streamline = ''; log = 'off'; extra_args = ''; environment = '' }
+	skip_notice_screen = $false; redzone = $false; precompile_first = $true; precompile_pipelines = $true; pipeline_lists = $true; shader_pairs = $true; skip_pending_draws = $true; framegen = 1; render_scale = 100; dlss = 'off'; occlusion_queries = $true; streamline = ''; log = 'file'; extra_args = ''; environment = '' }
 if (Test-Path -LiteralPath $settingsPath) {
 	# (A file that cannot be read leaves the defaults.)
 	try {
@@ -39,7 +39,7 @@ if (Test-Path -LiteralPath $settingsPath) {
 if (!$settings.game -and (Test-Path "$root\game-path.txt")) { $settings.game = "$(Get-Content "$root\game-path.txt" -TotalCount 1)".Trim() }
 # (Values of another spelling or kind, as in a file edited by hand, become valid ones.)
 $settings.present_mode = @($presentModes | Where-Object { $_ -eq [string]$settings.present_mode }) + $presentModes[0] | Select-Object -First 1
-$settings.log = @($logModes | Where-Object { $_ -eq [string]$settings.log }) + $logModes[0] | Select-Object -First 1
+$settings.log = @($logModes | Where-Object { $_ -eq [string]$settings.log }) + 'file' | Select-Object -First 1
 $number = 0
 $settings.language = if ([int]::TryParse([string]$settings.language, [ref]$number)) { [Math]::Max(0, [Math]::Min($languages.Count - 1, $number)) } else { 1 }
 $settings.gpu = if ([int]::TryParse([string]$settings.gpu, [ref]$number)) { [Math]::Max(-1, $number) } else { -1 }
@@ -567,7 +567,7 @@ Add-Row '' @($skipPending)
 $log = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 320 }
 $log.Items.AddRange($logNames)
 $log.SelectedIndex = [Math]::Max(0, [Array]::IndexOf($logModes, [string]$settings.log))
-Add-Row 'Log' @($log, (New-Note 'the emulator''s own log; writing it can slow the game'))
+Add-Row 'Log' @($log, (New-Note 'the emulator''s own log: the file to send with a report of a crash'))
 $extraArgs = New-Object System.Windows.Forms.TextBox -Property @{ Text = $settings.extra_args; Width = 640 }
 $tips.SetToolTip($extraArgs, "More options of kyty_emulator.exe, as on its command line (kyty_emulator.exe --help lists them all).`n" +
 	"They come after the launcher's own, so they win. For example:`n" +

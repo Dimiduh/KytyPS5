@@ -185,6 +185,13 @@ with them; other places and machines will differ.
   asked for) before the call, is written out at least once a second and at every message of
   Streamline, and an exception nobody handles is named from the process' first moment:
   `--- Crash ---` with its code and the module it happened in.
+- **The emulator's log is written by default.** The launchers' Log setting and
+  `run-windows.ps1` without `-Log` now choose the file (`logs\<time>.log` in the data folder),
+  so a report of a crash has the log without a second try. Measured at one spot of Saros: no
+  frame rate lost (56 fps with the log, 53 to 54 without), but the start into the save took
+  about 7 s longer (42 and 47 s against 35 and 39), and one such start writes some 25 MB. The
+  run script therefore keeps the five newest of these files and removes older ones. Log: Off
+  in the launcher (`-Log off`) is as before; a settings file that says `off` keeps saying so.
 - With 12 GB of video memory or 16 GB of RAM Saros is still at the edge; a lower 3D resolution
   and no frame generation leave more room.
 

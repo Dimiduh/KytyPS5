@@ -715,7 +715,8 @@ partial class MainWindow : Window {
 		if (!S.Bool("occlusion_queries")) options.Add(T("summary.noOcclusion"));
 		if (S.Bool("skip_notice_screen")) options.Add(T("summary.skipNotice"));
 		if (S.Bool("redzone")) options.Add(T("summary.redzone"));
-		if (S.Str("log") != "off") options.Add(F("summary.log", S.Str("log")));
+		// (The file is the default; the summary names the other choices.)
+		if (S.Str("log") != "file") options.Add(F("summary.log", S.Str("log")));
 		if (S.Bool("data")) options.Add(T("summary.data"));
 		if (commands.ExtraArguments().Length != 0) options.Add(T("summary.extra"));
 		if (commands.EnvironmentPairs().Length != 0) options.Add(T("summary.environment"));
