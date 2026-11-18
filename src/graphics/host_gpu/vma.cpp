@@ -20,11 +20,13 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/upscaler/dlss.h"
+#include "graphics/host_gpu/submissionNotes.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
 #include <fmt/format.h>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -300,6 +302,21 @@ void GraphicContext::LogLostDevice() const {
 		    fmt::format("Lost device: the upscaler made {} picture(s), the last for tick {}\n",
 		                pictures, tick));
 	}
+	// What the last submissions held: the failing call says which of them the GPU did not finish.
+	SubmissionNotes::ForEachNewest(12, [](const SubmissionNotes::Note& note) {
+		std::string shaders;
+		for (uint32_t i = 0; i < note.shader_count; i++) {
+			shaders += fmt::format("{}{:#018x}", i == 0 ? "" : ", ", note.shaders[i]);
+		}
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Lost device: submission {} held {} command(s): {} dispatch(es){}{}, {} render pass "
+		    "instance(s), {} buffer upload(s){}{}{}\n",
+		    note.tick, note.commands, note.dispatches, shaders.empty() ? "" : ", the last of ",
+		    shaders, note.passes, note.uploads,
+		    (note.scopes & (1u << 5u)) != 0 ? ", texture uploads" : "",
+		    (note.scopes & (1u << 6u)) != 0 ? ", downloads" : "",
+		    (note.scopes & (1u << 7u)) != 0 ? ", the upscaler" : ""));
+	});
 	vk::DeviceFaultCountsEXT counts {};
 	if (!device_fault_enabled ||
 	    device.getFaultInfoEXT(&counts, nullptr) != vk::Result::eSuccess) {

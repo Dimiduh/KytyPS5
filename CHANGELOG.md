@@ -177,6 +177,14 @@ with them; other places and machines will differ.
   upscaler's commands were in the lost submission. Two records so far: a player's (a write
   through an invalid address, hours into a session) and one here (a read through an address of
   no buffer, during the load into a save, with DLSS upscaling on).
+- **The record also says what the last twelve submissions held**: how many guest dispatches and
+  the shaders of the last six, render pass instances, buffer uploads, and whether texture
+  uploads, downloads or the upscaler were in them. The failing call names the submission the
+  GPU did not finish, so the two together say what it was doing. The loss here came back in a
+  loop of test starts with DLSS upscaling on, twice in 62 and once before the loop, always a
+  read at about the same low address that is in none of the emulator's buffers, during the
+  load or at the arrival in the level; none of those starts had this record yet, and the cause
+  is not known.
 - **A start that dies inside a driver says where.** A player's log of a start with frame
   generation ended in the middle of the Vulkan device's creation, without an error: the
   process had crashed inside a library that is not the emulator's, before the emulator's crash

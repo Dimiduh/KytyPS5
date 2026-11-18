@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/renderer/upscaler/upscaler.h"
+#include "graphics/host_gpu/submissionNotes.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
@@ -300,6 +301,8 @@ private:
 	mutable uint64_t    m_indirect_reads_since = UINT64_MAX;
 	mutable bool        m_has_commands = false;
 	mutable uint32_t    m_command_count = 0;
+	// What this buffer holds, for the record of a lost device (SubmissionNotes).
+	mutable SubmissionNotes::Note m_note;
 	// The GPU time profile: the name of the dispatch recorded next, and the scope whose time
 	// the next mark closes (0: none).
 	mutable uint64_t    m_profile_key  = 0;

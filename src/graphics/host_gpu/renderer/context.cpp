@@ -241,6 +241,7 @@ void CommandBuffer::ProfileBegin() const {
 }
 
 void CommandBuffer::ProfileEnd(ProfileScope scope) const {
+	m_note.scopes |= 1u << static_cast<uint32_t>(scope);
 	if (g_gpu_prof.On() && !m_rendering) {
 		FinishCopies();
 		ProfileClose();
@@ -347,6 +348,8 @@ vk::CommandBuffer CommandBuffer::DispatchHandle(bool writes, bool shared) const 
 	FinishCopies();
 	ProfileClose();
 	RecordBarrier(m_barriers.BeforeDispatch(writes, shared));
+	m_note.dispatches++;
+	m_note.AddShader(m_profile_key);
 	// What was recorded since the last scope is the rest's; the dispatch recorded next is its
 	// shader's.
 	ProfileMark(GpuProfile::Other);
@@ -418,6 +421,7 @@ void CommandBuffer::CopyToBuffer(vk::Buffer source, vk::Buffer destination,
 	}
 	EndRendering();
 	FlushReads();
+	m_note.uploads++;
 	// The copies of a run, their scatter dispatch included, are the buffer uploads' time.
 	if (m_profile_open != GpuProfile::BufferUploads) {
 		ProfileClose();
@@ -621,6 +625,7 @@ void CommandBuffer::Begin() {
 	// The previous buffer recorded the barrier of its copies when it ended.
 	(void)m_copies.BeforeOther();
 	m_barriers.BeginBuffer();
+	m_note         = {};
 	m_profile_open = 0;
 	ProfileMark(GpuProfile::Base);
 	EXIT_IF(!m_scatter_pieces.empty());
@@ -637,6 +642,11 @@ void CommandBuffer::End() const {
 	// The deferred barriers after the last copies and dispatches stay in this submission.
 	OrderDispatches();
 	ProfileMark(GpuProfile::Other);
+	if (m_has_commands) {
+		m_note.tick     = m_context.GetCommandScheduler().CurrentTick();
+		m_note.commands = m_command_count;
+		SubmissionNotes::Add(m_note);
+	}
 
 	auto result = m_buffer.end();
 
@@ -686,6 +696,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
 	// Attachment loads and stores access memory like any other command.
 	const auto handle = Handle();
+	m_note.passes++;
 	ProfileMark(GpuProfile::Other);
 	m_profile_open = GpuProfile::Draws;
 	handle.beginRendering(rendering);
