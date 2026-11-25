@@ -209,6 +209,11 @@ public:
 	// submission completes, so the guest finds them clean instead of faulting into a
 	// synchronous readback that drains the queue.
 	void RecordAsyncDownloads();
+	// Runs `download` (an image copied into `buffer` over `copied`) and keeps the buffer's bytes
+	// in `written`, the part of the image's memory later buffer writes may have produced.
+	template <typename Download>
+	void KeepBufferWrittenBytes(Buffer& buffer, GuestRange written, GuestRange copied,
+	                            Download&& download);
 
 private:
 	friend struct BufferCacheTestAccess;
