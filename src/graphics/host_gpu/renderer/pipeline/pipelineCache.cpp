@@ -2106,9 +2106,10 @@ PrecompileOutcome PrecompileComputeProgram(GraphicContext& graphics, vk::Pipelin
                                            bool code_only, PipelineBuildMode mode,
                                            const std::atomic<bool>*            cancel,
                                            std::shared_ptr<DriverCacheHistory> history,
-                                           KeptPipeline*                       keep) {
+                                           const PreviousDriverCache&          previous) {
 	const auto cancelled = [cancel] { return cancel != nullptr && cancel->load(); };
-	EXIT_IF(mode != PipelineBuildMode::Precompile && mode != PipelineBuildMode::Unoptimized);
+	EXIT_IF(mode != PipelineBuildMode::Precompile && mode != PipelineBuildMode::Unoptimized &&
+	        mode != PipelineBuildMode::RebuildStale);
 	EXIT_IF(record.code == nullptr || record.code->empty());
 	// The inputs GetComputeProgram derives from the device.
 	auto input               = record.input;
@@ -2188,8 +2189,10 @@ PrecompileOutcome PrecompileComputeProgram(GraphicContext& graphics, vk::Pipelin
 
 	PipelineCache::Pipeline pipeline;
 	bool                    from_driver_cache = false;
+	bool                    from_previous     = false;
 	(void)CreatePipelineInternal(graphics, pipeline, input, module, driver_cache, mode,
-	                             &from_driver_cache, cancel, std::move(history));
+	                             &from_driver_cache, cancel, std::move(history), previous,
+	                             &from_previous);
 	const bool built = pipeline.pipeline != nullptr;
 	if (built && keep != nullptr) {
 		*keep = {.pipeline = pipeline.pipeline, .fingerprint = pipeline.fingerprint};
@@ -2201,6 +2204,9 @@ PrecompileOutcome PrecompileComputeProgram(GraphicContext& graphics, vk::Pipelin
 	graphics.device.destroyShaderModule(module, nullptr);
 	if (!built) {
 		return PrecompileOutcome::TimedOut;
+	}
+	if (from_previous) {
+		return PrecompileOutcome::Provided;
 	}
 	return from_driver_cache ? PrecompileOutcome::Cached : PrecompileOutcome::Compiled;
 }
@@ -2345,7 +2351,7 @@ PipelineCache::PrecompiledStageOf(const GraphicsStageRecord& stage) {
 PrecompileOutcome PipelineCache::PrecompileShaderPair(const PipelinePattern& pattern,
                                                       PairShader vertex_shader, PairShader pixel_shader,
                                                       PipelineBuildMode        mode,
-                                                      const std::atomic<bool>* cancel,
+                                                      const BuildTarget& target, const std::atomic<bool>* cancel) {
                                                       KeptPipeline*            keep) {
 	const auto stage_of = [](const GraphicsStageRecord& like, const PairShader& shader,
 	                         uint32_t cursor) {
@@ -2480,11 +2486,13 @@ PrecompileOutcome PipelineCache::PrecompileGraphicsPipeline(
 	const auto device = m_graphics.device;
 	Pipeline   pipeline;
 	bool       from_driver_cache = false;
+	const auto target            = CurrentBuildTarget();
 	try {
 		const Common::RecoverableFatalScope recoverable;
 		(void)CreatePipelineInternal(m_graphics, pipeline, record.rendering, record.vertex_input,
-		                             state, record.static_params, m_driver_cache, mode,
-		                             &from_driver_cache, cancel, m_driver_history);
+		                             state, record.static_params, target.cache, mode,
+		                             &from_driver_cache, cancel, target.history, target.previous,
+		                             &from_previous);
 	} catch (const Common::RecoverableFatal& fatal) {
 		PipelineCacheLog("Precompile: recorded pipeline {:016x} cannot be built: {}", record.Key(),
 		                 fatal.message);
@@ -2500,6 +2508,9 @@ PrecompileOutcome PipelineCache::PrecompileGraphicsPipeline(
 	device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
 	if (!built) {
 		return PrecompileOutcome::TimedOut;
+	}
+	if (from_previous) {
+		return PrecompileOutcome::Provided;
 	}
 	return from_driver_cache ? PrecompileOutcome::Cached : PrecompileOutcome::Compiled;
 }
@@ -2677,6 +2688,12 @@ PipelineCache::~PipelineCache() {
 	if (m_driver_cache != nullptr) {
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	}
+	if (m_rebuild_cache != nullptr) {
+		m_graphics.device.destroyPipelineCache(m_rebuild_cache, nullptr);
+	}
+	for (const auto cache: m_replaced_driver_caches) {
+		m_graphics.device.destroyPipelineCache(cache, nullptr);
+	}
 }
 
 void PipelineCache::StartProgramPreparation(uint32_t thread_count) {
@@ -2766,6 +2783,13 @@ void PipelineCache::InstallOptimizedPipelines() {
 		CheckPrecompileTimeouts();
 		UpdatePrecompileThreads();
 		ReleaseWarmPipelinesUnderPressure();
+	}
+	if ((m_rebuild.GetState() == DriverCacheRebuildPolicy::State::Watching ||
+	     m_rebuild.Running()) &&
+	    now >= m_next_rebuild_check) {
+		m_next_rebuild_check = now + std::chrono::seconds {1};
+		TrackGameRendering(now);
+		UpdateStaleRebuild();
 	}
 	// Sessions usually end without a save: the coverage is also logged once a minute.
 	if (m_pipeline_manifest != nullptr && now >= m_next_coverage_report) {
@@ -2928,6 +2952,7 @@ void PipelineCache::InitializeDriverCache() {
 		m_history_file_built      = m_driver_history->Snapshot();
 		m_history_file_cache_hash = initial_hash;
 		m_history_file_stale      = m_driver_history->StaleCount();
+		m_history_file_owner      = m_driver_history.get();
 	}
 	SetManifest(
 	    std::make_unique<ProgramManifest>(ProgramManifest::PathFor(directory, title_id),
@@ -3056,6 +3081,9 @@ constexpr auto PrecompileBuildBudget = std::chrono::seconds {300};
 // Precompile order: recorded and listed programs and pipelines by their FirstSeenPosition (below
 // 2^32), then the created shaders without a record by theirs.
 constexpr uint64_t PrecompileCreatedOrder = uint64_t {1} << 32u;
+// A background rebuild builds the pipelines the cache it replaces still provides after all others
+// (PrecompileOutcome::Provided): their order is raised by this much.
+constexpr uint64_t PrecompileProvidedOrder = uint64_t {1} << 33u;
 // The precompile keeps its boot threads while recorded or listed builds were queued this
 // recently: the guest creates its shaders during the boot, and the list resolves as it does.
 constexpr auto PrecompileBootQuiet = std::chrono::seconds {120};
@@ -3155,13 +3183,16 @@ bool PipelineCache::EnqueuePrecompileJob(uint64_t key, std::string label, Precom
 		                     PipelineBuildMode::Unoptimized, order);
 		return true;
 	}
-	EnqueuePrecompileJob(key, std::move(label), std::move(build), PipelineBuildMode::Precompile,
+	// A rebuild builds what the cache it replaces lacks first.
+	EnqueuePrecompileJob(key, std::move(label), std::move(build),
+	                     m_rebuild.Running() ? PipelineBuildMode::RebuildStale
+	                                         : PipelineBuildMode::Precompile,
 	                     order);
 	return true;
 }
 
 void PipelineCache::EnqueuePrecompileJob(uint64_t key, std::string label, PrecompileBuild build,
-                                         PipelineBuildMode mode, uint64_t order) {
+                                          PipelineBuildMode mode, uint64_t order, bool requeue) {
 	auto& progress = m_precompile_progress;
 	// Counted before the job can run; a key the queue rejects is uncounted again below.
 	progress.Queued();
@@ -3239,6 +3270,11 @@ void PipelineCache::EnqueuePrecompileJob(uint64_t key, std::string label, Precom
 		if (attempts != nullptr) {
 			attempts->End(key);
 		}
+					if (outcome == PrecompileOutcome::Provided) {
+			// Queued before this build counts as finished, so the run stays open.
+			EnqueuePrecompileJob(key, label, build, PipelineBuildMode::Precompile,
+			                     order + PrecompileProvidedOrder, true);
+		}
 		// A probe hit may have been served by the driver's own disk cache, which then adds the
 		// pipeline to the application's cache: that changes the file too.
 		if (outcome == PrecompileOutcome::Compiled || outcome == PrecompileOutcome::Cached) {
@@ -3249,7 +3285,8 @@ void PipelineCache::EnqueuePrecompileJob(uint64_t key, std::string label, Precom
 			PrecompileRunEnded();
 		}
 	};
-	const bool queued = m_precompile_queue->Enqueue(key, std::move(job), order);
+	const bool queued = requeue ? m_precompile_queue->Requeue(key, std::move(job), order)
+	                            : m_precompile_queue->Enqueue(key, std::move(job), order);
 	if (!queued) {
 		progress.Rejected();
 	} else if (order < PrecompileCreatedOrder) {
@@ -3275,7 +3312,8 @@ void PipelineCache::CheckPrecompileTimeouts() {
 		if (m_precompile_attempts != nullptr) {
 			m_precompile_attempts->TimeOut(key);
 		}
-		const bool replace = running.mode == PipelineBuildMode::Precompile &&
+		const bool replace = (running.mode == PipelineBuildMode::Precompile ||
+		                      running.mode == PipelineBuildMode::RebuildStale) &&
 		                     (m_precompile_attempts == nullptr ||
 		                      !m_precompile_attempts->Failed(UnoptimizedKey(key)));
 		PipelineCacheLog(
@@ -3297,26 +3335,31 @@ void PipelineCache::CheckPrecompileTimeouts() {
 	}
 }
 
+void PipelineCache::TrackGameRendering(std::chrono::steady_clock::time_point now) {
+	if (m_game_rendering) {
+		return;
+	}
+	const auto flips = Common::GpuTiming::GuestFlips();
+	if (m_flip_window_start == std::chrono::steady_clock::time_point {}) {
+		m_flip_window_start       = now;
+		m_flip_window_start_count = flips;
+	} else if (now - m_flip_window_start >= std::chrono::seconds {10}) {
+		m_rendering_windows       = flips - m_flip_window_start_count >= PrecompileRenderingFlips
+		                                ? m_rendering_windows + 1
+		                                : 0;
+		m_game_rendering          = m_rendering_windows >= PrecompileRenderingWindows;
+		m_flip_window_start       = now;
+		m_flip_window_start_count = flips;
+	}
+}
+
 void PipelineCache::UpdatePrecompileThreads() {
 	if (m_precompile_queue == nullptr || m_precompile_steady_threads == 0 ||
 	    m_precompile_steady_threads >= m_precompile_queue->ThreadCount()) {
 		return;
 	}
 	const auto now = std::chrono::steady_clock::now();
-	if (!m_game_rendering) {
-		const auto flips = Common::GpuTiming::GuestFlips();
-		if (m_flip_window_start == std::chrono::steady_clock::time_point {}) {
-			m_flip_window_start       = now;
-			m_flip_window_start_count = flips;
-		} else if (now - m_flip_window_start >= std::chrono::seconds {10}) {
-			m_rendering_windows = flips - m_flip_window_start_count >= PrecompileRenderingFlips
-			                          ? m_rendering_windows + 1
-			                          : 0;
-			m_game_rendering    = m_rendering_windows >= PrecompileRenderingWindows;
-			m_flip_window_start = now;
-			m_flip_window_start_count = flips;
-		}
-	}
+	TrackGameRendering(now);
 	const auto last_recorded = std::chrono::steady_clock::time_point(
 	    std::chrono::steady_clock::duration(m_last_recorded_enqueue.load()));
 	const bool booting =
@@ -3381,11 +3424,10 @@ void PipelineCache::EnqueuePrecompile(std::shared_ptr<const ComputeProgramRecord
 	    fmt::format("{} CS {:016x}", code_only ? "created" : "recorded", record->shader_hash);
 	(void)EnqueuePrecompileJob(
 	    key, std::move(label),
-	    [graphics = &m_graphics, driver_cache = m_driver_cache, history = m_driver_history,
-	     record = std::move(record),
+	   [graphics = &m_graphics, target = CurrentBuildTarget(), record = std::move(record),
 	     code_only](PipelineBuildMode mode, const std::atomic<bool>& cancel, KeptPipeline* keep) {
-		    return PrecompileComputeProgram(*graphics, driver_cache, *record, nullptr, code_only,
-		                                    mode, &cancel, history, keep);
+		    return PrecompileComputeProgram(*graphics, target.cache, *record, nullptr, code_only,
+		                                    mode, &cancel, target.history, target.previous);
 	    },
 	    code_only ? PrecompileCreatedOrder + position : position);
 }
@@ -3400,10 +3442,10 @@ void PipelineCache::EnqueuePrecompile(
 	                record->pixel_stage != 0 ? stages.back()->shader_hash : 0);
 	(void)EnqueuePrecompileJob(
 	    key, std::move(label),
-	    [this, record = std::move(record),
+	    [this, target = CurrentBuildTarget(), record = std::move(record),
 	     stages = std::move(stages)](PipelineBuildMode mode, const std::atomic<bool>& cancel,
 	                                 KeptPipeline* keep) {
-		    return PrecompileGraphicsPipeline(*record, stages, mode, &cancel, keep);
+		    return PrecompileGraphicsPipeline(*record, stages, mode, target, &cancel);
 	    },
 	    position);
 }
@@ -3708,7 +3750,7 @@ uint64_t PipelineCache::QueueShaderPairs(uint64_t& finished_before) {
 	return queued;
 }
 
-void PipelineCache::QueuePrecompile(uint32_t thread_count) {
+void PipelineCache::QueuePrecompile(uint32_t thread_count, bool with_created) {
 	EXIT_IF(thread_count == 0);
 	if (m_precompile_queue == nullptr) {
 		// Next to a running guest the builds yield to it; the pass by itself takes nearly every
@@ -3793,7 +3835,7 @@ void PipelineCache::QueuePrecompile(uint32_t thread_count) {
 	// programs: a dispatch that binds it other formats or level counts than the recorded ones
 	// (another place of the game, another resolution) takes that module instead of waiting for
 	// one of its own.
-	if (m_created != nullptr) {
+	if (with_created && m_created != nullptr) {
 		const auto created = m_created->Records();
 		for (size_t i = 0; i < created.size(); i++) {
 			// Built by an earlier session of this emulator build into this driver cache.
@@ -3848,7 +3890,11 @@ void PipelineCache::LogPrecompileStats(const char* when) {
 	    "Precompile {}: {} pipelines already in the driver cache, {} compiled ({} s of "
 	    "driver time), {} skipped, {} timed out{}",
 	    when, counts.cached, counts.compiled, counts.compile_ms / 1000u, counts.skipped,
-	    counts.timed_out, earlier);
+	    counts.timed_out,
+	    counts.provided != 0
+	        ? fmt::format(" ({} were built after the others: the replaced cache provided them)",
+	                      counts.provided)
+	        : std::string {});
 }
 
 void PipelineCache::StartPrecompile(uint32_t thread_count, uint32_t steady_thread_count) {
@@ -3857,10 +3903,109 @@ void PipelineCache::StartPrecompile(uint32_t thread_count, uint32_t steady_threa
 		return;
 	}
 	m_precompile_steady_threads = std::min(steady_thread_count, thread_count);
+	if (m_rebuild.Running()) {
+		// The rebuild queued the same builds into the new cache.
+		return;
+	}
 	// The boot counts as a recorded enqueue: the guest has not created its shaders yet.
 	m_last_recorded_enqueue.store(std::chrono::steady_clock::now().time_since_epoch().count(),
 	                              std::memory_order_relaxed);
 	QueuePrecompile(thread_count);
+}
+
+void PipelineCache::EnableStaleRebuild(uint32_t thread_count, uint32_t steady_thread_count) {
+	// Without probes no stale entry is ever seen; --precompile-only rebuilds by itself.
+	if (m_manifest == nullptr || m_driver_cache == nullptr || m_driver_history == nullptr ||
+	    m_driver_cache_path.empty() || Config::PrecompileOnlyEnabled() ||
+	    !m_graphics.pipeline_creation_cache_control_enabled || thread_count == 0) {
+		return;
+	}
+	m_rebuild_threads        = thread_count;
+	m_rebuild_steady_threads = std::min(steady_thread_count, thread_count);
+	m_rebuild.Enable();
+	// Earlier sessions found stale entries: the rebuild starts with the boot.
+	UpdateStaleRebuild();
+}
+
+PipelineCache::BuildTarget PipelineCache::CurrentBuildTarget() const {
+	if (m_rebuild_cache != nullptr) {
+		return {.cache    = m_rebuild_cache,
+		        .history  = m_rebuild_history,
+		        .previous = {.cache = m_driver_cache, .history = m_driver_history}};
+	}
+	return {.cache = m_driver_cache, .history = m_driver_history};
+}
+
+void PipelineCache::UpdateStaleRebuild() {
+	if (m_rebuild.ShouldReplace(m_precompile_progress.Complete())) {
+		ReplaceRebuiltDriverCache();
+		return;
+	}
+	// A --precompile-pipelines run builds into the loaded cache; the rebuild waits for its end.
+	const bool run_open = m_precompile_queue != nullptr && !m_precompile_progress.Complete();
+	if (m_rebuild.ShouldStart(m_driver_history->StaleCount(), run_open) && !StartStaleRebuild()) {
+		m_rebuild.Finished();
+	}
+}
+
+bool PipelineCache::StartStaleRebuild() {
+	vk::PipelineCacheCreateInfo create {};
+	vk::PipelineCache           empty = nullptr;
+	const auto result = m_graphics.device.createPipelineCache(&create, nullptr, &empty);
+	if (result != vk::Result::eSuccess) {
+		PipelineCacheLog("Vulkan pipeline cache: cannot start an empty cache for a rebuild ({})",
+		                 vk::to_string(result));
+		return false;
+	}
+	if (m_precompile_queue != nullptr) {
+		// A finished --precompile-pipelines run: its queue knows every key. Abandoned builds keep
+		// their workers, which are never joined.
+		m_precompile_queue->Stop();
+		m_precompile_queue.reset();
+		ReleasePrecompiledStages();
+	}
+	m_precompile_progress.Reset();
+	m_rebuild_cache   = empty;
+	m_rebuild_history = std::make_shared<DriverCacheHistory>();
+	m_rebuild_start   = std::chrono::steady_clock::now();
+	m_rebuild.Started();
+	PipelineCacheLog("Vulkan pipeline cache: {} builds ({} this session) missed pipelines {} was "
+	                 "given before (stale entries the driver keeps but does not provide); "
+	                 "rebuilding it in the background",
+	                 m_driver_history->StaleCount(), m_driver_history->SessionStaleCount(),
+	                 Common::PathToString(m_driver_cache_path));
+	m_precompile_steady_threads = m_rebuild_steady_threads;
+	m_last_recorded_enqueue.store(m_rebuild_start.time_since_epoch().count(),
+	                              std::memory_order_relaxed);
+	QueuePrecompile(m_rebuild_threads, Config::PrecompilePipelinesEnabled());
+	UpdatePrecompileThreads();
+	return true;
+}
+
+void PipelineCache::ReplaceRebuiltDriverCache() {
+	// Every build has finished (abandoned ones keep their workers, which are never joined).
+	if (m_precompile_queue != nullptr) {
+		m_precompile_queue->Stop();
+		m_precompile_queue.reset();
+		ReleasePrecompiledStages();
+	}
+	m_driver_cache_writer.Wait();
+	// Builds that captured the loaded cache may still run (abandoned, optimized-background).
+	m_replaced_driver_caches.push_back(m_driver_cache);
+	m_driver_cache   = m_rebuild_cache;
+	m_rebuild_cache  = nullptr;
+	m_driver_history = std::move(m_rebuild_history);
+	m_rebuild.Finished();
+	PipelineCacheLog(
+	    "Vulkan pipeline cache: rebuilt in the background in {} s ({} pipelines given to it); it "
+	    "replaces the loaded cache from now on",
+	    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() -
+	                                                     m_rebuild_start)
+	        .count(),
+	    m_driver_history->Size());
+	// Written at once: until then the file on disk holds the stale entries.
+	m_next_driver_cache_save = {};
+	CheckpointDriverCache();
 }
 
 PipelineCache::PrecompileResult PipelineCache::PrecompileAll(uint32_t thread_count,
@@ -4024,17 +4169,21 @@ void PipelineCache::LogStaleDriverCache() const {
 	}
 	PipelineCacheLog("Vulkan pipeline cache: {} builds ({} this session) missed pipelines the "
 	                 "cache was given before (stale entries the driver keeps but does not "
-	                 "provide); --precompile-only rebuilds the cache",
-	                 m_driver_history->StaleCount(), m_driver_history->SessionStaleCount());
+	                 "provide); {}",
+	                 m_driver_history->StaleCount(), m_driver_history->SessionStaleCount(),
+	                 m_rebuild.GetState() == DriverCacheRebuildPolicy::State::Off
+	                     ? "--precompile-only rebuilds the cache"
+	                     : "the session rebuilds the cache in the background");
 }
 
 void PipelineCache::LogCoverage() {
 	auto& programs = *m_program_cache;
 	if (m_graphics_from_cache + m_graphics_compiled != 0) {
-		PipelineCacheLog("Graphics pipelines this session: {} from the driver cache, {} compiled; "
-		                 "{} of {} recorded were predicted (by earlier sessions or the list)",
-		                 m_graphics_from_cache, m_graphics_compiled, m_graphics_predicted,
-		                 m_graphics_recorded);
+		PipelineCacheLog("Graphics pipelines this session: {} from the driver cache ({} from a "
+		                 "replaced one), {} compiled; {} of {} recorded were predicted (by earlier "
+		                 "sessions or the list)",
+		                 m_graphics_from_cache, m_graphics_from_previous, m_graphics_compiled,
+		                 m_graphics_predicted, m_graphics_recorded);
 	}
 	if (programs.code_only_same + programs.code_only_taken + programs.code_only_other +
 	        programs.code_only_listed !=
@@ -4132,8 +4281,9 @@ void PipelineCache::CheckpointDriverCache() {
 	}
 	m_driver_cache_dirty.store(true, std::memory_order_relaxed);
 	// A cache being rebuilt holds only part of the old file's pipelines until the precompile
-	// ends; it is written once, then.
-	if (m_driver_cache_rebuild) {
+	// ends; it is written once, then. While a background rebuild runs, new pipelines go to the
+	// new cache and the file keeps the loaded one's.
+	if (m_driver_cache_rebuild || m_rebuild.Running()) {
 		return;
 	}
 	const auto now = std::chrono::steady_clock::now();
@@ -4153,8 +4303,9 @@ void PipelineCache::CheckpointDriverCache() {
 
 bool PipelineCache::Save() {
 	if (m_compute_from_cache + m_compute_compiled != 0) {
-		PipelineCacheLog("Compute pipelines this session: {} from the driver cache, {} compiled",
-		                 m_compute_from_cache, m_compute_compiled);
+		PipelineCacheLog("Compute pipelines this session: {} from the driver cache ({} from a "
+		                 "replaced one), {} compiled",
+		                 m_compute_from_cache, m_compute_from_previous, m_compute_compiled);
 		const auto ms = [](uint64_t ns) { return static_cast<double>(ns) / 1'000'000.0; };
 		PipelineCacheLog("Pipelines created at their first use this session held the GPU thread "
 		                 "for {:.0f} ms (compute) and {:.0f} ms (graphics); {} and {} of them for "
@@ -4186,6 +4337,12 @@ bool PipelineCache::Save() {
 	}
 	m_driver_cache_writer.Wait();
 	PersistStaleMisses();
+	if (m_rebuild.Running()) {
+		PipelineCacheLog(
+		    "Vulkan pipeline cache: the background rebuild has not finished; keeping {}",
+		    Common::PathToString(m_driver_cache_path));
+		return true;
+	}
 	if (m_driver_cache == nullptr || m_driver_cache_path.empty() ||
 	    !m_driver_cache_dirty.exchange(false)) {
 		// Nothing to write: what ended since the last write changed no cache (shaders that do
@@ -4206,9 +4363,9 @@ bool PipelineCache::Save() {
 
 bool PipelineCache::WriteDriverCache() {
 	// Taken first: every pipeline it names is in the data below.
-	const auto built =
-	    m_driver_history != nullptr ? m_driver_history->Snapshot() : std::vector<uint64_t> {};
-	const auto           stale = m_driver_history != nullptr ? m_driver_history->StaleCount() : 0;
+	const auto history = m_driver_history;
+	const auto built   = history != nullptr ? history->Snapshot() : std::vector<uint64_t> {};
+	const auto stale   = history != nullptr ? history->StaleCount() : 0;
 	// And the builds that ended before the data is taken: their pipelines are in it.
 	auto ended = m_finished_created != nullptr ? m_finished_created->TakePending()
 	                                           : FinishedBuilds::Ended {};
@@ -4264,8 +4421,8 @@ bool PipelineCache::WriteDriverCache() {
 		return false;
 	}
 	m_driver_cache_stored_size.store(payload.size(), std::memory_order_relaxed);
-	if (m_driver_history != nullptr) {
-		WriteDriverHistory(built, hash, stale);
+	if (history != nullptr) {
+		WriteDriverHistory(*history, built, hash, stale);
 	}
 	if (m_finished_created != nullptr) {
 		m_finished_created->Commit(ended);
@@ -4276,7 +4433,8 @@ bool PipelineCache::WriteDriverCache() {
 	return true;
 }
 
-void PipelineCache::WriteDriverHistory(std::vector<uint64_t> built, uint64_t cache_hash,
+void PipelineCache::WriteDriverHistory(const DriverCacheHistory& history,
+                                       std::vector<uint64_t> built, uint64_t cache_hash,
                                        uint64_t stale) {
 	const auto      signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
 	std::lock_guard lock(m_history_file_mutex);
@@ -4290,6 +4448,7 @@ void PipelineCache::WriteDriverHistory(std::vector<uint64_t> built, uint64_t cac
 	m_history_file_built      = std::move(built);
 	m_history_file_cache_hash = cache_hash;
 	m_history_file_stale      = stale;
+	m_history_file_owner      = &history;
 }
 
 void PipelineCache::PersistStaleMisses() {
@@ -4299,7 +4458,8 @@ void PipelineCache::PersistStaleMisses() {
 	const auto      stale     = m_driver_history->StaleCount();
 	const auto      signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
 	std::lock_guard lock(m_history_file_mutex);
-	if (m_history_file_cache_hash == 0 || stale == m_history_file_stale) {
+	if (m_history_file_cache_hash == 0 || stale == m_history_file_stale ||
+	    m_history_file_owner != m_driver_history.get()) {
 		return;
 	}
 	if (DriverCacheHistory::Store(
@@ -4922,10 +5082,11 @@ PipelineCache::Pipeline* PipelineCache::FindGraphicsPipeline(const CommandBuffer
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
 		return CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, state,
-		                              static_params, m_driver_cache, build_mode, &from_driver_cache,
-		                              nullptr, m_driver_history, &m_warm_pipelines);
+		                              static_params, target.cache, build_mode, &from_driver_cache,
+		                              nullptr, target.history, target.previous, &from_previous);
 	}();
 	(from_driver_cache ? m_graphics_from_cache : m_graphics_compiled)++;
+	m_graphics_from_previous += from_previous ? 1u : 0u;
 	const auto create_ns = static_cast<uint64_t>(
 	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
 	                                                         create_start)
@@ -4987,6 +5148,13 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 	// (m_warm_pipelines). One whose precompile has not started is built here like any other
 	// pipeline (from the driver cache, or unoptimized first) and its precompile is skipped; one
 	// being built is built here too: waiting for an optimized build would stop the frame.
+	// cache. A background rebuild's builds are not waited for: the loaded cache serves meanwhile.
+	if (m_precompile_queue != nullptr && !m_rebuild.Running() && compute_program.record_key != 0 &&
+		!m_precompile_queue->Expedite(compute_program.record_key, PrecompileExpediteWait)) {
+		PipelineCacheLog("PipelineCache: the precompile of CS program {:016x} still runs after "
+		                 "{} s; building it here",
+		                 compute_program.record_key, PrecompileExpediteWait.count());
+	}
 	// A program whose optimized build ran past the precompile budget is never built optimized:
 	// the driver may not finish that build at all.
 	const bool optimized_hangs   = compute_program.record_key != 0 &&
@@ -4994,20 +5162,22 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 	                               m_precompile_attempts->TimedOut(compute_program.record_key);
 	auto       cached            = std::make_unique<Pipeline>();
 	bool       from_driver_cache = false;
-	const auto create_start      = std::chrono::steady_clock::now();
+	bool       from_previous     = false;
+	const auto target            = CurrentBuildTarget();
 	auto       job               = [&] {
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
-		return CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module,
-		                              m_driver_cache,
-		                              optimized_hangs        ? PipelineBuildMode::Unoptimized
-		                              : m_defer_optimization ? PipelineBuildMode::UnoptimizedFirst
-		                                                     : PipelineBuildMode::Optimized,
-		                              &from_driver_cache, nullptr, m_driver_history,
-		                              &m_warm_pipelines);
+		return CreatePipelineInternal(
+		    m_graphics, *cached, input_info, compute_program.module, target.cache,
+		    optimized_hangs        ? PipelineBuildMode::Unoptimized
+		    : m_defer_optimization ? PipelineBuildMode::UnoptimizedFirst
+		                           : PipelineBuildMode::Optimized,
+		    &from_driver_cache, nullptr, target.history, target.previous, &from_previous);
+		    &m_warm_pipelines);
 	}();
 	(from_driver_cache ? m_compute_from_cache : m_compute_compiled)++;
+	m_compute_from_previous += from_previous ? 1u : 0u;
 	m_compute_create.Add(static_cast<uint64_t>(
 	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
 	                                                         create_start)
