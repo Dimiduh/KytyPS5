@@ -105,6 +105,8 @@ struct ConfigOptions {
 	bool                   precompile_pipelines            = true;
 	bool                   precompile_only                 = false;
 	bool                   rebuild_pipeline_cache          = false;
+	// A session rebuilds a driver cache with stale entries in the background.
+	bool                   stale_pipeline_rebuild          = true;
 	// --export-pipeline-list / --import-pipeline-list (empty = off).
 	std::filesystem::path  export_pipeline_list;
 	std::filesystem::path  import_pipeline_list;
@@ -206,6 +208,7 @@ bool     SerializeDispatchesEnabled();
 bool     PrecompilePipelinesEnabled();
 bool     PrecompileOnlyEnabled();
 bool     RebuildPipelineCacheEnabled();
+bool     StalePipelineRebuildEnabled();
 std::filesystem::path ExportPipelineListPath();
 std::filesystem::path ImportPipelineListPath();
 std::filesystem::path ImportShadersPath();
