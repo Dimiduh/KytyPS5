@@ -198,6 +198,10 @@ static void PrintUsage() {
 	    "                                       with only the pipelines this run builds (also\n"
 	    "                                       done for a cache file larger than 3 GiB).\n");
 	::printf(
+	    "  --no-stale-pipeline-rebuild          Do not rebuild a driver cache with stale entries\n"
+	    "                                       (pipelines it was given and no longer provides)\n"
+	    "                                       in the background while the game runs.\n");
+	::printf(
 	    "  --export-pipeline-list <file>        Write the pipelines recorded for the game as a\n"
 	    "                                       shareable list without shader code, and exit.\n");
 	::printf(
@@ -382,6 +386,7 @@ static constexpr Flag FLAGS[] = {
     {"--no-precompile-pipelines", &ConfigOptions::precompile_pipelines, false},
     {"--precompile-only", &ConfigOptions::precompile_only},
     {"--rebuild-pipeline-cache", &ConfigOptions::rebuild_pipeline_cache},
+	{"--no-stale-pipeline-rebuild", &ConfigOptions::stale_pipeline_rebuild, false},
     {"--serialize-dispatches", &ConfigOptions::serialize_dispatches},
     {"--no-trophy-notifications", &ConfigOptions::trophy_enabled, false},
     {"--perf-overlay", &ConfigOptions::perf_overlay_enabled},
